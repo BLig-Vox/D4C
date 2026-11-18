@@ -1,0 +1,11 @@
+FROM docker.io/library/archlinux:base
+RUN pacman -Syu --noconfirm --needed xfce4 xfce4-terminal tigervnc dbus sudo firefox noto-fonts noto-fonts-cjk noto-fonts-emoji ttf-dejavu xorg-xrandr xorg-xdpyinfo xdotool && pacman -Scc --noconfirm \
+ && useradd -m -u 1000 -s /bin/bash desktop \
+ && printf 'desktop ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/desktop \
+ && chmod 0440 /etc/sudoers.d/desktop
+COPY start-desktop /usr/local/bin/start-desktop
+RUN chmod 0755 /usr/local/bin/start-desktop
+USER desktop
+ENV HOME=/home/desktop DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/d4c-runtime LANG=C.UTF-8
+EXPOSE 5900
+ENTRYPOINT ["/usr/local/bin/start-desktop"]

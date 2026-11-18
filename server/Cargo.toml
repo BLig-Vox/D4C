@@ -1,0 +1,22 @@
+[package]
+name = "vox-d4c-server"
+version = "0.1.0-alpha.1"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Blig-Vox/D4C"
+
+[dependencies]
+serde_json = "1"
+rusqlite = { version = "0.38", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+tungstenite = "0.30"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+flate2 = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+libc="0.2"

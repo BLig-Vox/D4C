@@ -1,0 +1,11 @@
+[Unit]
+Description=Apply D4C MCP connections after active chats finish
+After=openclaw-gateway.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.openclaw/workspace/skills/connect-mcp/scripts/d4c-mcp.py work
+TimeoutStartSec=240
+MemoryMax=384M
+MemorySwapMax=0
+UMask=0077

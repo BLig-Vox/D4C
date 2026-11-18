@@ -1,0 +1,10 @@
+[Unit]
+Description=Renew D4C tailnet TLS certificate
+After=tailscaled.service
+[Service]
+Type=oneshot
+UMask=0027
+ExecStart=/usr/bin/tailscale cert --cert-file /etc/d4c/tls/cert.pem --key-file /etc/d4c/tls/key.pem @D4C_HOSTNAME@
+ExecStart=/usr/bin/chown root:d4c /etc/d4c/tls/cert.pem /etc/d4c/tls/key.pem
+ExecStart=/usr/bin/chmod 0640 /etc/d4c/tls/cert.pem /etc/d4c/tls/key.pem
+ExecStart=/usr/bin/systemctl try-restart d4c-manager.service

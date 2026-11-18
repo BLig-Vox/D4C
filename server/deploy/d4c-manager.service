@@ -1,0 +1,27 @@
+[Unit]
+Description=D4C persistent workspace manager
+After=network-online.target tailscaled.service user@@D4C_UID@.service
+Wants=network-online.target user@@D4C_UID@.service
+
+[Service]
+Type=simple
+User=d4c
+Group=d4c
+WorkingDirectory=/var/lib/d4c
+Environment=HOME=/home/d4c
+Environment=XDG_RUNTIME_DIR=/run/user/@D4C_UID@
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@D4C_UID@/bus
+RuntimeDirectory=d4c
+RuntimeDirectoryMode=0750
+UMask=0077
+ExecStart=/usr/local/bin/d4c-server --config /etc/d4c/manager.json
+Restart=on-failure
+RestartSec=3
+MemoryHigh=512M
+MemoryMax=768M
+MemorySwapMax=0
+TasksMax=512
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

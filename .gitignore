@@ -1,0 +1,16 @@
+**/target/
+.reports/
+__pycache__/
+*.pyc
+.env
+.env.*
+*.keystore
+*.jks
+*.pem
+*.key
+*.sqlite*
+*.log
+/docs/deployments/
+/docs/superpowers/
+/docs/*verification*
+/docs/chat-interface.md

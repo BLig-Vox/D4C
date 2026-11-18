@@ -1,0 +1,443 @@
+//! Bounded previews from uploads and the gateway's authenticated media route.
+use base64::Engine as _;
+use eframe::egui;
+use serde_json::Value;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
+static WORKERS: AtomicUsize = AtomicUsize::new(0);
+struct Permit;
+impl Drop for Permit {
+    fn drop(&mut self) {
+        WORKERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+pub struct Attachment {
+    pub name: String,
+    pub mime: String,
+    pub size: usize,
+    pub artifact: Option<String>,
+    pub requested: bool,
+    source: Option<(String, String)>,
+    state: Mutex<State>,
+}
+enum Payload {
+    Bytes(Vec<u8>),
+    Http {
+        endpoint: String,
+        token: String,
+        source: String,
+        session: String,
+        message: String,
+    },
+}
+enum State {
+    Pending(Payload),
+    Loading(Arc<Mutex<Option<Option<egui::ColorImage>>>>),
+    Ready(Option<egui::TextureHandle>),
+}
+fn decode(payload: Payload) -> Option<egui::ColorImage> {
+    let bytes = match payload {
+        Payload::Bytes(bytes) => bytes,
+        Payload::Http {
+            endpoint,
+            token,
+            source,
+            session,
+            message,
+        } => {
+            let config = ureq::Agent::config_builder()
+                .max_redirects(0)
+                .timeout_global(Some(std::time::Duration::from_secs(15)))
+                .build();
+            let agent: ureq::Agent = config.into();
+            let mut request = agent
+                .get(&endpoint)
+                .header("Authorization", format!("Bearer {token}"));
+            if !source.is_empty() {
+                request = request
+                    .query("source", &source)
+                    .query("sessionKey", session)
+                    .query("messageId", message);
+            }
+            if source.starts_with("media://inbound/") {
+                request = request.query("variant", "thumbnail").query("width", "640");
+            }
+            let mut response = request.call().ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            response
+                .body_mut()
+                .with_config()
+                .limit(crate::uploads::FILE_LIMIT as u64)
+                .read_to_vec()
+                .ok()?
+        }
+    };
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode().ok()?.thumbnail(960, 720).to_rgba8();
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [image.width() as usize, image.height() as usize],
+        image.as_raw(),
+    ))
+}
+impl Attachment {
+    pub fn new(name: String, mime: String, bytes: Vec<u8>) -> Self {
+        Self {
+            name,
+            mime,
+            size: bytes.len(),
+            artifact: None,
+            requested: false,
+            source: None,
+            state: Mutex::new(State::Pending(Payload::Bytes(bytes))),
+        }
+    }
+    pub fn receive(&mut self, mime: String, bytes: Vec<u8>) {
+        self.mime = mime;
+        self.size = bytes.len();
+        if let Ok(mut state) = self.state.lock() {
+            *state = State::Pending(Payload::Bytes(bytes));
+        }
+    }
+    pub fn receive_url(&mut self, gateway: &str, token: &str, path: &str) {
+        let Ok(uri) = gateway.parse::<tungstenite::http::Uri>() else {
+            return;
+        };
+        let Some(authority) = uri.authority() else {
+            return;
+        };
+        if uri.scheme_str() != Some("wss")
+            || !(path.starts_with("/api/chat/media/outgoing/")
+                || path.starts_with("/__openclaw__/"))
+            || path.len() > 8192
+        {
+            return;
+        }
+        self.source = None;
+        if let Ok(mut state) = self.state.lock() {
+            *state = State::Pending(Payload::Http {
+                endpoint: format!("https://{authority}{path}"),
+                token: token.into(),
+                source: String::new(),
+                session: String::new(),
+                message: String::new(),
+            });
+        }
+    }
+    pub fn configure_http(&mut self, gateway: &str, token: &str, session: &str) {
+        if self.source.is_none() || !self.mime.starts_with("image/") {
+            return;
+        }
+        let Ok(uri) = gateway.parse::<tungstenite::http::Uri>() else {
+            return;
+        };
+        if uri.scheme_str() != Some("wss") {
+            return;
+        }
+        let Some(authority) = uri.authority() else {
+            return;
+        };
+        let (source, message) = self.source.take().unwrap();
+        if let Ok(mut state) = self.state.lock() {
+            *state = State::Pending(Payload::Http {
+                endpoint: format!("https://{authority}/__openclaw__/assistant-media"),
+                token: token.into(),
+                source,
+                session: session.into(),
+                message,
+            });
+        }
+    }
+    pub fn ui(&self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(crate::icon_text(
+                if self.mime.starts_with("image/") {
+                    lucide_icons::Icon::Image
+                } else {
+                    lucide_icons::Icon::File
+                },
+                16.0,
+            ));
+            ui.label(
+                if self.name.starts_with("d4c-") && self.name.ends_with(".png") {
+                    "Desktop screenshot"
+                } else {
+                    &self.name
+                },
+            );
+            if self.size > 0 {
+                ui.label(
+                    egui::RichText::new(format!("{:.1} KB", self.size as f32 / 1000.0))
+                        .small()
+                        .weak(),
+                );
+            }
+        });
+        if !self.mime.starts_with("image/") {
+            return;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        // Reserve layout before checking visibility so offscreen images don't all download.
+        let image_space = egui::vec2(ui.available_width().min(420.0), 160.0);
+        let visible = ui.is_rect_visible(egui::Rect::from_min_size(ui.cursor().min, image_space));
+        if matches!(*state, State::Pending(_)) && visible && self.source.is_none() {
+            if WORKERS
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    (n < 4).then_some(n + 1)
+                })
+                .is_ok()
+            {
+                let State::Pending(payload) = std::mem::replace(&mut *state, State::Ready(None))
+                else {
+                    unreachable!()
+                };
+                let result = Arc::new(Mutex::new(None));
+                let output = result.clone();
+                let ctx = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    let _permit = Permit;
+                    let decoded = decode(payload);
+                    if let Ok(mut slot) = output.lock() {
+                        *slot = Some(decoded);
+                    }
+                    ctx.request_repaint();
+                });
+                *state = State::Loading(result);
+            }
+        }
+        if let State::Loading(result) = &*state {
+            let decoded = result.lock().ok().and_then(|mut r| r.take());
+            if let Some(image) = decoded {
+                *state = State::Ready(image.map(|image| {
+                    ui.ctx().load_texture(
+                        format!("attachment-{}", self.name),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    )
+                }));
+            }
+        }
+        match &*state {
+            State::Ready(Some(texture)) => {
+                ui.add(egui::Image::new(texture).fit_to_exact_size(
+                    texture.size_vec2()
+                        * (ui.available_width().min(420.0) / texture.size_vec2().x).min(1.0),
+                ));
+            }
+            State::Ready(None) => {
+                ui.label(
+                    egui::RichText::new("Image preview unavailable")
+                        .small()
+                        .weak(),
+                );
+            }
+            _ => {
+                ui.allocate_ui(image_space, |ui| {
+                    ui.spinner();
+                });
+            }
+        }
+    }
+}
+pub fn from_message(message: &Value) -> Vec<Attachment> {
+    let mut out: Vec<_> = message["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|part| {
+            let kind = part["type"].as_str()?;
+            if !matches!(kind, "image" | "image_url" | "file" | "document") {
+                return None;
+            }
+            let mime = part["mimeType"]
+                .as_str()
+                .or_else(|| part["source"]["media_type"].as_str())
+                .or_else(|| part["mime_type"].as_str())
+                .unwrap_or(if kind.starts_with("image") {
+                    "image/png"
+                } else {
+                    "application/octet-stream"
+                })
+                .to_owned();
+            let name = part["fileName"]
+                .as_str()
+                .or_else(|| part["name"].as_str())
+                .or_else(|| part["alt"].as_str())
+                .unwrap_or(if mime.starts_with("image/") {
+                    "Image"
+                } else {
+                    "File"
+                })
+                .to_owned();
+            let encoded = part["data"]
+                .as_str()
+                .or_else(|| part["source"]["data"].as_str())
+                .or_else(|| part["image_url"]["url"].as_str())
+                .unwrap_or("");
+            let encoded = if encoded.starts_with("data:") {
+                encoded.split_once(',').map(|(_, d)| d).unwrap_or("")
+            } else {
+                encoded
+            };
+            let bytes = if encoded.len() <= 8_000_000 {
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
+            if bytes.is_empty()
+                && part["artifactId"].as_str().is_none()
+                && part["url"].as_str().is_none()
+                && (part["omitted"] == true || part["source"]["omitted"] == true)
+            {
+                return None;
+            }
+            let mut a = Attachment::new(name, mime, bytes);
+            a.artifact = part["artifactId"].as_str().map(str::to_owned);
+            if a.artifact.is_none() {
+                if let Some(source) = part["url"]
+                    .as_str()
+                    .or_else(|| part["source"].as_str())
+                    .or_else(|| part["source"]["url"].as_str())
+                    .or_else(|| part["image_url"]["url"].as_str())
+                    .filter(|s| {
+                        s.len() < 2048
+                            && (s.starts_with('/')
+                                || s.starts_with("file:///")
+                                || s.starts_with("media://inbound/"))
+                    })
+                {
+                    a.source = Some((
+                        source.into(),
+                        message["__openclaw"]["id"].as_str().unwrap_or("").into(),
+                    ));
+                    if a.name == "Image" {
+                        a.name = source.rsplit('/').next().unwrap_or("Image").into();
+                    }
+                }
+            }
+            Some(a)
+        })
+        .take(8)
+        .collect();
+    for fact in message["__openclaw"]["media"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(8 - out.len())
+    {
+        let mime = fact["contentType"]
+            .as_str()
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        let name = fact["fileName"].as_str().unwrap_or("Attachment").to_owned();
+        let mut a = Attachment::new(name, mime, vec![]);
+        a.size = fact["sizeBytes"].as_u64().unwrap_or(0) as usize;
+        if let Some(uri) = fact["url"].as_str().filter(|u| {
+            (u.starts_with("media://inbound/") || u.starts_with('/') || u.starts_with("file:///"))
+                && u.len() < 2048
+        }) {
+            a.source = Some((
+                uri.into(),
+                message["__openclaw"]["id"].as_str().unwrap_or("").into(),
+            ));
+        }
+        out.push(a);
+    }
+    // MEDIA references are delivered through the authenticated Gateway route,
+    // never opened as client-local files or fetched from arbitrary remote hosts.
+    if message["role"] == "assistant" {
+        for text in message["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p["text"].as_str())
+        {
+            for line in text.lines().filter_map(|l| l.trim().strip_prefix("MEDIA:")) {
+                let source = line.trim().trim_matches(['`', '"', '\'']);
+                if out.len() >= 8
+                    || source.len() > 2048
+                    || !(source.starts_with('/') || source.starts_with("file:///"))
+                {
+                    continue;
+                }
+                if out
+                    .iter()
+                    .any(|a| a.source.as_ref().is_some_and(|(s, _)| s == source))
+                {
+                    continue;
+                }
+                let mime = match source
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "png" => "image/png",
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "webp" => "image/webp",
+                    "gif" => "image/gif",
+                    _ => continue,
+                };
+                let mut a = Attachment::new(
+                    source.rsplit('/').next().unwrap_or("Screenshot").into(),
+                    mime.into(),
+                    vec![],
+                );
+                a.source = Some((
+                    source.into(),
+                    message["__openclaw"]["id"].as_str().unwrap_or("").into(),
+                ));
+                out.push(a);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn omitted_tool_observation_does_not_render_a_broken_preview() {
+        assert!(from_message(&json!({"role":"toolResult","content":[{"type":"image","mimeType":"image/png","omitted":true}]})).is_empty());
+    }
+    #[test]
+    fn managed_attachment_retains_download_identity() {
+        let a = from_message(
+            &json!({"role":"assistant","content":[{"type":"image","artifactId":"artifact_managed_image_example","mimeType":"image/png","alt":"Screenshot.png"}]}),
+        );
+        assert_eq!(a.len(), 1);
+        assert_eq!(
+            a[0].artifact.as_deref(),
+            Some("artifact_managed_image_example")
+        );
+        assert_eq!(a[0].name, "Screenshot.png");
+    }
+    #[test]
+    fn local_media_reference_is_gateway_scoped_and_remote_url_is_not_proxied() {
+        let a = from_message(
+            &json!({"role":"assistant","content":[{"type":"text","text":"MEDIA:/example-state/media/test.png\nMEDIA:https://untrusted.example/test.png"}]}),
+        );
+        assert_eq!(a.len(), 1);
+        assert_eq!(
+            a[0].source.as_ref().unwrap().0,
+            "/example-state/media/test.png"
+        );
+    }
+}

@@ -1,0 +1,65 @@
+use std::{fs, path::PathBuf};
+use vox_d4c_server::{manager::Manager, runtime::Runtime, store::Store};
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("D4C: {e}");
+        std::process::exit(1);
+    }
+}
+fn run() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h") {
+        println!(
+            "D4C server\nUsage: d4c-server [--config PATH] [--list-devices | --approve DEVICE_ID]\n       d4c-server --mcp\n       d4c-server --help | --version"
+        );
+        return Ok(());
+    }
+    if args.len() == 2 && matches!(args[1].as_str(), "--version" | "-V") {
+        println!("d4c-server {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    let mut options = args.iter().skip(1);
+    while let Some(arg) = options.next() {
+        match arg.as_str() {
+            "--mcp" | "--list-devices" => {}
+            "--config" | "--approve" => {
+                if options.next().is_none_or(|v| v.starts_with("--")) {
+                    return Err(format!("{arg} requires a value"));
+                }
+            }
+            _ => return Err(format!("Unknown option {arg}; use --help")),
+        }
+    }
+    let option = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|n| args.get(n + 1))
+            .cloned()
+    };
+    if args.iter().any(|a| a == "--mcp") {
+        return vox_d4c_server::mcp::serve(
+            &std::env::var("D4C_SOCKET").unwrap_or_else(|_| "/run/d4c/manager.sock".into()),
+            &std::env::var("D4C_SESSION").map_err(|_| "D4C_SESSION required")?,
+        );
+    }
+    let path = option("--config").unwrap_or_else(|| "/etc/d4c/manager.json".into());
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let root = PathBuf::from(config["dataDirectory"].as_str().unwrap_or("/var/lib/d4c"));
+    let mut db = Store::open(&root.join("workspace.sqlite"))?;
+    if args.iter().any(|a| a == "--list-devices") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&db.devices()?).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    if let Some(id) = option("--approve") {
+        db.approve_device(&id)?;
+        println!("Approved {id}");
+        return Ok(());
+    }
+    let runtime = Runtime::new(root)?;
+    vox_d4c_server::transport::serve(Manager::new(db, runtime), &config)
+}

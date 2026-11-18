@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=D4C
+Comment=Chat and remote desktops
+Exec=vox-d4c
+Icon=site.blig.D4C
+Terminal=false
+Categories=Network;Utility;
+StartupWMClass=site.blig.D4C
+StartupNotify=true

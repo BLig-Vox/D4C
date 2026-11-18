@@ -1,0 +1,10 @@
+[Unit]
+Description=Process persistent D4C MCP requests
+
+[Timer]
+OnBootSec=8s
+OnUnitInactiveSec=3s
+Unit=d4c-mcp-queue.service
+
+[Install]
+WantedBy=timers.target

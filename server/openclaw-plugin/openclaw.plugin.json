@@ -1,0 +1,73 @@
+{
+  "id": "d4c-desktops",
+  "name": "D4C Desktops",
+  "description": "Persistent desktop tools and workspace activity for D4C.",
+  "configSchema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "desktop_screenshot",
+      "desktop_click",
+      "desktop_move",
+      "desktop_scroll",
+      "desktop_type",
+      "desktop_key"
+    ]
+  },
+  "toolMetadata": {
+    "desktop_screenshot": {
+      "profiles": [
+        "coding",
+        "full"
+      ],
+      "sideEffecting": false,
+      "replaySafe": true
+    },
+    "desktop_click": {
+      "profiles": [
+        "coding",
+        "full"
+      ],
+      "sideEffecting": true,
+      "replaySafe": false
+    },
+    "desktop_move": {
+      "profiles": [
+        "coding",
+        "full"
+      ],
+      "sideEffecting": true,
+      "replaySafe": false
+    },
+    "desktop_scroll": {
+      "profiles": [
+        "coding",
+        "full"
+      ],
+      "sideEffecting": true,
+      "replaySafe": false
+    },
+    "desktop_type": {
+      "profiles": [
+        "coding",
+        "full"
+      ],
+      "sideEffecting": true,
+      "replaySafe": false
+    },
+    "desktop_key": {
+      "profiles": [
+        "coding",
+        "full"
+      ],
+      "sideEffecting": true,
+      "replaySafe": false
+    }
+  }
+}
