@@ -37,3 +37,23 @@ The live verification script is optional and intrusive: it creates fixture
 identities and a desktop and restarts the manager. Read it before use, run only
 on an owned test deployment, and supply `D4C_HOSTNAME`. It is not an installer.
 See [MCP setup](../docs/mcp.md) for the independent idle queue service.
+
+## Explicit desktop memory policy
+
+Administrators may set `D4C_DESKTOP_MEMORY_OVERRIDES` to a JSON object mapping
+existing desktop UUIDs to memory in MiB, for example:
+
+```sh
+D4C_DESKTOP_MEMORY_OVERRIDES='{"00000000-0000-4000-8000-000000000001":1536}'
+```
+
+The manager validates UUIDs and limits (256–4096 MiB), admits increases only with
+2 GiB host `MemAvailable` plus the increase in reserve, persists the admitted
+budget, and updates a running container without restarting it. Memory and
+memory-plus-swap limits are equal, allowing no additional container swap.
+Rejected policies do not affect later lifecycle operations. Defaults and other
+desktops stay unchanged. A higher limit provides headroom; it does not prevent
+all browser OOMs or reserve that much physical memory.
+
+For Codex desktop screenshot histories, see the separately installed,
+[version-checked request budget adapter](codex-image-budget/README.md).

@@ -672,7 +672,8 @@ impl D4c {
                                 if self.compact_previous {
                                     self.sidebar_open = false;
                                 }
-                            } else if let Some(job) = job {
+                            }
+                            if let Some(job) = job {
                                 self.cron.show_history(&job, title);
                                 self.settings_open = false;
                                 self.notifications_open = false;
@@ -3222,58 +3223,7 @@ impl D4c {
                                 }
                                 ui.add_space(12.0);
                             }
-                            self.cron.chat_ui(ui, &self.session, self.connected);
-                            for result in self.center.chat_results(&self.session) {
-                                ui.add_space(10.0);
-                                let response = egui::Frame::new()
-                                    .fill(egui::Color32::from_rgb(29, 38, 38))
-                                    .corner_radius(12)
-                                    .inner_margin(14)
-                                    .show(ui, |ui| {
-                                        ui.set_max_width(ui.available_width().min(740.0));
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label(icon_text(
-                                                lucide_icons::Icon::CalendarClock,
-                                                16.0,
-                                            ));
-                                            ui.strong(
-                                                result["title"]
-                                                    .as_str()
-                                                    .unwrap_or("Scheduled result"),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(
-                                                    result["status"].as_str().unwrap_or("Finished"),
-                                                )
-                                                .small()
-                                                .weak(),
-                                            );
-                                        });
-                                        ui.label(
-                                            egui::RichText::new(cron::timestamp(
-                                                result["time"].as_u64().unwrap_or(0),
-                                            ))
-                                            .small()
-                                            .weak(),
-                                        );
-                                        egui_commonmark::CommonMarkViewer::new().show(
-                                            ui,
-                                            &mut self.markdown_cache,
-                                            result["body"].as_str().unwrap_or(""),
-                                        );
-                                        if ui.button("Run history").clicked() {
-                                            self.cron.show_history(
-                                                result["job"].as_str().unwrap_or(""),
-                                                result["title"].as_str().unwrap_or("Task"),
-                                            );
-                                        }
-                                    });
-                                if ui.is_rect_visible(response.response.rect)
-                                    && ui.input(|i| i.viewport().focused.unwrap_or(false))
-                                {
-                                    self.center.read(Some(&self.session));
-                                }
-                            }
+                            // Scheduled work stays in Tasks and owner-linked notifications.
                             for request in self.questions.ui(ui, &self.session, self.connected) {
                                 if let Some(g) = &self.gateway {
                                     let _ = g.tx.send(request);

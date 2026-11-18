@@ -186,6 +186,25 @@ openclaw plugins install --force /absolute/path/to/D4C/server/openclaw-plugin
 openclaw plugins enable d4c-desktops
 ```
 
+The plugin also keeps D4C schedules isolated from interactive conversations. Native
+`cron`/`automations` add and update calls from a D4C chat use an isolated session
+and no fallback delivery into the live transcript. Their originating owner is
+retained. Completed runs enter the manager as notifications without changing the
+owner chat's active run. Tasks history remains available in the chat workspace.
+
+After upgrading an existing deployment, run this once **on the Gateway server**
+from a copy of this repository:
+
+```sh
+python3 scripts/isolate-scheduled-chats.py
+```
+
+It uses supported Gateway RPCs with revision checks to migrate only schedules
+owned by D4C chats, keeping names, prompts, enabled state, schedule and owner.
+It does not restart the Gateway. Direct administrator CLI/RPC scheduling bypasses
+the agent tool policy; use `sessionTarget: isolated` and `delivery.mode: none`
+when deliberately managing D4C schedules through those interfaces.
+
 Use upstream's supported plugin activation/reload procedure, outside an active
 agent turn. If you changed the socket path, set `D4C_SOCKET` in the Gateway service
 environment before activating. `OPENCLAW_STATE_DIR` controls plugin screenshot/outbox

@@ -63,6 +63,8 @@ Wireless debugging page's separate connection port for
 - VNC supports fit/zoom, fullscreen, touch panning and explicit takeover. Input is
   authorized by the manager; Return to agent waits for server acknowledgement.
 - Desktop/Tasks belong to the selected chat. Server bindings restore on reconnect.
+- Scheduled work runs separately from live chat. Results appear in owner-linked
+  notifications and Tasks history without adding cards to the conversation.
 - A visible foreground messaging service receives background notifications, subject
   to Android permission, channel settings, network and power policy. Force-stop
   prevents delivery. Server work continues independently.

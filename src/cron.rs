@@ -277,7 +277,6 @@ pub struct Tasks {
     filter: String,
     scope_session: Option<String>,
     chat_request: Option<ChatRequest>,
-    chat_links: HashMap<String, Vec<String>>,
     pub open_history: bool,
     finished: Vec<Value>,
     feed_checked: Option<Instant>,
@@ -383,15 +382,13 @@ impl Tasks {
     pub fn take_chat_request(&mut self) -> Option<ChatRequest> {
         self.chat_request.take()
     }
-    pub fn observe_tool(&mut self, session: &str, result: &Value) {
+    pub fn observe_tool(&mut self, _session: &str, result: &Value) {
         for job in task_results(result) {
             let Some(id) = job["id"].as_str().map(str::to_owned) else {
                 continue;
             };
-            let links = self.chat_links.entry(session.into()).or_default();
-            if !links.contains(&id) {
-                links.push(id.clone());
-            }
+            // Observing a list/get result does not transfer ownership to this chat.
+            // Only server-supplied owner/session metadata may scope a task.
             if let Some(existing) = self.jobs.iter_mut().find(|j| j["id"] == id) {
                 *existing = job;
             } else {
@@ -412,77 +409,6 @@ impl Tasks {
             ),
         });
     }
-    pub fn chat_ui(&mut self, ui: &mut egui::Ui, session: &str, connected: bool) {
-        let linked = self.chat_links.get(session).cloned().unwrap_or_default();
-        let jobs: Vec<_> = self
-            .jobs
-            .iter()
-            .filter(|j| belongs_to_session(j, session, &linked))
-            .cloned()
-            .collect();
-        if connected
-            && (self.dirty
-                || ((!linked.is_empty() || !jobs.is_empty())
-                    && self
-                        .last_refresh
-                        .is_none_or(|t| t.elapsed() > Duration::from_secs(15))))
-        {
-            self.refresh();
-        }
-        for job in jobs {
-            ui.add_space(8.0);
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgb(29, 44, 42))
-                .corner_radius(12)
-                .inner_margin(14)
-                .show(ui, |ui| {
-                    ui.set_width((ui.available_width() * 0.90).min(732.0).max(1.0));
-                    ui.horizontal(|ui| {
-                        ui.label(icon_text(lucide_icons::Icon::CalendarClock, 17.0));
-                        ui.label(
-                            egui::RichText::new("Scheduled task")
-                                .small()
-                                .color(egui::Color32::from_rgb(164, 206, 190)),
-                        );
-                    });
-                    ui.strong(job["name"].as_str().unwrap_or("Task"));
-                    ui.label(schedule_label(&job["schedule"]));
-                    let state = if job["enabled"] == true {
-                        "Active"
-                    } else {
-                        "Paused"
-                    };
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{state}{}",
-                            job["state"]["nextRunAtMs"]
-                                .as_u64()
-                                .map(|t| format!(" · Next: {}", timestamp(t)))
-                                .unwrap_or_default()
-                        ))
-                        .small()
-                        .weak(),
-                    );
-                    ui.horizontal(|ui| {
-                        if ui.button("Change in chat").clicked() {
-                            self.edit_in_chat(&job);
-                        }
-                        if ui.button("View history").clicked() {
-                            if let Some(id) = job["id"].as_str() {
-                                self.history = Some((
-                                    id.into(),
-                                    job["name"].as_str().unwrap_or("Task").into(),
-                                ));
-                                self.runs.clear();
-                                self.load_runs(id, 0);
-                                self.open_history = true;
-                            }
-                        }
-                    });
-                });
-        }
-    }
-
     fn queue(&mut self, method: &str, params: Value, kind: Pending) {
         self.outbox.push((method.into(), params, kind));
     }
@@ -722,10 +648,9 @@ impl Tasks {
         thinking: &str,
     ) {
         let all = std::mem::take(&mut self.jobs);
-        let linked = self.chat_links.get(session).cloned().unwrap_or_default();
         self.jobs = all
             .iter()
-            .filter(|j| belongs_to_session(j, session, &linked))
+            .filter(|j| belongs_to_session(j, session, &[]))
             .cloned()
             .collect();
         if self

@@ -195,14 +195,6 @@ impl Center {
     pub fn pending_results(&self) -> Vec<Value> {
         self.entries.iter().filter(|v|v["kind"]=="cron" && (v["needsBody"]==true || v["body"].as_str().is_some_and(|s|s.starts_with("Task finished. Open history")))).map(|v|json!({"action":"finished","jobId":v["job"],"runId":v["runId"],"runAtMs":v["runAtMs"],"status":v["status"],"ts":v["time"]})).collect()
     }
-    pub fn chat_results(&self, session: &str) -> Vec<Value> {
-        self.entries
-            .iter()
-            .rev()
-            .filter(|v| v["kind"] == "cron" && v["session"].as_str() == Some(session))
-            .cloned()
-            .collect()
-    }
 }
 
 pub struct Live {

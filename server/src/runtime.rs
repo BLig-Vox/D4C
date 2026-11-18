@@ -15,6 +15,7 @@ use std::{
 pub struct Runtime {
     pub root: PathBuf,
     units: PathBuf,
+    memory_overrides: HashMap<String, u64>,
     input: Mutex<HashMap<String, Arc<Mutex<Option<rfb::Session>>>>>,
 }
 fn command(program: &str, args: &[&str]) -> Result<String> {
@@ -55,6 +56,17 @@ fn safe_id(id: &str) -> Result<()> {
 }
 impl Runtime {
     pub fn new(root: PathBuf) -> Result<Self> {
+        let memory_overrides: HashMap<String, u64> = std::env::var("D4C_DESKTOP_MEMORY_OVERRIDES")
+            .ok()
+            .map(|text| serde_json::from_str(&text).map_err(|_| "Invalid desktop memory policy".to_string()))
+            .transpose()?
+            .unwrap_or_default();
+        for (id, mb) in &memory_overrides {
+            safe_id(id)?;
+            if !(256..=4096).contains(mb) {
+                return Err("Desktop memory policy must be between256 and4096MiB".into());
+            }
+        }
         let home = std::env::var_os("HOME").ok_or("HOME missing")?;
         let units = PathBuf::from(home).join(".config/containers/systemd");
         fs::create_dir_all(&units).map_err(|e| e.to_string())?;
@@ -62,8 +74,35 @@ impl Runtime {
         Ok(Self {
             root,
             units,
+            memory_overrides,
             input: Mutex::new(HashMap::new()),
         })
+    }
+    /// Apply an explicit administrator policy without stopping a running desktop.
+    pub fn apply_memory_policy(&self, d: &Value) -> Result<Option<u64>> {
+        let id = d["id"].as_str().ok_or("Missing desktop ID")?;
+        let Some(&memory) = self.memory_overrides.get(id) else { return Ok(None); };
+        let previous = d["memoryMb"].as_u64().unwrap_or(1024);
+        if memory == previous { return Ok(None); }
+        if memory < previous {
+            return Err("Live memory policy cannot shrink an existing desktop; stop it and configure deliberately".into());
+        }
+        let available = fs::read_to_string("/proc/meminfo").map_err(|e| e.to_string())?
+            .lines().find(|line| line.starts_with("MemAvailable:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or("Cannot verify host memory headroom")?;
+        if available < (2048 + memory - previous) * 1024 {
+            return Err("Insufficient host memory for desktop policy plus 2 GiB reserve".into());
+        }
+        let mut configured = d.clone();
+        configured["memoryMb"] = serde_json::json!(memory);
+        self.prepare(&configured)?;
+        if self.status(id).is_ok_and(|state| state == "running") {
+            let limit = format!("{memory}m");
+            command("podman", &["update", "--memory", &limit, "--memory-swap", &limit, &format!("d4c-{id}")])?;
+        }
+        Ok(Some(memory))
     }
     pub fn prepare(&self, d: &Value) -> Result<()> {
         let id = d["id"].as_str().ok_or("Missing desktop ID")?;
@@ -85,6 +124,8 @@ impl Runtime {
         }
         let width = d["width"].as_u64().unwrap_or(1280).clamp(640, 2560);
         let height = d["height"].as_u64().unwrap_or(800).clamp(480, 1600);
+        // Lifecycle actions use only the admitted, persisted budget.
+        // A rejected policy must not leak into a later start or stop.
         let memory = d["memoryMb"].as_u64().unwrap_or(1024).clamp(256, 4096);
         let cpus = d["cpus"].as_u64().unwrap_or(1).clamp(1, 2);
         let home = base.join("home");

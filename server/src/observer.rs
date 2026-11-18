@@ -18,6 +18,25 @@ pub fn record(manager: &Manager, session: &str, p: &Value) -> Result<Value> {
     }
     let time = p["time"].as_u64().unwrap_or_else(now);
     let mut db = manager.db.lock().map_err(|_| "Database unavailable")?;
+    if p["kind"] == "cron" {
+        let job = p["job"].as_str().filter(|s| !s.is_empty() && s.len() <= 256)
+            .ok_or("Cron job required")?;
+        let id = format!("cron:{job}:{run}");
+        let text: String = p["text"].as_str().unwrap_or("").chars().take(16000).collect();
+        if let Ok(mut existing) = db.get("notification", &id) {
+            let rev = existing["rev"].as_u64().unwrap_or(0);
+            existing["session"] = json!(session);
+            existing["body"] = json!(text);
+            existing["status"] = p["status"].clone();
+            db.put("notification", &id, Some(rev), existing)?;
+        } else {
+            let title: String = p["title"].as_str().unwrap_or("Scheduled task").chars().take(120).collect();
+            db.put("notification", &id, Some(0), json!({"session":session,"runId":run,
+                "job":job,"runAtMs":p["runAtMs"],"kind":"cron","title":title,
+                "body":text,"unread":true,"time":time,"status":p["status"]}))?;
+        }
+        return Ok(json!({"recorded":true}));
+    }
     let old = db.get("activity", session).ok();
     // Do not let retried old frames overwrite a newer run or revive a completed one.
     let stale = old.as_ref().is_some_and(|o| {

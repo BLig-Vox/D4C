@@ -20,7 +20,23 @@ pub enum Actor {
     Agent(String),
 }
 impl Manager {
-    pub fn new(db: Store, runtime: Runtime) -> Self {
+    pub fn new(mut db: Store, runtime: Runtime) -> Self {
+        if let Ok(desktops) = db.list("desktop") {
+            for mut desktop in desktops.into_iter().filter(|d| d["deleted"] != true) {
+                match runtime.apply_memory_policy(&desktop) {
+                    Ok(Some(memory)) => {
+                        let Some(id) = desktop["id"].as_str().map(str::to_owned) else { continue; };
+                        let revision = desktop["rev"].as_u64().unwrap_or(0);
+                        desktop["memoryMb"] = json!(memory);
+                        if let Err(error) = db.put("desktop", &id, Some(revision), desktop) {
+                            eprintln!("Desktop memory policy persistence failed: {error}");
+                        }
+                    }
+                    Err(error) => eprintln!("Desktop memory policy not applied: {error}"),
+                    Ok(None) => {}
+                }
+            }
+        }
         Self {
             db: Arc::new(Mutex::new(db)),
             runtime: Arc::new(runtime),

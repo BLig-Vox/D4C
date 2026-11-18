@@ -36,6 +36,7 @@ struct Viewer {
     width: u16,
     height: u16,
     status: String,
+    waiting_for_frame: bool,
     last_claim: std::time::Instant,
     buttons: u8,
     zoom: f32,
@@ -128,8 +129,17 @@ impl Desktops {
             }
             for e in events {
                 match e {
-                    Event::Status(s) => v.status = s,
+                    Event::Status(s) => {
+                        v.waiting_for_frame = true;
+                        v.status = if s == "Online" {
+                            "Loading desktop…".into()
+                        } else {
+                            s
+                        };
+                    }
                     Event::Frame(w, h, pixels) => {
+                        v.waiting_for_frame = false;
+                        v.status = "Online".into();
                         let image = egui::ColorImage::from_rgba_unmultiplied(
                             [w as usize, h as usize],
                             &pixels,
@@ -172,6 +182,7 @@ impl Desktops {
             width: 1280,
             height: 800,
             status: "Connecting…".into(),
+            waiting_for_frame: true,
             last_claim: std::time::Instant::now(),
             buttons: 0,
             zoom: 1.0,
@@ -358,9 +369,18 @@ impl Desktops {
             .get("desktop", &v.id)
             .cloned()
             .unwrap_or(Value::Null);
+        let stream_live = v.link.as_ref().is_some_and(Link::is_online) && !v.waiting_for_frame;
+        if !stream_live && v.buttons != 0 {
+            self.workspace.rpc(
+                "desktop.input",
+                json!({"id":v.id,"type":"pointer","x":0,"y":0,"buttons":0}),
+            );
+            v.buttons = 0;
+        }
         let human = d["mode"] == "human";
         let pending_control = self.workspace.control_pending(&v.id);
-        let mut own = human
+        let mut own = stream_live
+            && human
             && !pending_control
             && d["controller"].as_str() == self.workspace.device.as_deref();
         let in_use = self
@@ -379,12 +399,19 @@ impl Desktops {
         if !v.expanded {
             // Floating overlay: preserves full chat width and the user's drag position.
             let diameter = 52.0;
-            let clamp_position = |pos: egui::Pos2| egui::pos2(
-                pos.x.clamp(bounds.left(), (bounds.right() - diameter).max(bounds.left())),
-                pos.y.clamp(bounds.top(), (bounds.bottom() - diameter).max(bounds.top())),
-            );
-            let mut pos = clamp_position(v.bubble_pos.unwrap_or_else(||
-                egui::pos2(bounds.right() - diameter - 12.0, bounds.center().y)));
+            let clamp_position = |pos: egui::Pos2| {
+                egui::pos2(
+                    pos.x.clamp(
+                        bounds.left(),
+                        (bounds.right() - diameter).max(bounds.left()),
+                    ),
+                    pos.y
+                        .clamp(bounds.top(), (bounds.bottom() - diameter).max(bounds.top())),
+                )
+            };
+            let mut pos = clamp_position(v.bubble_pos.unwrap_or_else(|| {
+                egui::pos2(bounds.right() - diameter - 12.0, bounds.center().y)
+            }));
 
             let mut expand = false;
             let mut dismiss = false;
@@ -461,6 +488,7 @@ impl Desktops {
                 v.expanded = true;
                 v.initial_fit = true;
                 v.status = "Connecting…".into();
+                v.waiting_for_frame = true;
                 v.link = Some(workspace::connect(
                     v.base.clone(),
                     Some(v.id.clone()),
@@ -559,6 +587,19 @@ impl Desktops {
                 });
                 if v.last_claim.elapsed()>std::time::Duration::from_secs(10){self.workspace.rpc("desktop.claim",json!({"id":v.id}));v.last_claim=std::time::Instant::now();}
             }
+            if !stream_live {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    let status = if v.status == "Online" { "Desktop disconnected. Reconnecting…" } else { &v.status };
+                    ui.label(egui::RichText::new(status).size(12.0));
+                    if ui.button("Reconnect").clicked() {
+                        if let Some(link) = v.link.as_ref() { link.reconnect(); }
+                        v.waiting_for_frame = true;
+                        v.status = "Reconnecting…".into();
+                    }
+                });
+                if v.texture.is_some() { ui.label(egui::RichText::new("Last received image — waiting for live desktop").small().weak()); }
+            }
             if !self.workspace.error.is_empty(){ui.colored_label(egui::Color32::LIGHT_RED,&self.workspace.error);}
             if let Some(texture)=v.texture.as_ref(){
                 let available=ui.available_size().max(egui::vec2(100.0,100.0));
@@ -590,7 +631,7 @@ impl Desktops {
                         }}}
                     }
                 });
-            }else{ui.allocate_ui(egui::vec2(ui.available_width(),(default_size.y-88.0).max(80.0)),|ui|{ui.spinner();ui.label(&v.status);});}
+            }else{ui.allocate_space(egui::vec2(ui.available_width(),(default_size.y-132.0).max(80.0)));}
         });
         if !was_fullscreen {
             if let Some(shown) = shown {

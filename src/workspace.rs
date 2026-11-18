@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     io,
-    net::TcpStream,
+    net::{TcpStream, ToSocketAddrs},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -28,6 +28,7 @@ pub struct Link {
     pub frame: Arc<std::sync::Mutex<Option<(u16, u16, Vec<u8>)>>>,
     stop: Arc<AtomicBool>,
     online: Arc<AtomicBool>,
+    reconnect: Arc<AtomicBool>,
 }
 impl Drop for Link {
     fn drop(&mut self) {
@@ -35,6 +36,13 @@ impl Drop for Link {
     }
 }
 impl Link {
+    pub fn is_online(&self) -> bool {
+        self.online.load(Ordering::Relaxed) && !self.reconnect.load(Ordering::Relaxed)
+    }
+    pub fn reconnect(&self) {
+        self.online.store(false, Ordering::Relaxed);
+        self.reconnect.store(true, Ordering::Relaxed);
+    }
     pub fn rpc(&self, method: &str, params: Value) -> bool {
         if !self.online.load(Ordering::Relaxed) {
             return false;
@@ -63,8 +71,13 @@ fn transient(e: &tungstenite::Error) -> bool {
     matches!(e,tungstenite::Error::Io(e) if matches!(e.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::TimedOut))
 }
 pub fn base(gateway: &str) -> Option<String> {
-    if let Some(url) = crate::preferences::Settings::load().workspace_urls.get(gateway) {
-        if crate::preferences::valid_url(url) { return Some(url.clone()); }
+    if let Some(url) = crate::preferences::Settings::load()
+        .workspace_urls
+        .get(gateway)
+    {
+        if crate::preferences::valid_url(url) {
+            return Some(url.clone());
+        }
     }
     let uri: tungstenite::http::Uri = gateway.parse().ok()?;
     if uri.scheme_str() != Some("wss") {
@@ -75,7 +88,44 @@ pub fn base(gateway: &str) -> Option<String> {
 pub(crate) fn open(url: &str) -> Result<Socket, String> {
     let uri: tungstenite::http::Uri = url.parse().map_err(|_| "Invalid service URL")?;
     let host = uri.host().ok_or("Service hostname missing")?;
-    let (mut socket, _) = tungstenite::connect(url).map_err(|e| e.to_string())?;
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("wss") {
+            443
+        } else {
+            80
+        });
+    let address_host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let addresses = (address_host, port)
+        .to_socket_addrs()
+        .map_err(|e| e.to_string())?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut stream = None;
+    let mut last_error = "Service address unavailable".to_owned();
+    for address in addresses {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&address, remaining.min(Duration::from_secs(5))) {
+            Ok(socket) => {
+                stream = Some(socket);
+                break;
+            }
+            Err(error) => last_error = error.to_string(),
+        }
+    }
+    let stream = stream.ok_or(last_error)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    let (mut socket, _) = tungstenite::client_tls(url, stream).map_err(|e| e.to_string())?;
     if let Some(s) = tcp(&mut socket) {
         let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
         let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
@@ -126,6 +176,8 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
     let stop = Arc::new(AtomicBool::new(false));
     let online = Arc::new(AtomicBool::new(false));
     let connected = online.clone();
+    let reconnect = Arc::new(AtomicBool::new(false));
+    let retry = reconnect.clone();
     let frame = Arc::new(std::sync::Mutex::new(None));
     let newest = frame.clone();
     let cancel = stop.clone();
@@ -147,6 +199,8 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
             result
         };
         while !cancel.load(Ordering::Relaxed) {
+            retry.store(false, Ordering::Relaxed);
+            emit(Event::Status("Connecting…".into()));
             let url = format!(
                 "{base}/{}",
                 desktop
@@ -161,17 +215,45 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
                 let mut decoder = None;
                 let mut last_frame = std::time::Instant::now();
                 let mut pending = false;
+                let mut last_received = std::time::Instant::now();
+                let mut last_ping = std::time::Instant::now();
+                let framebuffer_deadline = std::time::Instant::now() + Duration::from_secs(15);
+                let mut received_frame = false;
                 loop {
                     if cancel.load(Ordering::Relaxed) {
                         let _ = socket.close(None);
                         return Ok(());
+                    }
+                    if retry.load(Ordering::Relaxed) {
+                        let _ = socket.close(None);
+                        return Err("Reconnect requested".into());
+                    }
+                    // Detect half-open mobile sockets even when the desktop is idle.
+                    if last_received.elapsed() >= Duration::from_secs(30) {
+                        return Err("Workspace connection timed out".into());
+                    }
+                    if desktop.is_some()
+                        && !received_frame
+                        && std::time::Instant::now() >= framebuffer_deadline
+                    {
+                        return Err("Desktop did not send a framebuffer".into());
+                    }
+                    if last_ping.elapsed() >= Duration::from_secs(10) {
+                        socket
+                            .send(Message::Ping(Vec::new().into()))
+                            .map_err(|e| e.to_string())?;
+                        last_ping = std::time::Instant::now();
                     }
                     while let Ok(req) = commands.try_recv() {
                         socket
                             .send(Message::Text(req.to_string().into()))
                             .map_err(|e| e.to_string())?;
                     }
-                    match socket.read() {
+                    let incoming = socket.read();
+                    if incoming.is_ok() {
+                        last_received = std::time::Instant::now();
+                    }
+                    match incoming {
                         Ok(Message::Text(t)) => {
                             let v: Value = serde_json::from_str(&t).map_err(|e| e.to_string())?;
                             if v["type"] == "framebuffer" {
@@ -206,6 +288,7 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
                         Ok(Message::Binary(bytes)) => {
                             if let Some(d) = decoder.as_mut() {
                                 pending |= d.feed(&bytes).map_err(|e| e.to_string())?;
+                                received_frame |= pending;
                             }
                         }
                         Ok(Message::Close(_)) => return Err("Workspace disconnected".into()),
@@ -224,13 +307,33 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
                 }
             })();
             connected.store(false, Ordering::Relaxed);
+            // Never publish an old decoder's final image as the new stream's first frame.
+            if let Ok(mut frame) = newest.lock() {
+                *frame = None;
+            }
             while commands.try_recv().is_ok() {}
             if let Err(e) = result {
-                emit(Event::Status(e));
+                if desktop.is_some() {
+                    eprintln!("Desktop stream disconnected: {e}");
+                    let status = if e.starts_with("Approve this device")
+                        || e.contains("authentication")
+                        || e == "Unexpected server identity"
+                    {
+                        e
+                    } else {
+                        "Desktop disconnected. Reconnecting…".into()
+                    };
+                    emit(Event::Status(status));
+                } else {
+                    emit(Event::Status(e));
+                }
             }
             for _ in 0..30 {
                 if cancel.load(Ordering::Relaxed) {
                     return;
+                }
+                if retry.load(Ordering::Relaxed) {
+                    break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -242,6 +345,7 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
         stop,
         frame,
         online,
+        reconnect,
     }
 }
 #[derive(Default)]

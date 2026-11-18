@@ -9,7 +9,7 @@ A native Rust client for your OpenClaw servers. Chat, stream replies and tool ac
 ## Get started
 
 1. [Set up OpenClaw](docs/setup.md#1-openclaw-and-codex-authentication) on your server.
-2. Download the Android APK from [Releases](https://github.com/Blig-Vox/D4C/releases), or [build the Linux client](#build-and-install-on-linux).
+2. Download the Android APK or Linux x86_64 archive from [Releases](https://github.com/Blig-Vox/D4C/releases).
 3. Open **Settings → Add server**, enter a name and your `wss://` Gateway URL, save, and switch to it. Fresh installations contain no server address.
 4. Approve the new device on the server with `openclaw devices list` and `openclaw devices approve REQUEST_ID`. Supply a Gateway token in Settings if your deployment requires one; tokens are not saved by D4C.
 5. For shared drafts, desktop control and synchronized notification state, install the [workspace manager](docs/setup.md#3-persistent-workspace-and-desktops). It pairs devices separately.
@@ -24,7 +24,7 @@ Use **Settings → Workspace server** if the manager runs on another hostname or
 - **Uploads:** use **+** or desktop drag-and-drop. Limits are 6 MB per file and 12 MB per draft. Sent images have previews; files have cards. Interpretation of audio, video and documents depends on the chosen runtime/model. Unsent attachments stay on their originating device.
 - **Activity:** replies stream as Gateway events arrive. Tool calls have expandable details; thinking is displayed only when emitted by the server. Older messages load when scrolling up.
 - **Commands:** type `/` to discover eligible server commands and skills. Select a suggestion, fill its arguments, then send. `/vnc connect NAME` attaches a desktop to the current conversation; `/vnc disconnect` detaches it without stopping the desktop.
-- **Tasks:** ask in chat, such as “Every weekday at 9 AM, summarize my project.” Open the chat workspace's **Tasks** tab for status, history, run now, pause/resume and deletion. Execution and delivery follow OpenClaw's scheduling configuration; closing D4C does not stop a schedule.
+- **Tasks:** ask in chat, such as “Every weekday at 9 AM, summarize my project.” Open the chat workspace's **Tasks** tab for status, history, run now, pause/resume and deletion. D4C schedules run in isolated sessions; results appear in Tasks history and notifications linked to the originating chat. Scheduled cards do not interrupt the conversation. Closing D4C does not stop a schedule.
 - **Desktops:** open the chat workspace's **Desktop** tab, create or select an environment, and connect it. The floating monitor bubble is freely draggable. Tap to expand, minimize to return to the bubble, and resize/zoom the viewer. **Take over** pauses agent control; **Return to agent** explicitly hands it back. Minimized viewers do not stream video.
 - **Notifications:** the bell shows recent activity. Settings controls OS alerts and sound. Android uses a foreground messaging service; Android notification permissions, battery rules, force-stop and network connectivity affect delivery.
 
@@ -36,6 +36,24 @@ Use **Settings → Workspace server** if the manager runs on another hostname or
 - [Android build and platform notes](android/README.md)
 
 D4C uses OpenClaw's native MCP registry. The included helper queues connection changes until chat turns are idle, checks authentication and tool discovery, and then publishes the targeted change. A queued receipt does **not** mean the service is connected. Subsequent messages can inspect its applied/failed status. OAuth uses OpenClaw's native sign-in. Failed checks preserve the existing registry; the queue does not guarantee that every third-party server or upstream runtime is compatible.
+
+## Prebuilt Linux install
+
+Download `d4c-0.1.0-alpha.2-linux-x86_64.tar.gz` and `SHA256SUMS` from
+[Releases](https://github.com/Blig-Vox/D4C/releases/tag/v0.1.0-alpha.2), then:
+
+```sh
+sha256sum --ignore-missing -c SHA256SUMS
+tar -xzf d4c-0.1.0-alpha.2-linux-x86_64.tar.gz
+cd d4c-0.1.0-alpha.2-linux-x86_64
+python3 scripts/install-desktop.py bin/vox-d4c
+~/.local/bin/vox-d4c
+```
+
+Requires glibc 2.39+ and compatible X11/Wayland and Vulkan drivers. This is a
+native Linux build, not a static binary or AppImage. The separate workspace-server
+archive includes its binary, deployment templates, plugin, migration helper and
+setup documentation; configure it for your server using the guide below.
 
 ## Build and install on Linux
 
