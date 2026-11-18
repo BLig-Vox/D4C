@@ -78,7 +78,7 @@ fn timeout(stream: &mut MaybeTlsStream<TcpStream>) {
     };
     if let Some(s) = tcp {
         let _ = s.set_read_timeout(Some(Duration::from_millis(150)));
-        let _ = s.set_write_timeout(Some(Duration::from_secs(10)));
+        let _ = s.set_write_timeout(Some(Duration::from_secs(1)));
     }
 }
 /// Bound TCP and TLS/WebSocket startup; a black-holed route must not leave
@@ -103,8 +103,8 @@ fn open(
         match TcpStream::connect_timeout(&address, remaining.min(Duration::from_secs(5))) {
             Ok(stream) => {
                 stream.set_nodelay(true)?;
-                stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-                stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+                stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(30)))?;
                 return tungstenite::client_tls(url, stream)
                     .map(|(socket, _)| socket)
                     .map_err(|e| e.to_string().into());
@@ -147,7 +147,7 @@ fn connect_mode(url: String, token: String, ctx: eframe::egui::Context, catalog:
                 if stop.load(Ordering::Relaxed) {
                     return Ok(());
                 }
-                if handshake.elapsed() > Duration::from_secs(20) {
+                if handshake.elapsed() > Duration::from_secs(45) {
                     return Err("Gateway challenge timed out".into());
                 }
                 match socket.read() {
@@ -197,15 +197,18 @@ fn connect_mode(url: String, token: String, ctx: eframe::egui::Context, catalog:
                 nonce
             );
             let sig = signing.sign(payload.as_bytes());
-            let mut params = json!({"minProtocol":4,"maxProtocol":4,"client":{"id":"gateway-client","displayName":"D4C","version":"0.1.0","platform":std::env::consts::OS,"mode":"ui"},"role":"operator","scopes":scopes,"caps":if catalog{json!([])}else{json!(["tool-events"])},"device":{"id":device_id,"publicKey":URL_SAFE_NO_PAD.encode(public),"signature":URL_SAFE_NO_PAD.encode(sig.to_bytes()),"signedAt":signed_at,"nonce":nonce}});
+            let mut params = json!({"minProtocol":4,"maxProtocol":4,"client":{"id":"gateway-client","displayName":"D4C","version":env!("CARGO_PKG_VERSION"),"platform":std::env::consts::OS,"mode":"ui"},"role":"operator","scopes":scopes,"caps":if catalog{json!([])}else{json!(["tool-events"])},"device":{"id":device_id,"publicKey":URL_SAFE_NO_PAD.encode(public),"signature":URL_SAFE_NO_PAD.encode(sig.to_bytes()),"signedAt":signed_at,"nonce":nonce}});
             if !token.is_empty() {
                 params["auth"] = json!({"token":token});
             }
-            socket.send(Message::Text(
-                json!({"type":"req","id":"connect","method":"connect","params":params})
-                    .to_string()
-                    .into(),
-            ))?;
+            crate::wire::send(
+                &mut socket,
+                Message::Text(
+                    json!({"type":"req","id":"connect","method":"connect","params":params})
+                        .to_string()
+                        .into(),
+                ),
+            )?;
             emit(Event::Status("Authenticating…".into()));
             let authentication_started = std::time::Instant::now();
             let mut authenticated = false;
@@ -219,14 +222,14 @@ fn connect_mode(url: String, token: String, ctx: eframe::egui::Context, catalog:
                     let _ = socket.close(None);
                     return Ok(());
                 }
-                if !authenticated && authentication_started.elapsed() >= Duration::from_secs(20) {
+                if !authenticated && authentication_started.elapsed() >= Duration::from_secs(45) {
                     return Err("Gateway authentication timed out; reconnecting".into());
                 }
-                if authenticated && last_received.elapsed() >= Duration::from_secs(60) {
+                if authenticated && last_received.elapsed() >= Duration::from_secs(90) {
                     return Err("Gateway stopped responding; reconnecting".into());
                 }
                 if authenticated && last_ping.elapsed() >= Duration::from_secs(15) {
-                    socket.send(Message::Ping(Vec::new().into()))?;
+                    crate::wire::send(&mut socket, Message::Ping(Vec::new().into()))?;
                     last_ping = std::time::Instant::now();
                 }
                 if authenticated
@@ -235,11 +238,14 @@ fn connect_mode(url: String, token: String, ctx: eframe::egui::Context, catalog:
                     && (catalog_dirty && catalog_refreshed.elapsed() >= Duration::from_secs(1)
                         || catalog_refreshed.elapsed() >= Duration::from_secs(30))
                 {
-                    socket.send(Message::Text(
-                        request("sessions.list", json!({"includeDerivedTitles":true}))
-                            .to_string()
-                            .into(),
-                    ))?;
+                    crate::wire::send(
+                        &mut socket,
+                        Message::Text(
+                            request("sessions.list", json!({"includeDerivedTitles":true}))
+                                .to_string()
+                                .into(),
+                        ),
+                    )?;
                     catalog_pending = true;
                     catalog_dirty = false;
                     catalog_refreshed = std::time::Instant::now();
@@ -248,7 +254,10 @@ fn connect_mode(url: String, token: String, ctx: eframe::egui::Context, catalog:
                 if authenticated {
                     loop {
                         match out_rx.try_recv() {
-                            Ok(req) => socket.send(Message::Text(req.to_string().into()))?,
+                            Ok(req) => crate::wire::send(
+                                &mut socket,
+                                Message::Text(req.to_string().into()),
+                            )?,
                             Err(mpsc::TryRecvError::Empty) => break,
                             Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
                         }
@@ -276,20 +285,23 @@ fn connect_mode(url: String, token: String, ctx: eframe::egui::Context, catalog:
                                     ]
                                 };
                                 for &method in methods {
-                                    socket.send(Message::Text(
-                                        request(
-                                            method,
-                                            if method == "sessions.list" {
-                                                json!({"includeDerivedTitles":true})
-                                            } else if method == "sessions.subscribe" {
-                                                json!({"includeMessageBodies":!catalog})
-                                            } else {
-                                                json!({})
-                                            },
-                                        )
-                                        .to_string()
-                                        .into(),
-                                    ))?;
+                                    crate::wire::send(
+                                        &mut socket,
+                                        Message::Text(
+                                            request(
+                                                method,
+                                                if method == "sessions.list" {
+                                                    json!({"includeDerivedTitles":true})
+                                                } else if method == "sessions.subscribe" {
+                                                    json!({"includeMessageBodies":!catalog})
+                                                } else {
+                                                    json!({})
+                                                },
+                                            )
+                                            .to_string()
+                                            .into(),
+                                        ),
+                                    )?;
                                 }
                                 catalog_pending = catalog;
                                 catalog_refreshed = std::time::Instant::now();

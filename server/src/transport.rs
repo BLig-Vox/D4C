@@ -84,7 +84,8 @@ pub fn serve(manager: Manager, config: &Value) -> Result<()> {
     let observer_uid = u32::try_from(observer_uid).map_err(|_| "Invalid observerUid")?;
     if config["socketGroupAccess"] == true {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&socket, fs::Permissions::from_mode(0o660)).map_err(|e| e.to_string())?;
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))
+            .map_err(|e| e.to_string())?;
     }
     let ipc = manager.clone();
     let ipc_active = active.clone();
@@ -139,22 +140,21 @@ pub fn serve(manager: Manager, config: &Value) -> Result<()> {
         let Some(guard) = permit(&active) else {
             continue;
         };
+        let peer = tcp.peer_addr().ok();
         let tls = tls.clone();
         let manager = manager.clone();
         let host = host.clone();
         std::thread::spawn(move || {
             let _guard = guard;
             if let Err(e) = connection_task(tcp, tls, manager, &host) {
-                eprintln!("Connection ended: {e}");
+                eprintln!("Connection ended peer={peer:?}: {e}");
             }
         });
     }
     Ok(())
 }
 fn send(socket: &mut Socket, value: Value) -> Result<()> {
-    socket
-        .send(Message::Text(value.to_string().into()))
-        .map_err(|e| e.to_string())
+    crate::wire::send(socket, Message::Text(value.to_string().into())).map_err(|e| e.to_string())
 }
 fn connection_task(
     tcp: TcpStream,
@@ -162,9 +162,9 @@ fn connection_task(
     manager: Manager,
     host: &str,
 ) -> Result<()> {
-    tcp.set_read_timeout(Some(Duration::from_secs(10)))
+    tcp.set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(|e| e.to_string())?;
-    tcp.set_write_timeout(Some(Duration::from_secs(5)))
+    tcp.set_write_timeout(Some(Duration::from_secs(30)))
         .map_err(|e| e.to_string())?;
     let _ = tcp.set_nodelay(true);
     let stream = StreamOwned::new(ServerConnection::new(tls).map_err(|e| e.to_string())?, tcp);
@@ -220,6 +220,11 @@ fn connection_task(
         .sock
         .set_read_timeout(Some(Duration::from_millis(150)))
         .map_err(|e| e.to_string())?;
+    socket
+        .get_mut()
+        .sock
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .map_err(|e| e.to_string())?;
     if path == "/control" {
         control(socket, manager, id)
     } else if let Some(desktop) = path.strip_prefix("/vnc/") {
@@ -227,6 +232,29 @@ fn connection_task(
         viewer(socket, manager, desktop)
     } else {
         Err("Unknown endpoint".into())
+    }
+}
+struct Heartbeat {
+    received: Instant,
+    sent: Instant,
+}
+impl Heartbeat {
+    fn new() -> Self {
+        Self {
+            received: Instant::now(),
+            sent: Instant::now(),
+        }
+    }
+    fn poll(&mut self, socket: &mut Socket) -> Result<()> {
+        if self.received.elapsed() >= Duration::from_secs(90) {
+            return Err("WebSocket peer stopped responding".into());
+        }
+        if self.sent.elapsed() >= Duration::from_secs(15) {
+            crate::wire::send(socket, Message::Ping(Vec::new().into()))
+                .map_err(|e| e.to_string())?;
+            self.sent = Instant::now();
+        }
+        Ok(())
     }
 }
 fn control(mut socket: Socket, manager: Manager, client: String) -> Result<()> {
@@ -237,8 +265,14 @@ fn control(mut socket: Socket, manager: Manager, client: String) -> Result<()> {
         .snapshot()?;
     let mut cursor = snapshot["revision"].as_u64().unwrap_or(0);
     send(&mut socket, json!({"type":"snapshot","payload":snapshot}))?;
+    let mut heartbeat = Heartbeat::new();
     loop {
-        match socket.read() {
+        heartbeat.poll(&mut socket)?;
+        let incoming = socket.read();
+        if incoming.is_ok() {
+            heartbeat.received = Instant::now();
+        }
+        match incoming {
             Ok(Message::Text(text)) => {
                 let request: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
                 let method = request["method"].as_str().ok_or("method missing")?;
@@ -300,6 +334,7 @@ fn viewer(mut socket: Socket, manager: Manager, id: &str) -> Result<()> {
     session.request(false).map_err(|e| e.to_string())?;
     let mut refresh = Instant::now();
     let mut bytes = [0; 65536];
+    let mut heartbeat = Heartbeat::new();
     loop {
         if refresh.elapsed() > Duration::from_millis(100) {
             session.request(true).map_err(|e| e.to_string())?;
@@ -307,8 +342,7 @@ fn viewer(mut socket: Socket, manager: Manager, id: &str) -> Result<()> {
         }
         match session.socket.read(&mut bytes) {
             Ok(0) => return Err("VNC disconnected".into()),
-            Ok(n) => socket
-                .send(Message::Binary(bytes[..n].to_vec().into()))
+            Ok(n) => crate::wire::send(&mut socket, Message::Binary(bytes[..n].to_vec().into()))
                 .map_err(|e| e.to_string())?,
             Err(e)
                 if matches!(
@@ -319,7 +353,12 @@ fn viewer(mut socket: Socket, manager: Manager, id: &str) -> Result<()> {
         }
         // The framebuffer channel never forwards client bytes into VNC. All input goes
         // through typed, server-authorized control RPCs, so takeover cannot be bypassed.
-        match socket.read() {
+        heartbeat.poll(&mut socket)?;
+        let incoming = socket.read();
+        if incoming.is_ok() {
+            heartbeat.received = Instant::now();
+        }
+        match incoming {
             Ok(Message::Close(_)) => return Ok(()),
             Ok(_) => {}
             Err(tungstenite::Error::Io(e))

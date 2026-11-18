@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.0-alpha.4 — 2026-11-19
+
+- Recover temporary WebSocket write failures by flushing the queued frame once;
+  never duplicate a message after a partial write. Shared by chat, workspace and server.
+- Add server workspace/VNC heartbeats and log peer addresses.
+- Allow slower authentication and idle recovery on lossy routes.
+- Keep conversation history visible during reconnects; replace chat loading spinners
+  and the reconnect configuration form with compact skeleton placeholders.
+- Report the installed client version in the Gateway handshake. Android version code 9.
+
+
 ## 0.1.0-alpha.3 — 2026-11-19
 
 - Bound Gateway TCP/TLS connection and authentication waits; automatically retry

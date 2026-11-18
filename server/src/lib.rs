@@ -9,3 +9,6 @@ pub mod transport;
 pub mod mcp;
 
 pub mod observer;
+
+#[path = "../../src/wire.rs"]
+pub mod wire;

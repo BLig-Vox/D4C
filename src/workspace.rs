@@ -120,15 +120,15 @@ pub(crate) fn open(url: &str) -> Result<Socket, String> {
     }
     let stream = stream.ok_or(last_error)?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(|e| e.to_string())?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
+        .set_write_timeout(Some(Duration::from_secs(30)))
         .map_err(|e| e.to_string())?;
     let (mut socket, _) = tungstenite::client_tls(url, stream).map_err(|e| e.to_string())?;
     if let Some(s) = tcp(&mut socket) {
-        let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
-        let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+        let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+        let _ = s.set_write_timeout(Some(Duration::from_secs(1)));
         let _ = s.set_nodelay(true);
     }
     let text = socket
@@ -147,7 +147,7 @@ pub(crate) fn open(url: &str) -> Result<Socket, String> {
     let key = gateway::key().map_err(|e| e.to_string())?;
     let public = key.verifying_key().to_bytes();
     let signature = key.sign(format!("d4c-service-v1|{host}|{nonce}").as_bytes());
-    socket.send(Message::Text(json!({"deviceId":format!("{:x}",Sha256::digest(public)),"publicKey":URL_SAFE_NO_PAD.encode(public),"signature":URL_SAFE_NO_PAD.encode(signature.to_bytes())}).to_string().into())).map_err(|e|e.to_string())?;
+    crate::wire::send(&mut socket, Message::Text(json!({"deviceId":format!("{:x}",Sha256::digest(public)),"publicKey":URL_SAFE_NO_PAD.encode(public),"signature":URL_SAFE_NO_PAD.encode(signature.to_bytes())}).to_string().into())).map_err(|e|e.to_string())?;
     let reply: Value = serde_json::from_str(
         &socket
             .read()
@@ -217,7 +217,7 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
                 let mut pending = false;
                 let mut last_received = std::time::Instant::now();
                 let mut last_ping = std::time::Instant::now();
-                let framebuffer_deadline = std::time::Instant::now() + Duration::from_secs(15);
+                let framebuffer_deadline = std::time::Instant::now() + Duration::from_secs(45);
                 let mut received_frame = false;
                 loop {
                     if cancel.load(Ordering::Relaxed) {
@@ -229,7 +229,7 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
                         return Err("Reconnect requested".into());
                     }
                     // Detect half-open mobile sockets even when the desktop is idle.
-                    if last_received.elapsed() >= Duration::from_secs(30) {
+                    if last_received.elapsed() >= Duration::from_secs(90) {
                         return Err("Workspace connection timed out".into());
                     }
                     if desktop.is_some()
@@ -239,14 +239,12 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
                         return Err("Desktop did not send a framebuffer".into());
                     }
                     if last_ping.elapsed() >= Duration::from_secs(10) {
-                        socket
-                            .send(Message::Ping(Vec::new().into()))
+                        crate::wire::send(&mut socket, Message::Ping(Vec::new().into()))
                             .map_err(|e| e.to_string())?;
                         last_ping = std::time::Instant::now();
                     }
                     while let Ok(req) = commands.try_recv() {
-                        socket
-                            .send(Message::Text(req.to_string().into()))
+                        crate::wire::send(&mut socket, Message::Text(req.to_string().into()))
                             .map_err(|e| e.to_string())?;
                     }
                     let incoming = socket.read();

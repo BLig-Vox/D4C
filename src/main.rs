@@ -19,6 +19,7 @@ mod rfb;
 mod servers;
 mod uploads;
 mod workspace;
+mod wire;
 use base64::Engine as _;
 use eframe::egui;
 use serde_json::{Value, json};
@@ -2217,9 +2218,7 @@ impl D4c {
                         {
                             send = true;
                         }
-                        if self.upload.is_some() {
-                            ui.spinner();
-                        }
+                        if self.upload.is_some() { loading_bar(ui, 24.0, 3.0); }
                     });
                 });
                 if !self.composer_error.is_empty() {
@@ -3115,58 +3114,27 @@ impl D4c {
                     self.workspace_ui(ui);
                 } else if self.settings_open {
                     self.settings_ui(ui);
-                } else if !self.connected {
-                    ui.heading("Connect to OpenClaw");
-                    ui.add_space(8.0);
-                    ui.label("Gateway URL");
-                    ui.text_edit_singleline(&mut self.url);
-                    ui.add_space(8.0);
-                    ui.label("Gateway token");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.token)
-                            .password(true)
-                            .hint_text("Paste your Gateway token"),
-                    );
-                    ui.add_space(10.0);
-                    if ui.button("Connect").clicked() {
-                        if preferences::valid_url(&self.url) {
-                            if self.preferences.current().url != self.url {
-                                let index = if let Some(index) = self
-                                    .preferences
-                                    .connections
-                                    .iter()
-                                    .position(|c| c.url == self.url)
-                                {
-                                    index
-                                } else {
-                                    self.preferences.connections.push(preferences::Connection {
-                                        name: "OpenClaw".into(),
-                                        url: self.url.clone(),
-                                    });
-                                    self.preferences.connections.len() - 1
-                                };
-                                let token = std::mem::take(&mut self.token);
-                                self.switch_with_token(index, ui.ctx(), token);
-                            } else {
-                                self.reconnect(ui.ctx());
-                            }
-                        } else {
-                            self.status =
-                                "Use a secure wss:// URL without credentials or query tokens"
-                                    .into();
-                        }
-                    }
-                    ui.add_space(8.0);
-                    if self.gateway.is_some() {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("Reconnecting automatically");
+                } else if !self.connected && self.messages.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(if self.gateway.is_some() { "Connecting" } else { "Offline" }).weak());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Settings").clicked() { self.settings_open = true; }
+                            if ui.small_button("Retry").clicked() { self.reconnect(ui.ctx()); }
                         });
-                    }
+                    });
+                    ui.add_space(20.0);
+                    loading_conversation(ui);
                     if self.status != "Not connected" {
-                        ui.label(&self.status);
+                        egui::CollapsingHeader::new("Connection details").show(ui, |ui| { ui.label(&self.status); });
                     }
                 } else {
+                    if !self.connected {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Reconnecting").small().weak());
+                            if ui.small_button("Retry").clicked() { self.reconnect(ui.ctx()); }
+                        });
+                        loading_bar(ui, ui.available_width().min(180.0), 3.0);
+                    }
                     if ui.input(|i| i.viewport().focused.unwrap_or(false)) && !self.history_loading
                     {
                         self.center.read(Some(&self.session));
@@ -3185,15 +3153,13 @@ impl D4c {
                     if let Some(offset) = self.restore_scroll.take() { message_scroll = message_scroll.vertical_scroll_offset(offset); }
                     let scroll = message_scroll.show(ui, |ui| {
                             if self.older_cursor.is_some() {
-                                if self.older_request.is_some() { ui.spinner(); }
+                                if self.older_request.is_some() { loading_bar(ui, 120.0_f32.min(ui.available_width()), 5.0); }
                                 else if ui.small_button("Earlier messages").clicked() { load_older = true; }
                             }
                             if !self.older_error.is_empty() { ui.colored_label(egui::Color32::LIGHT_RED, &self.older_error); }
                             if self.history_loading {
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.label("Loading conversation…");
-                                });
+                                if self.messages.is_empty() { loading_conversation(ui); }
+                                else { loading_bar(ui, 160.0_f32.min(ui.available_width()), 5.0); }
                             }
                             if self.messages.is_empty()
                                 && !self.history_loading
@@ -3748,6 +3714,24 @@ fn chat_row(
     }
     (response.clicked(), edit, delete)
 }
+fn loading_bar(ui: &mut egui::Ui, width: f32, height: f32) {
+    let phase = ui.input(|i| i.time) as f32;
+    let alpha = (24.0 + 10.0 * (phase * 2.4).sin()) as u8;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width.max(0.0), height), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 5.0, egui::Color32::from_white_alpha(alpha));
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(66));
+}
+fn loading_conversation(ui: &mut egui::Ui) {
+    let width = ui.available_width();
+    for (right, lengths) in [(false, [0.64, 0.78, 0.41]), (true, [0.46, 0.57, 0.3]), (false, [0.72, 0.62, 0.46])] {
+        if ui.available_height() < 70.0 { break; }
+        let block = width * if right { 0.65 } else { 0.86 };
+        ui.with_layout(if right { egui::Layout::top_down(egui::Align::RIGHT) } else { egui::Layout::top_down(egui::Align::LEFT) }, |ui| {
+            for fraction in lengths { loading_bar(ui, block * fraction, 10.0); ui.add_space(7.0); }
+        });
+        ui.add_space(24.0);
+    }
+}
 fn icon_text(icon: lucide_icons::Icon, size: f32) -> egui::RichText {
     egui::RichText::new(char::from(icon).to_string()).font(egui::FontId::new(
         size,
@@ -3881,6 +3865,20 @@ mod composer_tests {
         app.gateway = Some(gateway::test_gateway(out, rx));
         tx.send(event).unwrap();
         app.events(&egui::Context::default());
+    }
+    #[test]
+    fn skeleton_fits_mobile_and_desktop() {
+        for width in [320.0, 390.0, 768.0, 1440.0] {
+            for height in [160.0, 780.0] {
+                let ctx = egui::Context::default();
+                let mut used = egui::Rect::NOTHING;
+                let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height))), ..Default::default() }, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| { loading_conversation(ui); used = ui.min_rect(); });
+                });
+                output.textures_delta.clear();
+                assert!(used.max.x <= width && used.max.y <= height, "{width}x{height}: {used:?}");
+            }
+        }
     }
     #[test]
     fn deletion_acknowledgement_uses_original_target() {
@@ -4028,7 +4026,7 @@ mod composer_tests {
             media: Default::default(),
             role: "user".into(),
             text: "Current conversation".into(),
-            item_id: None,
+            item_id: Some("message:current".into()),
         });
         let (tx, rx) = std::sync::mpsc::channel();
         let (out, _) = std::sync::mpsc::channel();
@@ -4036,7 +4034,7 @@ mod composer_tests {
         tx.send(gateway::Event::Data(json!({"type":"res","ok":true,"id":"chat.history:first","payload":{"messages":[{"role":"user","content":"Wrong conversation"}]}}))).unwrap();
         app.events(&egui::Context::default());
         assert_eq!(app.messages[0].text, "Current conversation");
-        tx.send(gateway::Event::Data(json!({"type":"res","ok":true,"id":"chat.history:second","payload":{"messages":[{"role":"user","content":"Selected history"}]}}))).unwrap();
+        tx.send(gateway::Event::Data(json!({"type":"res","ok":true,"id":"chat.history:second","payload":{"messages":[{"role":"user","id":"current","content":"Selected history"}]}}))).unwrap();
         app.events(&egui::Context::default());
         assert_eq!(app.messages[0].text, "Selected history");
         assert!(app.history_request.is_none());
@@ -4064,7 +4062,7 @@ mod composer_tests {
             role: "user".into(),
             text: "Local echo".into(),
             media: vec![],
-            item_id: None,
+            item_id: Some("local:send-1".into()),
         });
         tx.send(gateway::Event::Data(json!({"event":"session.message","payload":{"sessionKey":"shared","messageId":"m3","message":{"role":"user","content":"Local echo"}}}))).unwrap();
         app.events(&egui::Context::default());

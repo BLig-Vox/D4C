@@ -1351,18 +1351,18 @@ mod tests {
         assert_eq!(tasks.outbox.len(), 8);
     }
     #[test]
-    fn scheduler_tool_results_link_cards_to_their_chat() {
+    fn scheduler_tool_results_do_not_assign_chat_ownership() {
         let job = json!({"id":"task-1","name":"Morning summary","schedule":{"kind":"cron","expr":"0 9 * * *","tz":"Asia/Manila"},"enabled":true});
         let result = json!({"content":[{"type":"text","text":job.to_string()}],"details":job});
         let mut tasks = Tasks::default();
         tasks.observe_tool("chat-a", &result);
-        assert_eq!(tasks.chat_links["chat-a"], vec!["task-1"]);
+        assert!(!belongs_to_session(&tasks.jobs[0], "chat-a", &[]));
         assert_eq!(tasks.jobs.len(), 1);
         tasks.observe_tool("chat-a", &result);
         assert_eq!(tasks.jobs.len(), 1);
         assert!(task_summary(&result).unwrap().contains("Daily at 09:00"));
         tasks.observe_tool("chat-b", &json!({"isError":true,"details":job}));
-        assert!(!tasks.chat_links.contains_key("chat-b"));
+        assert!(!belongs_to_session(&tasks.jobs[0], "chat-b", &[]));
         assert!(is_scheduler_tool("automations"));
         assert!(is_scheduler_tool("mcp__openclaw__cron"));
     }
@@ -1383,6 +1383,7 @@ mod tests {
     #[test]
     fn respects_timezone_and_weekdays() {
         let mut e = Editor::new("model", "medium");
+        e.timezone = "Asia/Manila".into();
         assert_eq!(
             e.schedule().unwrap(),
             json!({"kind":"cron","expr":"0 9 * * *","tz":"Asia/Manila"})

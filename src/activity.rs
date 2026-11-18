@@ -319,7 +319,7 @@ mod tests {
         assert!(c.cron(&r).is_some());
         assert_eq!(c.entries[0]["session"], "");
         c.bind(&[json!({"id":"late","name":"Late task","owner":{"sessionKey":"owner"}})]);
-        assert_eq!(c.chat_results("owner").len(), 1);
+        assert_eq!(c.unread(Some("owner")), 1);
         assert_eq!(c.entries[0]["title"], "Late task");
         assert!(c.cron(&r).is_none());
     }
@@ -341,8 +341,8 @@ mod tests {
         let item = c.cron(&run).unwrap();
         assert_eq!(item["session"], "owner-chat");
         assert!(c.cron(&run).is_none());
-        assert_eq!(c.chat_results("owner-chat").len(), 1);
-        assert!(c.chat_results("isolated-run-chat").is_empty());
+        assert_eq!(c.unread(Some("owner-chat")), 1);
+        assert_eq!(c.unread(Some("isolated-run-chat")), 0);
         let mut newer = run.clone();
         newer["runId"] = json!("r2");
         newer["status"] = json!("error");
