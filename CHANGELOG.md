@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0-alpha.3 — 2026-11-19
+
+- Bound Gateway TCP/TLS connection and authentication waits; automatically retry
+  silent connections with heartbeat monitoring.
+- Wait for authentication before sending queued RPCs after a reconnect.
+- Remove the unconditional device-approval reminder from disconnected screens;
+  show connection progress and actual Gateway errors instead.
+- Remove D4C desktop RAM/swap caps, including persistent migration of existing
+  containers without restarting their desktops. Compilation guards are unchanged.
+- Android version code 8, signed with the same developer key as earlier APKs.
+
+
 ## 0.1.0-alpha.1 — 2026-11-19
 
 First public D4C alpha for Linux and Android arm64.

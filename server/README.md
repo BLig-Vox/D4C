@@ -19,8 +19,9 @@ Deployment templates under `deploy/` must be rendered for your host with
 - Each desktop has its own rootless container, home, workspace, X server, runtime
   and DBus session. The supplied Arch/XFCE image includes a browser and fonts.
 
-Two desktops may run at once; default resources per desktop are 1 GiB memory,
-no additional swap, one CPU and a PID limit. Frames use one latest-frame slot.
+Two desktops may run at once; each desktop has one CPU and a PID limit.
+D4C does not impose a desktop RAM or swap cap; desktops share the host
+resources under the operating system's normal memory management. Frames use one latest-frame slot.
 Human takeover is enforced by the server, across clients and agent tools. Losing
 a controller lease releases held input and leaves agent input paused until an
 explicit Return to agent. Deleting a desktop removes its unit/container but
@@ -38,22 +39,18 @@ identities and a desktop and restarts the manager. Read it before use, run only
 on an owned test deployment, and supply `D4C_HOSTNAME`. It is not an installer.
 See [MCP setup](../docs/mcp.md) for the independent idle queue service.
 
-## Explicit desktop memory policy
+## Desktop memory and build limits
 
-Administrators may set `D4C_DESKTOP_MEMORY_OVERRIDES` to a JSON object mapping
-existing desktop UUIDs to memory in MiB, for example:
+D4C does not set Podman desktop memory/swap limits. On upgrade, the manager
+removes legacy `memoryMb` limits from existing desktops, their generated Quadlet
+units and running containers without restarting those containers. Migration uses
+the rootless Podman Unix socket and verifies both the persisted configuration
+and the live cgroup. `podman.socket` is started in the manager account’s user
+systemd instance; it is not exposed on TCP. Obsolete
+`D4C_DESKTOP_MEMORY_OVERRIDES` settings are ignored and should be removed.
 
-```sh
-D4C_DESKTOP_MEMORY_OVERRIDES='{"00000000-0000-4000-8000-000000000001":1536}'
-```
+The separate build supervisor still enforces its requested compilation RAM cap,
+zero build swap and one Cargo job. Those controls apply only to compilation.
 
-The manager validates UUIDs and limits (256–4096 MiB), admits increases only with
-2 GiB host `MemAvailable` plus the increase in reserve, persists the admitted
-budget, and updates a running container without restarting it. Memory and
-memory-plus-swap limits are equal, allowing no additional container swap.
-Rejected policies do not affect later lifecycle operations. Defaults and other
-desktops stay unchanged. A higher limit provides headroom; it does not prevent
-all browser OOMs or reserve that much physical memory.
-
-For Codex desktop screenshot histories, see the separately installed,
+For Codex screenshot histories, see the separately installed,
 [version-checked request budget adapter](codex-image-budget/README.md).

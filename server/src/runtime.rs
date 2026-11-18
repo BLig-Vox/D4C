@@ -6,7 +6,8 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     fs,
-    io::Write,
+    io::{Read, Write},
+    os::unix::net::UnixStream,
     path::PathBuf,
     process::{Command, Stdio},
     sync::{Arc, Mutex},
@@ -15,7 +16,6 @@ use std::{
 pub struct Runtime {
     pub root: PathBuf,
     units: PathBuf,
-    memory_overrides: HashMap<String, u64>,
     input: Mutex<HashMap<String, Arc<Mutex<Option<rfb::Session>>>>>,
 }
 fn command(program: &str, args: &[&str]) -> Result<String> {
@@ -56,17 +56,6 @@ fn safe_id(id: &str) -> Result<()> {
 }
 impl Runtime {
     pub fn new(root: PathBuf) -> Result<Self> {
-        let memory_overrides: HashMap<String, u64> = std::env::var("D4C_DESKTOP_MEMORY_OVERRIDES")
-            .ok()
-            .map(|text| serde_json::from_str(&text).map_err(|_| "Invalid desktop memory policy".to_string()))
-            .transpose()?
-            .unwrap_or_default();
-        for (id, mb) in &memory_overrides {
-            safe_id(id)?;
-            if !(256..=4096).contains(mb) {
-                return Err("Desktop memory policy must be between256 and4096MiB".into());
-            }
-        }
         let home = std::env::var_os("HOME").ok_or("HOME missing")?;
         let units = PathBuf::from(home).join(".config/containers/systemd");
         fs::create_dir_all(&units).map_err(|e| e.to_string())?;
@@ -74,35 +63,68 @@ impl Runtime {
         Ok(Self {
             root,
             units,
-            memory_overrides,
             input: Mutex::new(HashMap::new()),
         })
     }
-    /// Apply an explicit administrator policy without stopping a running desktop.
-    pub fn apply_memory_policy(&self, d: &Value) -> Result<Option<u64>> {
+    /// Remove legacy desktop RAM limits without restarting its container.
+    pub fn remove_memory_limit(&self, d: &Value) -> Result<()> {
         let id = d["id"].as_str().ok_or("Missing desktop ID")?;
-        let Some(&memory) = self.memory_overrides.get(id) else { return Ok(None); };
-        let previous = d["memoryMb"].as_u64().unwrap_or(1024);
-        if memory == previous { return Ok(None); }
-        if memory < previous {
-            return Err("Live memory policy cannot shrink an existing desktop; stop it and configure deliberately".into());
+        self.prepare(d)?;
+        // The CLI treats --memory=0 as unchanged. The local API accepts OCI's
+        // explicit -1 sentinel, updating both persistent configuration and cgroups.
+        command("systemctl", &["--user", "start", "podman.socket"])?;
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR missing")?;
+        let socket = PathBuf::from(runtime_dir).join("podman/podman.sock");
+        let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .map_err(|e| e.to_string())?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .map_err(|e| e.to_string())?;
+        let body = r#"{"memory":{"limit":-1,"swap":-1}}"#;
+        write!(stream, "POST /v4.0.0/libpod/containers/d4c-{id}/update HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
+        let mut response = String::new();
+        stream
+            .take(65536)
+            .read_to_string(&mut response)
+            .map_err(|e| e.to_string())?;
+        if !response
+            .lines()
+            .next()
+            .is_some_and(|line| line.split_whitespace().nth(1) == Some("201"))
+        {
+            return Err(format!(
+                "Podman RAM limit removal failed: {}",
+                response.chars().take(1000).collect::<String>()
+            ));
         }
-        let available = fs::read_to_string("/proc/meminfo").map_err(|e| e.to_string())?
-            .lines().find(|line| line.starts_with("MemAvailable:"))
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|value| value.parse::<u64>().ok())
-            .ok_or("Cannot verify host memory headroom")?;
-        if available < (2048 + memory - previous) * 1024 {
-            return Err("Insufficient host memory for desktop policy plus 2 GiB reserve".into());
+        let inspect: Value =
+            serde_json::from_str(&command("podman", &["inspect", &format!("d4c-{id}")])?)
+                .map_err(|e| e.to_string())?;
+        if inspect[0]["HostConfig"]["Memory"] != -1 || inspect[0]["HostConfig"]["MemorySwap"] != -1
+        {
+            return Err("Podman did not persist unlimited desktop memory".into());
         }
-        let mut configured = d.clone();
-        configured["memoryMb"] = serde_json::json!(memory);
-        self.prepare(&configured)?;
-        if self.status(id).is_ok_and(|state| state == "running") {
-            let limit = format!("{memory}m");
-            command("podman", &["update", "--memory", &limit, "--memory-swap", &limit, &format!("d4c-{id}")])?;
+        if let Some(pid) = inspect[0]["State"]["Pid"].as_u64().filter(|pid| *pid > 0) {
+            let membership =
+                fs::read_to_string(format!("/proc/{pid}/cgroup")).map_err(|e| e.to_string())?;
+            let relative = membership
+                .lines()
+                .find_map(|line| line.strip_prefix("0::"))
+                .ok_or("Desktop cgroup v2 path missing")?;
+            let cgroup = PathBuf::from("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+            for name in ["memory.max", "memory.swap.max"] {
+                if fs::read_to_string(cgroup.join(name))
+                    .map_err(|e| e.to_string())?
+                    .trim()
+                    != "max"
+                {
+                    return Err(format!("Desktop {name} is still capped"));
+                }
+            }
         }
-        Ok(Some(memory))
+        Ok(())
     }
     pub fn prepare(&self, d: &Value) -> Result<()> {
         let id = d["id"].as_str().ok_or("Missing desktop ID")?;
@@ -124,14 +146,11 @@ impl Runtime {
         }
         let width = d["width"].as_u64().unwrap_or(1280).clamp(640, 2560);
         let height = d["height"].as_u64().unwrap_or(800).clamp(480, 1600);
-        // Lifecycle actions use only the admitted, persisted budget.
-        // A rejected policy must not leak into a later start or stop.
-        let memory = d["memoryMb"].as_u64().unwrap_or(1024).clamp(256, 4096);
         let cpus = d["cpus"].as_u64().unwrap_or(1).clamp(1, 2);
         let home = base.join("home");
         let work = base.join("work");
         let unit = format!(
-            "[Unit]\nDescription=D4C desktop {id}\nStartLimitIntervalSec=120\nStartLimitBurst=5\n[Container]\nImage=localhost/d4c-arch-xfce:1\nContainerName=d4c-{id}\nNetwork=pasta:--no-map-gw\nPublishPort=127.0.0.1::5900\nVolume={home}:/home/desktop\nVolume={work}:/workspace\nEnvironment=D4C_WIDTH={width}\nEnvironment=D4C_HEIGHT={height}\nWorkingDir=/workspace\nPodmanArgs=--memory={memory}m --memory-swap={memory}m --cpus={cpus} --pids-limit=512\n[Service]\nRestart=on-failure\nRestartSec=3\nTimeoutStartSec=45\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription=D4C desktop {id}\nStartLimitIntervalSec=120\nStartLimitBurst=5\n[Container]\nImage=localhost/d4c-arch-xfce:1\nContainerName=d4c-{id}\nNetwork=pasta:--no-map-gw\nPublishPort=127.0.0.1::5900\nVolume={home}:/home/desktop\nVolume={work}:/workspace\nEnvironment=D4C_WIDTH={width}\nEnvironment=D4C_HEIGHT={height}\nWorkingDir=/workspace\nPodmanArgs=--cpus={cpus} --pids-limit=512\n[Service]\nRestart=on-failure\nRestartSec=3\nTimeoutStartSec=45\n[Install]\nWantedBy=default.target\n",
             home = home.display(),
             work = work.display()
         );

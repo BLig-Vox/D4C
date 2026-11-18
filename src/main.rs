@@ -3157,7 +3157,12 @@ impl D4c {
                         }
                     }
                     ui.add_space(8.0);
-                    ui.label("Approve this device on your OpenClaw server if pairing is requested.");
+                    if self.gateway.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Reconnecting automatically");
+                        });
+                    }
                     if self.status != "Not connected" {
                         ui.label(&self.status);
                     }

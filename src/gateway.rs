@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, Write},
-    net::TcpStream,
+    net::{TcpStream, ToSocketAddrs},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -81,6 +81,39 @@ fn timeout(stream: &mut MaybeTlsStream<TcpStream>) {
         let _ = s.set_write_timeout(Some(Duration::from_secs(10)));
     }
 }
+/// Bound TCP and TLS/WebSocket startup; a black-holed route must not leave
+/// the app waiting forever before its automatic reconnect loop can run.
+fn open(
+    url: &str,
+) -> Result<tungstenite::WebSocket<MaybeTlsStream<TcpStream>>, Box<dyn std::error::Error>> {
+    let uri: tungstenite::http::Uri = url.parse()?;
+    let host = uri.host().ok_or("Gateway hostname missing")?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut last_error =
+        io::Error::new(io::ErrorKind::TimedOut, "Gateway TCP connection timed out");
+    for address in (host, uri.port_u16().unwrap_or(443)).to_socket_addrs()? {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&address, remaining.min(Duration::from_secs(5))) {
+            Ok(stream) => {
+                stream.set_nodelay(true)?;
+                stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+                return tungstenite::client_tls(url, stream)
+                    .map(|(socket, _)| socket)
+                    .map_err(|e| e.to_string().into());
+            }
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error.into())
+}
 fn request(method: &str, params: Value) -> Value {
     json!({"type":"req","id":format!("{method}:{}",uuid::Uuid::new_v4()),"method":method,"params":params})
 }
@@ -106,8 +139,9 @@ fn connect_mode(url: String, token: String, ctx: eframe::egui::Context, catalog:
                 return Err("A secure wss:// Gateway URL is required".into());
             }
             emit(Event::Status("Connecting…".into()));
-            let (mut socket, _) = tungstenite::connect(url.as_str())?;
+            let mut socket = open(&url)?;
             timeout(socket.get_mut());
+            emit(Event::Status("Waiting for server…".into()));
             let handshake = std::time::Instant::now();
             let challenge: Value = loop {
                 if stop.load(Ordering::Relaxed) {
@@ -172,6 +206,11 @@ fn connect_mode(url: String, token: String, ctx: eframe::egui::Context, catalog:
                     .to_string()
                     .into(),
             ))?;
+            emit(Event::Status("Authenticating…".into()));
+            let authentication_started = std::time::Instant::now();
+            let mut authenticated = false;
+            let mut last_received = std::time::Instant::now();
+            let mut last_ping = std::time::Instant::now();
             let mut catalog_pending = false;
             let mut catalog_dirty = false;
             let mut catalog_refreshed = std::time::Instant::now();
@@ -180,7 +219,18 @@ fn connect_mode(url: String, token: String, ctx: eframe::egui::Context, catalog:
                     let _ = socket.close(None);
                     return Ok(());
                 }
-                if catalog
+                if !authenticated && authentication_started.elapsed() >= Duration::from_secs(20) {
+                    return Err("Gateway authentication timed out; reconnecting".into());
+                }
+                if authenticated && last_received.elapsed() >= Duration::from_secs(60) {
+                    return Err("Gateway stopped responding; reconnecting".into());
+                }
+                if authenticated && last_ping.elapsed() >= Duration::from_secs(15) {
+                    socket.send(Message::Ping(Vec::new().into()))?;
+                    last_ping = std::time::Instant::now();
+                }
+                if authenticated
+                    && catalog
                     && !catalog_pending
                     && (catalog_dirty && catalog_refreshed.elapsed() >= Duration::from_secs(1)
                         || catalog_refreshed.elapsed() >= Duration::from_secs(30))
@@ -194,18 +244,26 @@ fn connect_mode(url: String, token: String, ctx: eframe::egui::Context, catalog:
                     catalog_dirty = false;
                     catalog_refreshed = std::time::Instant::now();
                 }
-                loop {
-                    match out_rx.try_recv() {
-                        Ok(req) => socket.send(Message::Text(req.to_string().into()))?,
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                // RPCs queued across a reconnect must wait for the connect reply.
+                if authenticated {
+                    loop {
+                        match out_rx.try_recv() {
+                            Ok(req) => socket.send(Message::Text(req.to_string().into()))?,
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                        }
                     }
                 }
-                match socket.read() {
+                let received = socket.read();
+                if received.is_ok() {
+                    last_received = std::time::Instant::now();
+                }
+                match received {
                     Ok(Message::Text(t)) => {
                         let v: Value = serde_json::from_str(&t)?;
                         if v["id"] == "connect" {
                             if v["ok"] == true {
+                                authenticated = true;
                                 emit(Event::Status("Connected".into()));
                                 let methods: &[&str] = if catalog {
                                     &["sessions.list", "sessions.subscribe"]
