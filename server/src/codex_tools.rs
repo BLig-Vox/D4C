@@ -163,7 +163,13 @@ fn execute_once(
 pub fn answer(manager: &Manager, upstream_request: &Value) -> Option<Value> {
     let req = upstream_request;
     let p = &req["params"];
-    if req["method"] != "item/tool/call" || req["id"].is_null() || p["namespace"] != "d4c" {
+    if req["method"] != "item/tool/call"
+        || req["id"].is_null()
+        || !matches!(
+            p["namespace"].as_str(),
+            Some("d4c" | "openclaw" | "openclaw_direct")
+        )
+    {
         return None;
     }
     let result = (|| {
@@ -178,6 +184,9 @@ pub fn answer(manager: &Manager, upstream_request: &Value) -> Option<Value> {
             .filter(|s| !s.is_empty())
             .ok_or("Missing call id")?;
         let tool = p["tool"].as_str().ok_or("Missing tool name")?;
+        if p["namespace"] != "d4c" && tool != "desktop_context" && mcp::method(tool).is_err() {
+            return Err(format!("Legacy tool {tool} is unavailable. Use native Codex skills and the d4c desktop tools."));
+        }
         execute_once(manager, thread, turn, call, tool, &p["arguments"])
     })()
     .unwrap_or_else(|e| text_result(e, false));
@@ -211,7 +220,7 @@ fn invalidate_migrated_history(home: &Path, targets: &HashSet<String>) -> Result
 }
 
 /// Run with the native server stopped, as the owner of the dedicated migrated Codex home.
-/// Only the metadata line changes. Codex reads dynamic tools from this line on resume.
+/// Resumes can recover dynamic tools from the header or a compaction checkpoint.
 pub fn migrate_tools(home: &Path) -> Result<usize, String> {
     let manifest: Value = serde_json::from_reader(
         fs::File::open(home.join("migration-manifest.json")).map_err(|e| e.to_string())?,
@@ -289,9 +298,7 @@ fn migrate_rollout(path: &Path, id: &str) -> Result<bool, String> {
         return Err(format!("Invalid dynamic tool metadata for thread {id}"));
     }
     let updated = combine_specs(existing);
-    if *existing == updated {
-        return Ok(false);
-    }
+    let mut changed = *existing != updated;
     first["payload"]["dynamic_tools"] = updated;
     let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| -> io::Result<()> {
@@ -305,7 +312,32 @@ fn migrate_rollout(path: &Path, id: &str) -> Result<bool, String> {
             .open(&temp)?;
         serde_json::to_writer(&mut writer, &first)?;
         writer.write_all(b"\n")?;
-        io::copy(&mut reader, &mut writer)?;
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            let mut event: Value = serde_json::from_slice(&line)?;
+            if event["type"] == "compacted"
+                && let Some(tools) =
+                    event.pointer_mut("/payload/resume_metadata/dynamic_tools/tools")
+                && tools.is_array()
+            {
+                let next = combine_specs(tools);
+                if *tools != next {
+                    *tools = next;
+                    serde_json::to_writer(&mut writer, &event)?;
+                    writer.write_all(b"\n")?;
+                    changed = true;
+                    continue;
+                }
+            }
+            writer.write_all(&line)?;
+        }
+        if !changed {
+            drop(writer);
+            return fs::remove_file(&temp);
+        }
         writer.sync_all()?;
         fs::rename(&temp, path)?;
         if let Some(parent) = path.parent() {
@@ -316,7 +348,7 @@ fn migrate_rollout(path: &Path, id: &str) -> Result<bool, String> {
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
-    result.map(|_| true).map_err(|e| e.to_string())
+    result.map(|_| changed).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -381,11 +413,20 @@ mod tests {
         let first = json!({"type":"session_meta","payload":{"id":"test"}});
         let mut data = first.to_string().into_bytes();
         data.push(b'\n');
+        let checkpoint = json!({"type":"compacted","payload":{"resume_metadata":{"dynamic_tools":{"thread_id":"test","tools":[{"type":"namespace","name":"openclaw","tools":[]}]}}}});
+        data.extend_from_slice(checkpoint.to_string().as_bytes());
+        data.push(b'\n');
         data.extend_from_slice(tail);
         fs::write(&path, data).unwrap();
         assert!(migrate_rollout(&path, "test").unwrap());
         let updated = fs::read(&path).unwrap();
         assert!(updated.ends_with(tail));
+        let checkpoint: Value =
+            serde_json::from_slice(updated.split(|b| *b == b'\n').nth(1).unwrap()).unwrap();
+        assert_eq!(
+            checkpoint["payload"]["resume_metadata"]["dynamic_tools"]["tools"][0]["name"],
+            "d4c"
+        );
         assert!(!migrate_rollout(&path, "test").unwrap());
         fs::remove_dir_all(dir).unwrap();
     }

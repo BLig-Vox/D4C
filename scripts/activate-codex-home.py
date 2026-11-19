@@ -21,15 +21,43 @@ def copy_rollout(source, dest, old_workspace, workspace):
     with source.open("rb") as src, dest.open("xb") as out:
         for raw in src:
             event = json.loads(raw)
-            if event["type"] not in ("session_meta", "turn_context"):
+            if event["type"] == "world_state":
+                state = event["payload"]["state"]
+                env = state.get("environments") or {}
+                if isinstance(env, dict):
+                    local = (env.get("environments") or {}).get("local") or {}
+                    if local.get("cwd") == str(old_workspace):
+                        local["cwd"] = str(workspace)
+                    if isinstance(env.get("filesystem"), str):
+                        for end in ("/", "<"):
+                            env["filesystem"] = env["filesystem"].replace(
+                                str(old_workspace) + end, str(workspace) + end)
+                instructions = state.get("agents_md")
+                if isinstance(instructions, dict) and instructions.get("directory") == str(old_workspace):
+                    instructions["directory"] = str(workspace)
+                out.write(json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode() + b"\n")
+                continue
+            if event["type"] in ("session_meta", "turn_context"):
+                payload = event["payload"]
+            elif event["type"] == "event_msg" and isinstance(event["payload"].get("thread_settings"), dict):
+                payload = event["payload"]["thread_settings"]
+            else:
                 out.write(raw)
                 continue
-            payload = event["payload"]
             if payload.get("cwd") == str(old_workspace):
                 payload["cwd"] = str(workspace)
             if isinstance(payload.get("runtime_workspace_roots"), list):
                 payload["runtime_workspace_roots"] = [
                     str(workspace) if x == str(old_workspace) else x for x in payload["runtime_workspace_roots"]]
+            for policy in (payload.get("file_system_sandbox_policy"),
+                           (payload.get("permission_profile") or {}).get("file_system")):
+                if not isinstance(policy, dict):
+                    continue
+                for entry in policy.get("entries", []):
+                    target = entry.get("path")
+                    value = target.get("path") if isinstance(target, dict) else None
+                    if isinstance(value, str) and Path(value).is_relative_to(old_workspace):
+                        target["path"] = str(workspace / Path(value).relative_to(old_workspace))
             out.write(json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode() + b"\n")
 
 
