@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-alpha.7
+
+- Reuse the authenticated chat connection when returning to a previously visited server and refresh its conversation history.
+- Include an offline migration staging tool for existing OpenClaw chats, the bundled Ponytail skill, and an optional paired transport to a local Codex App Server. The existing chat runtime continues to serve this release.
+- Android version code 12.
+
 ## 0.1.0-alpha.6 — 2026-11-19
 
 - Display failed replies in the transcript, both live and after reopening a chat.

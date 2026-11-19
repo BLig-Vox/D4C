@@ -39,13 +39,13 @@ D4C uses OpenClaw's native MCP registry. The included helper queues connection c
 
 ## Prebuilt Linux install
 
-Download `d4c-0.1.0-alpha.6-linux-x86_64.tar.gz` and `SHA256SUMS` from
-[Releases](https://github.com/Blig-Vox/D4C/releases/tag/v0.1.0-alpha.6), then:
+Download `d4c-0.1.0-alpha.7-linux-x86_64.tar.gz` and `SHA256SUMS` from
+[Releases](https://github.com/Blig-Vox/D4C/releases/tag/v0.1.0-alpha.7), then:
 
 ```sh
 sha256sum --ignore-missing -c SHA256SUMS
-tar -xzf d4c-0.1.0-alpha.6-linux-x86_64.tar.gz
-cd d4c-0.1.0-alpha.6-linux-x86_64
+tar -xzf d4c-0.1.0-alpha.7-linux-x86_64.tar.gz
+cd d4c-0.1.0-alpha.7-linux-x86_64
 python3 scripts/install-desktop.py bin/vox-d4c
 ~/.local/bin/vox-d4c
 ```
