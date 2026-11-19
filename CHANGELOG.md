@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Preserve DNS resolution inside the isolated Codex service on systemd-resolved hosts.
+- Keep current chats visible after migration and archive other imported rollouts. Exclude Codex subagent threads from sidebar queries.
+
 ## 0.1.0-alpha.8
 
 - Run chats on native Codex App Server over the saved WSS endpoint. D4C uses its paired device identity for chat and workspace access.

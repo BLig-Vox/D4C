@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -53,6 +54,9 @@ def install(args):
         instructions = stage / "workspace/AGENTS.md"
         if instructions.exists():
             instructions.rename(stage / "workspace/OPENCLAW-AGENTS.md")
+        chat_threads = {row["threadId"] for key, row in manifest["sessions"].items()
+                        if re.fullmatch(r"agent:[^:]+:d4c-[^:]+", key) and row.get("threadId")}
+        installed_paths = {}
         for src in (snap / "native").rglob("rollout-*.jsonl"):
             rel = src.relative_to(snap / "native")
             with src.open("rb") as f:
@@ -62,15 +66,20 @@ def install(args):
                     f.seek(0)
                     if hashlib.file_digest(f, "sha256").hexdigest() != record["sha256"]:
                         raise ValueError("Rollout hash mismatch")
+            if rel.parts[0] == "sessions" and tid not in chat_threads:
+                rel = Path("archived_sessions") / rel.name
+            installed_paths[tid] = rel
             copy_rollout(src, stage / rel, old, workspace)
         for src in (snap / "databases").glob("*.sqlite"):
             if src.name.split("_")[0] in ("state", "thread", "queue", "memories", "goals"):
                 shutil.copy2(src, stage / src.name)
         for path in stage.glob("state_*.sqlite"):
             with contextlib.closing(sqlite3.connect(path)) as db, db:
-                for tid, fields in manifest["threads"].items():
+                for tid, rel in installed_paths.items():
                     db.execute("UPDATE threads SET rollout_path=?,cwd=CASE WHEN cwd=? THEN ? ELSE cwd END WHERE id=?",
-                               (str(home / fields["path"]),str(old),str(workspace),tid))
+                               (str(home / rel),str(old),str(workspace),tid))
+                    if rel.parts[0] == "archived_sessions":
+                        db.execute("UPDATE threads SET archived=1, archived_at=COALESCE(archived_at,unixepoch()) WHERE id=?", (tid,))
                 with contextlib.closing(sqlite3.connect(snap / "databases/openclaw-agent.sqlite")) as agent:
                     for key, title in agent.execute("SELECT session_key,COALESCE(NULLIF(label,''),display_name) FROM session_nodes"):
                         row = manifest["sessions"].get(key,{})

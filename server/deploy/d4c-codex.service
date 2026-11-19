@@ -28,6 +28,8 @@ TemporaryFileSystem=/var/lib/d4c:ro /run:ro
 BindPaths=/run/d4c-codex
 BindPaths=/var/lib/d4c/codex
 BindReadOnlyPaths=/var/lib/d4c/uploads
+# Keep the systemd-resolved target of /etc/resolv.conf visible inside private /run.
+BindReadOnlyPaths=-/run/systemd/resolve
 InaccessiblePaths=-/etc/d4c
 ProtectKernelModules=yes
 ProtectControlGroups=yes

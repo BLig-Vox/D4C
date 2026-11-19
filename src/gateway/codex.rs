@@ -106,7 +106,7 @@ impl Adapter {
         let method = string(&req["method"]);
         match method {
             "sessions.list" => {
-                let params = json!({"limit":100,"modelProviders":[],"sourceKinds":["cli","vscode","exec","appServer","subAgent","subAgentReview","subAgentCompact","subAgentThreadSpawn","subAgentOther","unknown"],"sortKey":"updated_at","cursor":req["cursor"]});
+                let params = json!({"limit":100,"modelProviders":[],"sourceKinds":["cli","vscode","exec","appServer","unknown"],"sortKey":"updated_at","cursor":req["cursor"]});
                 self.call("thread/list", params, req);
             }
             "models.list" => {

@@ -55,6 +55,8 @@ sudo systemctl start d4c-certificate.service
 
 Codex 0.169.0 creates a mode-0600 Unix socket under a private per-user directory in `/tmp` and links `/run/d4c-codex/app.sock` to it. The tmpfiles rule creates this directory on boot. The service shares this directory across its private mount namespace. Its work directory is `/var/lib/d4c/codex/workspace`. Uploaded attachments appear read-only at `/var/lib/d4c/uploads`.
 
+On systemd-resolved hosts, the unit mounts `/run/systemd/resolve` read-only inside its private `/run`. If a CLI chat succeeds but the service times out fetching models, check that `/etc/resolv.conf` resolves inside the service mount namespace after updating the unit and restarting it.
+
 ### Migrate an existing OpenClaw host
 
 For a migration, complete this step **before** creating the new workspace or launching the Codex service. Wait for active work to finish, take the final snapshot while the legacy service is idle, then stop and disable its gateway and schedule workers. Use the paths for the actual gateway account. Each snapshot destination must be new. Keep the source data and verified snapshot available for recovery.
@@ -73,7 +75,7 @@ sudo -u d4c /usr/local/bin/d4c-server --import-aliases /var/lib/d4c/codex/migrat
 sudo -u d4c /usr/local/bin/d4c-server --migrate-codex-tools /var/lib/d4c/codex
 ```
 
-The activation script verifies recorded native rollout hashes, copies the workspace, and rewrites thread paths to the new home. Its optional `--migrate-openai-profile` flag imports an unambiguous OpenAI profile from the private snapshot. When authentication is missing or expired, sign in as described below. Retain the original provider and schedule data until you have verified conversations and scheduled tasks on the new host.
+The activation script verifies recorded native rollout hashes, copies the workspace, and rewrites thread paths to the new home. Only current D4C chat bindings appear in the sidebar after migration. Other imported threads, including old bindings and scheduled runs, retain their rollouts in `archived_sessions`. New chats appear normally. The optional `--migrate-openai-profile` flag imports an unambiguous OpenAI profile from the private snapshot. When authentication is missing or expired, sign in as described below. Retain the original provider and schedule data until you have verified conversations and scheduled tasks on the new host.
 
 Import the archived jobs and run receipts before starting the timer. The final snapshot can contain credentials, so read it as its existing owner. Give the service account ownership of its new scheduler store. Jobs whose legacy target cannot run natively retain a migration error and stay disabled.
 
