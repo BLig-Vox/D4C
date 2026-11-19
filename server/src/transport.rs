@@ -290,6 +290,9 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
         .map_err(timeout)?;
     let (mut upstream, _) = tungstenite::client("ws://localhost/", stream)
         .map_err(|e| format!("Codex handshake: {e}"))?;
+    // Native Codex emits a whole JSON response in one frame. Allow a single
+    // large turn up to the existing message limit on this local Unix socket.
+    upstream.set_config(|cfg| cfg.max_frame_size = cfg.max_message_size);
     let tick = Some(Duration::from_millis(10));
     upstream.get_mut().set_read_timeout(tick).map_err(timeout)?;
     client
@@ -326,6 +329,15 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
                             send(&mut client, response)?;
                             continue;
                         }
+                        if request["method"] == "thread/turns/list"
+                            && request["params"]["itemsView"] == "full"
+                        {
+                            // A single desktop-heavy turn can contain megabytes of screenshots.
+                            // Codex returns a cursor for the remaining turns.
+                            request["params"]["limit"] = json!(1);
+                            send_native(&mut upstream, request)?;
+                            continue;
+                        }
                         if request["method"] == "thread/start" {
                             crate::codex_tools::augment_thread_start(&mut request);
                             send_native(&mut upstream, request)?;
@@ -353,7 +365,12 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
         match receive_codex(&mut upstream)? {
             Some(Message::Close(_)) => return Ok(()),
             Some(message) if message.is_text() => {
-                if let Ok(req) = serde_json::from_str::<Value>(message.to_text().unwrap_or("")) {
+                if let Ok(mut req) = serde_json::from_str::<Value>(message.to_text().unwrap_or(""))
+                {
+                    if compact_history_images(&mut req) {
+                        send(&mut client, req)?;
+                        continue;
+                    }
                     if let Some(reply) = crate::codex_tools::answer(manager, &req) {
                         send_native(&mut upstream, reply)?;
                         continue;
@@ -364,6 +381,47 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
             _ => {}
         }
     }
+}
+
+// The transcript displays tool results as text. Avoid transferring base64 screenshots
+// as JSON text while retaining the original result in Codex and all user attachments.
+fn compact_history_images(response: &mut Value) -> bool {
+    let mut changed = false;
+    let Some(turns) = response
+        .pointer_mut("/result/data")
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    for turn in turns {
+        for item in turn
+            .get_mut("items")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            if item["type"] != "dynamicToolCall" {
+                continue;
+            }
+            for part in item
+                .get_mut("contentItems")
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten()
+            {
+                if part["type"] == "inputImage"
+                    && part["imageUrl"]
+                        .as_str()
+                        .is_some_and(|url| url.starts_with("data:image/"))
+                {
+                    *part =
+                        json!({"type":"inputText","text":"[Tool image saved in Codex history]"});
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
 }
 
 fn send_native<S: Read + Write>(ws: &mut WebSocket<S>, value: Value) -> Result<()> {
@@ -680,6 +738,21 @@ fn peer_is_owner(stream: &std::os::unix::net::UnixStream, owner_uid: u32) -> Res
 #[cfg(test)]
 mod ipc_tests {
     use super::*;
+    #[test]
+    fn history_compacts_only_embedded_tool_images() {
+        let image = json!({"type":"inputImage","imageUrl":"data:image/png;base64,test"});
+        let user = json!({"type":"userMessage","content":[image.clone()]});
+        let mut response = json!({"result":{"data":[{"items":[user.clone(),
+            {"type":"dynamicToolCall","contentItems":[image,{"type":"inputText","text":"ok"}]}
+        ]}],"nextCursor":"older"}});
+        assert!(compact_history_images(&mut response));
+        assert_eq!(response["result"]["nextCursor"], "older");
+        let items = &response["result"]["data"][0]["items"];
+        assert_eq!(items[0], user);
+        assert_eq!(items[1]["contentItems"][0]["type"], "inputText");
+        assert_eq!(items[1]["contentItems"][1]["text"], "ok");
+        assert!(!compact_history_images(&mut response));
+    }
     #[test]
     fn second_manager_cannot_unlink_live_socket() {
         let dir = std::env::temp_dir().join(format!("d4c-ipc-{}", uuid::Uuid::new_v4()));

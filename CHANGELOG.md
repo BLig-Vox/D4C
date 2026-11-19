@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Page full Codex history one turn at a time and replace embedded desktop-tool screenshots with a text marker during replay. This prevents screenshot-heavy conversations from repeatedly disconnecting when switching servers. Original screenshots remain in Codex history.
+
 - Preserve DNS resolution inside the isolated Codex service on systemd-resolved hosts.
 - Keep current chats visible after migration and archive other imported rollouts. Exclude Codex subagent threads from sidebar queries.
 
