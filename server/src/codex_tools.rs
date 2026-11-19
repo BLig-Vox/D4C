@@ -184,6 +184,32 @@ pub fn answer(manager: &Manager, upstream_request: &Value) -> Option<Value> {
     Some(json!({"id":req["id"],"result":result}))
 }
 
+// Both activation and tool registration change byte offsets in the rollout. Codex
+// rebuilds these three derived tables from the final files when the thread resumes.
+fn invalidate_migrated_history(home: &Path, targets: &HashSet<String>) -> Result<(), String> {
+    let path = home.join("thread_history_1.sqlite");
+    if !path.try_exists().map_err(|e| e.to_string())? {
+        return Ok(());
+    }
+    let mut database =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|e| e.to_string())?;
+    let tx = database.transaction().map_err(|e| e.to_string())?;
+    for table in [
+        "thread_turns",
+        "thread_items",
+        "thread_history_projection_state",
+    ] {
+        let mut delete = tx
+            .prepare(&format!("DELETE FROM {table} WHERE thread_id=?1"))
+            .map_err(|e| e.to_string())?;
+        for id in targets {
+            delete.execute([id]).map_err(|e| e.to_string())?;
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+
 /// Run with the native server stopped, as the owner of the dedicated migrated Codex home.
 /// Only the metadata line changes. Codex reads dynamic tools from this line on resume.
 pub fn migrate_tools(home: &Path) -> Result<usize, String> {
@@ -206,6 +232,7 @@ pub fn migrate_tools(home: &Path) -> Result<usize, String> {
             targets.insert(id.into());
         }
     }
+    invalidate_migrated_history(home, &targets)?;
     let mut dirs = vec![home.join("sessions"), home.join("archived_sessions")];
     let mut changed = 0;
     while let Some(dir) = dirs.pop() {
@@ -295,6 +322,46 @@ fn migrate_rollout(path: &Path, id: &str) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invalidation_only_removes_derived_rows_for_migrated_threads() {
+        let home = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir(&home).unwrap();
+        let db = rusqlite::Connection::open(home.join("thread_history_1.sqlite")).unwrap();
+        let tables = [
+            "thread_turns",
+            "thread_items",
+            "thread_history_projection_state",
+            "thread_realtime_items",
+        ];
+        for table in tables {
+            db.execute_batch(&format!(
+                "CREATE TABLE {table}(thread_id TEXT); INSERT INTO {table} VALUES ('old'), ('new');"
+            ))
+            .unwrap();
+        }
+        for _ in 0..2 {
+            invalidate_migrated_history(&home, &HashSet::from(["old".into()])).unwrap();
+        }
+        for table in tables {
+            let ids: String = db
+                .query_row(
+                    &format!("SELECT group_concat(thread_id) FROM {table}"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                ids,
+                if table == "thread_realtime_items" {
+                    "old,new"
+                } else {
+                    "new"
+                }
+            );
+        }
+        drop(db);
+        fs::remove_dir_all(home).unwrap();
+    }
     #[test]
     fn registration_preserves_unrelated_tools_and_is_idempotent() {
         let other =

@@ -68,7 +68,7 @@ sudo python3 scripts/activate-codex-home.py /var/lib/d4c/migration/cutover-01 \
   --workspace /path/to/gateway-account/.openclaw/workspace
 ```
 
-Before starting Codex, import the native thread aliases into the manager and register the scoped D4C tools in existing rollout metadata. Keep the app server stopped while rewriting rollout metadata.
+Before starting Codex, import the native thread aliases into the manager and register the scoped D4C tools in existing rollout metadata. Keep the app server stopped while rewriting rollout metadata. This step also clears the migrated threads’ derived history indexes. Codex rebuilds them from the relocated transcripts when each chat resumes. On older migrations, rerun this step with the updated tool if a new reply disappears after refreshing the chat.
 
 ```sh
 sudo -u d4c /usr/local/bin/d4c-server --import-aliases /var/lib/d4c/codex/migration-manifest.json
