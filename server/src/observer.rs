@@ -18,11 +18,44 @@ pub fn record(manager: &Manager, session: &str, p: &Value) -> Result<Value> {
     }
     let time = p["time"].as_u64().unwrap_or_else(now);
     let mut db = manager.db.lock().map_err(|_| "Database unavailable")?;
+    if p["kind"] == "recovery" {
+        let id = format!("recovery:{run}");
+        if db.get("notification", &id).is_err() {
+            let title: String = p["title"]
+                .as_str()
+                .unwrap_or("Connection recovery")
+                .chars()
+                .take(120)
+                .collect();
+            let text: String = p["text"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(16000)
+                .collect();
+            db.put(
+                "notification",
+                &id,
+                Some(0),
+                json!({"session":session,"runId":run,
+                "kind":"recovery","title":title,"body":text,"unread":true,
+                "time":time,"status":p["status"]}),
+            )?;
+        }
+        return Ok(json!({"recorded":true}));
+    }
     if p["kind"] == "cron" {
-        let job = p["job"].as_str().filter(|s| !s.is_empty() && s.len() <= 256)
+        let job = p["job"]
+            .as_str()
+            .filter(|s| !s.is_empty() && s.len() <= 256)
             .ok_or("Cron job required")?;
         let id = format!("cron:{job}:{run}");
-        let text: String = p["text"].as_str().unwrap_or("").chars().take(16000).collect();
+        let text: String = p["text"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(16000)
+            .collect();
         if let Ok(mut existing) = db.get("notification", &id) {
             let rev = existing["rev"].as_u64().unwrap_or(0);
             existing["session"] = json!(session);
@@ -30,10 +63,20 @@ pub fn record(manager: &Manager, session: &str, p: &Value) -> Result<Value> {
             existing["status"] = p["status"].clone();
             db.put("notification", &id, Some(rev), existing)?;
         } else {
-            let title: String = p["title"].as_str().unwrap_or("Scheduled task").chars().take(120).collect();
-            db.put("notification", &id, Some(0), json!({"session":session,"runId":run,
+            let title: String = p["title"]
+                .as_str()
+                .unwrap_or("Scheduled task")
+                .chars()
+                .take(120)
+                .collect();
+            db.put(
+                "notification",
+                &id,
+                Some(0),
+                json!({"session":session,"runId":run,
                 "job":job,"runAtMs":p["runAtMs"],"kind":"cron","title":title,
-                "body":text,"unread":true,"time":time,"status":p["status"]}))?;
+                "body":text,"unread":true,"time":time,"status":p["status"]}),
+            )?;
         }
         return Ok(json!({"recorded":true}));
     }
@@ -73,6 +116,34 @@ pub fn record(manager: &Manager, session: &str, p: &Value) -> Result<Value> {
 mod tests {
     use super::*;
     use crate::{runtime::Runtime, store::Store};
+    #[test]
+    fn recovery_notices_do_not_replace_live_conversation_activity() {
+        let root = std::env::temp_dir().join(format!("d4c-recovery-{}", uuid::Uuid::new_v4()));
+        let manager = Manager::new(
+            Store::open(&root.join("db")).unwrap(),
+            Runtime::new(root.clone()).unwrap(),
+        );
+        record(
+            &manager,
+            "chat",
+            &json!({"runId":"live","phase":"running","time":1}),
+        )
+        .unwrap();
+        let notice = json!({"kind":"recovery","runId":"refresh","phase":"finished","time":2,"text":"Retry your message"});
+        record(&manager, "chat", &notice).unwrap();
+        record(&manager, "chat", &notice).unwrap();
+        let db = manager.db.lock().unwrap();
+        assert_eq!(db.get("activity", "chat").unwrap()["runId"], "live");
+        assert_eq!(db.get("activity", "chat").unwrap()["running"], true);
+        assert_eq!(db.list("notification").unwrap().len(), 1);
+        assert_eq!(
+            db.get("notification", "recovery:refresh").unwrap()["session"],
+            "chat"
+        );
+        drop(db);
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn terminal_events_are_durable_and_not_reopened_by_retries() {
         let root = std::env::temp_dir().join(format!("d4c-observer-{}", uuid::Uuid::new_v4()));

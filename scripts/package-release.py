@@ -27,7 +27,7 @@ def main():
         names = ['LICENSE', 'README.md', 'docs/setup.md', 'docs/mcp.md', 'scripts/build-limited.py']
         if server:
             names += ['server/README.md', 'scripts/configure-server.py', 'scripts/install-mcp-queue.py',
-                      'scripts/isolate-scheduled-chats.py']
+                      'scripts/isolate-scheduled-chats.py', 'scripts/sync-codex-models.py']
             for directory in ['server/deploy', 'server/openclaw-plugin', 'server/openclaw-skills',
                               'server/systemd', 'server/scripts', 'server/codex-image-budget', 'server/desktop']:
                 names += [str(f.relative_to(ROOT)) for f in sorted((ROOT / directory).rglob('*'))

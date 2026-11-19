@@ -7,8 +7,8 @@ mod android_text;
 mod android_uploads;
 mod commands;
 mod cron;
-mod desktops;
 mod desktop_wire;
+mod desktops;
 mod draft_sync;
 mod gateway;
 mod media;
@@ -19,8 +19,8 @@ mod questions;
 mod rfb;
 mod servers;
 mod uploads;
-mod workspace;
 mod wire;
+mod workspace;
 use base64::Engine as _;
 use eframe::egui;
 use serde_json::{Value, json};
@@ -79,13 +79,22 @@ struct Draft {
     input: String,
     attachments: Vec<uploads::Attachment>,
 }
-struct ServerView {session:String,messages:Vec<ChatMessage>,scroll:(f32,f32),desktop:desktops::UiState}
-const SERVER_CACHE_BYTES:usize=16*1024*1024;
-fn message_cache_bytes(m:&ChatMessage)->usize {m.media.iter().fold(m.text.len(),|n,a|n.saturating_add(a.cache_bytes()))}
+struct ServerView {
+    session: String,
+    messages: Vec<ChatMessage>,
+    scroll: (f32, f32),
+    desktop: desktops::UiState,
+}
+const SERVER_CACHE_BYTES: usize = 16 * 1024 * 1024;
+fn message_cache_bytes(m: &ChatMessage) -> usize {
+    m.media
+        .iter()
+        .fold(m.text.len(), |n, a| n.saturating_add(a.cache_bytes()))
+}
 struct D4c {
     desktops: desktops::Desktops,
     servers: servers::Catalogs,
-    server_views:std::collections::VecDeque<(String,ServerView)>,
+    server_views: std::collections::VecDeque<(String, ServerView)>,
     explicit_selection: bool,
     jump_latest: bool,
     workspace_hydrated: bool,
@@ -176,7 +185,7 @@ impl Default for D4c {
         Self {
             desktops: Default::default(),
             servers,
-            server_views:Default::default(),
+            server_views: Default::default(),
             explicit_selection: remembered.is_some(),
             jump_latest: false,
             workspace_hydrated: false,
@@ -291,6 +300,17 @@ impl D4c {
             ctx.clone(),
         ));
     }
+    fn upsert_notice(&mut self, row: ChatMessage) {
+        if let Some(existing) = row.item_id.as_ref().and_then(|id| {
+            self.messages
+                .iter_mut()
+                .find(|m| m.item_id.as_ref() == Some(id))
+        }) {
+            *existing = row;
+        } else {
+            self.messages.push(row);
+        }
+    }
     fn reset_connection(&mut self, index: usize, token: String) {
         self.deleted_sessions.clear();
         self.pending_sends.clear();
@@ -301,18 +321,40 @@ impl D4c {
             .rows
             .get(&preferences.current().url)
             .and_then(|row| row.selected.clone());
-        let mut views=std::mem::take(&mut self.server_views);
-        views.retain(|(url,_)|url!=&self.url);
+        let mut views = std::mem::take(&mut self.server_views);
+        views.retain(|(url, _)| url != &self.url);
         if preferences::valid_url(&self.url) {
-            let mut messages=std::mem::take(&mut self.messages);
+            let mut messages = std::mem::take(&mut self.messages);
             messages.drain(..messages.len().saturating_sub(100));
-            while messages.iter().map(|m|message_cache_bytes(m) as u128).sum::<u128>()>SERVER_CACHE_BYTES as u128 && !messages.is_empty(){messages.remove(0);}
-            views.push_back((self.url.clone(),ServerView{session:self.session.clone(),messages,scroll:self.history_scroll,desktop:self.desktops.capture_ui()}));
+            while messages
+                .iter()
+                .map(|m| message_cache_bytes(m) as u128)
+                .sum::<u128>()
+                > SERVER_CACHE_BYTES as u128
+                && !messages.is_empty()
+            {
+                messages.remove(0);
+            }
+            views.push_back((
+                self.url.clone(),
+                ServerView {
+                    session: self.session.clone(),
+                    messages,
+                    scroll: self.history_scroll,
+                    desktop: self.desktops.capture_ui(),
+                },
+            ));
         }
-        let restored=views.iter().position(|(url,_)|url==&preferences.current().url).and_then(|n|views.remove(n)).map(|(_,v)|v);
-        while views.len()>2 {views.pop_front();}
+        let restored = views
+            .iter()
+            .position(|(url, _)| url == &preferences.current().url)
+            .and_then(|n| views.remove(n))
+            .map(|(_, v)| v);
+        while views.len() > 2 {
+            views.pop_front();
+        }
         let mut next = Self::default();
-        next.server_views=views;
+        next.server_views = views;
         next.servers = servers;
         next.session =
             remembered.unwrap_or_else(|| format!("agent:main:d4c-{}", uuid::Uuid::new_v4()));
@@ -324,9 +366,23 @@ impl D4c {
         next.sidebar_open = self.sidebar_open;
         next.compact_previous = self.compact_previous;
         next.settings_open = self.settings_open;
-        next.sessions=next.servers.rows.get(&next.url).map(|row|row.sessions.iter().map(|s|(s.key.clone(),s.title.clone())).collect()).unwrap_or_default();
-        if let Some(view)=restored {
-            next.desktops.restore_ui(view.desktop);next.session=view.session;next.messages=view.messages;next.history_scroll=view.scroll;next.restore_scroll=Some(view.scroll.1);
+        next.sessions = next
+            .servers
+            .rows
+            .get(&next.url)
+            .map(|row| {
+                row.sessions
+                    .iter()
+                    .map(|s| (s.key.clone(), s.title.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(view) = restored {
+            next.desktops.restore_ui(view.desktop);
+            next.session = view.session;
+            next.messages = view.messages;
+            next.history_scroll = view.scroll;
+            next.restore_scroll = Some(view.scroll.1);
         }
         next.restore_server_drafts();
         *self = next;
@@ -1373,6 +1429,10 @@ impl D4c {
                                     });
                                 }
                             }
+                        } else if message["role"] == "custom" {
+                            if let Some(row) = transcript_message(message) {
+                                self.upsert_notice(row);
+                            }
                         }
                     }
                     if id.starts_with("models.list:") {
@@ -1426,37 +1486,8 @@ impl D4c {
                                 if cron::is_scheduler_tool(tool) {
                                     self.cron.observe_tool(&self.session, m);
                                 }
-                                let role = m["role"].as_str().unwrap_or("");
-                                let text = message_text(m);
-                                let media = media::from_message(m);
-                                if (role == "user"
-                                    || role == "assistant"
-                                    || matches!(role, "toolResult" | "tool"))
-                                    && (!text.is_empty() || !media.is_empty())
-                                {
-                                    self.messages.push(ChatMessage {
-                                        media,
-                                        role: if matches!(role, "toolResult" | "tool") {
-                                            tool_title(tool, "result", m["isError"] == true)
-                                        } else {
-                                            role.into()
-                                        },
-                                        text,
-                                        item_id: if matches!(role, "toolResult" | "tool") {
-                                            Some(format!(
-                                                "tool:{}",
-                                                m["toolCallId"]
-                                                    .as_str()
-                                                    .or_else(|| m["__openclaw"]["id"].as_str())
-                                                    .unwrap_or(tool)
-                                            ))
-                                        } else {
-                                            m["__openclaw"]["id"]
-                                                .as_str()
-                                                .or_else(|| m["id"].as_str())
-                                                .map(|id| format!("message:{id}"))
-                                        },
-                                    });
+                                if let Some(row) = transcript_message(m) {
+                                    self.messages.push(row);
                                 }
                             }
                         }
@@ -1465,14 +1496,26 @@ impl D4c {
                         // older pages: intentional repeated prompts must survive.
                         if !older_page {
                             if let (Some(local), Some(canonical)) = (
-                                previous.iter_mut().rev().find(|m| m.role == "user" &&
-                                    m.item_id.as_deref().is_some_and(|id| id.starts_with("local:"))),
+                                previous.iter_mut().rev().find(|m| {
+                                    m.role == "user"
+                                        && m.item_id
+                                            .as_deref()
+                                            .is_some_and(|id| id.starts_with("local:"))
+                                }),
                                 self.messages.iter().rev().find(|m| m.role == "user"),
                             ) {
-                                if local.text == canonical.text && !local.text.is_empty() &&
-                                    local.media.len() == canonical.media.len() &&
-                                    local.media.iter().zip(&canonical.media).all(|(a,b)| a.name == b.name && a.mime == b.mime) {
-                                    if canonical.item_id.is_some() { local.item_id = canonical.item_id.clone(); }
+                                if local.text == canonical.text
+                                    && !local.text.is_empty()
+                                    && local.media.len() == canonical.media.len()
+                                    && local
+                                        .media
+                                        .iter()
+                                        .zip(&canonical.media)
+                                        .all(|(a, b)| a.name == b.name && a.mime == b.mime)
+                                {
+                                    if canonical.item_id.is_some() {
+                                        local.item_id = canonical.item_id.clone();
+                                    }
                                 }
                             }
                         }
@@ -1505,6 +1548,29 @@ impl D4c {
                             if !self.history_initialized {
                                 self.older_cursor = page_cursor;
                                 self.history_initialized = true;
+                            }
+                        }
+                        if !older_page
+                            && payload["sessionInfo"]["status"] == "failed"
+                            && payload["sessionInfo"]["hasActiveRun"] == false
+                        {
+                            if let Some(text) = payload["sessionInfo"]["lastRunError"]
+                                .as_str()
+                                .filter(|t| !t.is_empty())
+                            {
+                                let id = payload["sessionInfo"]["lastRunId"]
+                                    .as_str()
+                                    .map(|id| format!("run-error:{id}"));
+                                if !id.as_ref().is_some_and(|id| {
+                                    self.messages.iter().any(|m| m.item_id.as_ref() == Some(id))
+                                }) {
+                                    self.upsert_notice(ChatMessage {
+                                        role: "error".into(),
+                                        text: text.into(),
+                                        media: vec![],
+                                        item_id: id,
+                                    });
+                                }
                             }
                         }
                         self.media_requests.clear();
@@ -1580,6 +1646,22 @@ impl D4c {
                         } else if state == "error" || state == "aborted" {
                             self.running = false;
                             self.status = payload["errorMessage"].as_str().unwrap_or(state).into();
+                            if state == "error" {
+                                let text = payload["errorMessage"]
+                                    .as_str()
+                                    .filter(|t| !t.is_empty())
+                                    .unwrap_or("The assistant could not complete this reply.");
+                                let id = payload["runId"]
+                                    .as_str()
+                                    .map(|id| format!("run-error:{id}"));
+                                self.upsert_notice(ChatMessage {
+                                    role: "error".into(),
+                                    text: text.into(),
+                                    media: vec![],
+                                    item_id: id,
+                                });
+                                self.history_dirty = true;
+                            }
                         }
                     }
                     if v["event"] == "agent"
@@ -2180,7 +2262,11 @@ impl D4c {
                         .unwrap_or(&self.model)
                         .to_string();
                     egui::ComboBox::from_id_salt("model")
-                        .selected_text(if short.is_empty() { "Model".into() } else { short })
+                        .selected_text(if short.is_empty() {
+                            "Model".into()
+                        } else {
+                            short
+                        })
                         .width(if ui.available_width() < 280.0 {
                             104.0
                         } else {
@@ -2239,7 +2325,9 @@ impl D4c {
                         {
                             send = true;
                         }
-                        if self.upload.is_some() { loading_bar(ui, 24.0, 3.0); }
+                        if self.upload.is_some() {
+                            loading_bar(ui, 24.0, 3.0);
+                        }
                     });
                 });
                 if !self.composer_error.is_empty() {
@@ -2357,7 +2445,9 @@ impl D4c {
             return;
         }
         let mut patch = json!({"key":self.session,"thinkingLevel":self.thinking});
-        if !self.model.is_empty() { patch["model"] = json!(self.model); }
+        if !self.model.is_empty() {
+            patch["model"] = json!(self.model);
+        }
         if let Some(id) = self.rpc("sessions.patch", patch) {
             self.selection_pending.insert(id, self.session.clone());
         }
@@ -2443,6 +2533,60 @@ impl D4c {
         self.slash_dismissed = false;
         self.slash_selected = 0;
     }
+}
+fn transcript_message(m: &Value) -> Option<ChatMessage> {
+    let role = m["role"].as_str()?;
+    let custom = role == "custom" && m["display"] == true;
+    if !matches!(role, "user" | "assistant" | "toolResult" | "tool") && !custom {
+        return None;
+    }
+    let text = message_text(m);
+    let media = media::from_message(m);
+    if text.is_empty() && media.is_empty() {
+        return None;
+    }
+    let tool = matches!(role, "toolResult" | "tool");
+    let failure = custom
+        && (m["customType"] == "run-failed-before-reply" || m["openclawRunError"].is_object());
+    let id = m["__openclaw"]["id"].as_str().or_else(|| m["id"].as_str());
+    let item_id = if failure {
+        m["openclawRunError"]["runId"]
+            .as_str()
+            .or_else(|| m["__openclaw"]["runId"].as_str())
+            .map(|id| format!("run-error:{id}"))
+            .or_else(|| id.map(|id| format!("message:{id}")))
+    } else if tool {
+        Some(format!(
+            "tool:{}",
+            m["toolCallId"]
+                .as_str()
+                .or(id)
+                .unwrap_or(m["toolName"].as_str().unwrap_or("tool"))
+        ))
+    } else {
+        id.map(|id| format!("message:{id}"))
+    };
+    Some(ChatMessage {
+        role: if failure {
+            "error".into()
+        } else if custom {
+            "notice".into()
+        } else if tool {
+            tool_title(
+                m["toolName"]
+                    .as_str()
+                    .or_else(|| m["name"].as_str())
+                    .unwrap_or(""),
+                "result",
+                m["isError"] == true,
+            )
+        } else {
+            role.into()
+        },
+        text,
+        media,
+        item_id,
+    })
 }
 fn message_text(v: &Value) -> String {
     if let Some(s) = v["content"].as_str() {
@@ -2931,7 +3075,10 @@ impl D4c {
                                 self.switch_connection(index, ui.ctx());
                                 if self.preferences.selected == index {
                                     if self.session != target {
-                                        self.messages.clear();self.history_initialized=false;self.older_cursor=None;self.restore_scroll=None;
+                                        self.messages.clear();
+                                        self.history_initialized = false;
+                                        self.older_cursor = None;
+                                        self.restore_scroll = None;
                                         self.drafts.insert(
                                             self.session.clone(),
                                             Draft {
@@ -3342,7 +3489,12 @@ fn message_bubble(
         .as_deref()
         .is_some_and(|id| id.starts_with("tool:"));
     let available = ui.available_width();
-    let max_width = (if outgoing { available * 0.92 } else { available }).max(1.0);
+    let max_width = (if outgoing {
+        available * 0.92
+    } else {
+        available
+    })
+    .max(1.0);
     // Bound measurement work during streaming. Code and tables get the full
     // reading width; ordinary messages shrink to their longest short line.
     let structured = !outgoing && (message.text.contains("```") || message.text.contains("|"));
@@ -3429,6 +3581,8 @@ fn message_bubble(
                             let title = match message.role.as_str() {
                                 "user" => "You",
                                 "assistant" => "Assistant",
+                                "error" => "Reply failed",
+                                "notice" => "Notice",
                                 other => other,
                             };
                             let icon = if outgoing {
@@ -3437,7 +3591,9 @@ fn message_bubble(
                                 lucide_icons::Icon::Bot
                             };
                             ui.horizontal(|ui| {
-                                let color = if outgoing {
+                                let color = if message.role == "error" {
+                                    egui::Color32::from_rgb(235, 164, 157)
+                                } else if outgoing {
                                     egui::Color32::from_rgb(162, 204, 191)
                                 } else {
                                     egui::Color32::from_gray(167)
@@ -3598,13 +3754,21 @@ fn navigation_footer(ui: &mut egui::Ui) -> egui::Response {
             .rect_filled(rect, 8, egui::Color32::from_rgb(36, 38, 43));
     }
     let color = ui.visuals().text_color();
-    let label = ui.painter().layout_no_wrap("Settings".into(),egui::FontId::proportional(14.0),color);
+    let label =
+        ui.painter()
+            .layout_no_wrap("Settings".into(), egui::FontId::proportional(14.0), color);
     let group_width = 18.0 + 9.0 + label.size().x;
     let left = rect.center().x - group_width / 2.0;
-    ui.painter().text(egui::pos2(left + 9.0,rect.center().y),egui::Align2::CENTER_CENTER,
-        char::from(lucide_icons::Icon::Settings),egui::FontId::new(18.0,egui::FontFamily::Name("lucide".into())),color);
+    ui.painter().text(
+        egui::pos2(left + 9.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        char::from(lucide_icons::Icon::Settings),
+        egui::FontId::new(18.0, egui::FontFamily::Name("lucide".into())),
+        color,
+    );
     let y = rect.center().y - label.size().y / 2.0;
-    ui.painter().galley(egui::pos2(left + 27.0,y),label,color);
+    ui.painter()
+        .galley(egui::pos2(left + 27.0, y), label, color);
     response
 }
 fn chat_row(
@@ -3739,18 +3903,37 @@ fn chat_row(
 fn loading_bar(ui: &mut egui::Ui, width: f32, height: f32) {
     let phase = ui.input(|i| i.time) as f32;
     let alpha = (24.0 + 10.0 * (phase * 2.4).sin()) as u8;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width.max(0.0), height), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 5.0, egui::Color32::from_white_alpha(alpha));
-    ui.ctx().request_repaint_after(std::time::Duration::from_millis(66));
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(width.max(0.0), height), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 5.0, egui::Color32::from_white_alpha(alpha));
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(66));
 }
 fn loading_conversation(ui: &mut egui::Ui) {
     let width = ui.available_width();
-    for (right, lengths) in [(false, [0.64, 0.78, 0.41]), (true, [0.46, 0.57, 0.3]), (false, [0.72, 0.62, 0.46])] {
-        if ui.available_height() < 70.0 { break; }
+    for (right, lengths) in [
+        (false, [0.64, 0.78, 0.41]),
+        (true, [0.46, 0.57, 0.3]),
+        (false, [0.72, 0.62, 0.46]),
+    ] {
+        if ui.available_height() < 70.0 {
+            break;
+        }
         let block = width * if right { 0.65 } else { 0.86 };
-        ui.with_layout(if right { egui::Layout::top_down(egui::Align::RIGHT) } else { egui::Layout::top_down(egui::Align::LEFT) }, |ui| {
-            for fraction in lengths { loading_bar(ui, block * fraction, 10.0); ui.add_space(7.0); }
-        });
+        ui.with_layout(
+            if right {
+                egui::Layout::top_down(egui::Align::RIGHT)
+            } else {
+                egui::Layout::top_down(egui::Align::LEFT)
+            },
+            |ui| {
+                for fraction in lengths {
+                    loading_bar(ui, block * fraction, 10.0);
+                    ui.add_space(7.0);
+                }
+            },
+        );
         ui.add_space(24.0);
     }
 }
@@ -3889,35 +4072,178 @@ mod composer_tests {
         app.events(&egui::Context::default());
     }
     #[test]
+    fn canonical_assistant_event_does_not_duplicate_streamed_answer() {
+        for canonical_first in [true, false] {
+            let mut app = D4c::default();
+            app.session = "chat".into();
+            let canonical = json!({"event":"session.message","payload":{"sessionKey":"chat","message":{"role":"assistant","id":"m1","content":"Reply"}}});
+            let final_event = json!({"event":"chat","payload":{"sessionKey":"chat","state":"final","message":{"role":"assistant","content":"Reply"}}});
+            for event in if canonical_first {
+                [canonical, final_event]
+            } else {
+                [final_event, canonical]
+            } {
+                inject(&mut app, gateway::Event::Data(event));
+            }
+            assert_eq!(app.messages.len(), 1);
+            assert_eq!(app.messages[0].text, "Reply");
+        }
+    }
+    #[test]
+    fn visible_failure_survives_history_reload() {
+        let mut app = D4c::default();
+        app.session = "chat".into();
+        app.history_request = Some(("chat.history:test".into(), "chat".into()));
+        inject(
+            &mut app,
+            gateway::Event::Data(
+                json!({"type":"res","id":"chat.history:test","ok":true,"payload":{"sessionInfo":{"hasActiveRun":false},"messages":[{"role":"custom","display":false,"content":"Internal context"},{"role":"custom","customType":"run-failed-before-reply","display":true,"content":"This model was not found.","openclawRunError":{"runId":"run-1"}}]}}),
+            ),
+        );
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].role, "error");
+        assert_eq!(app.messages[0].text, "This model was not found.");
+    }
+    #[test]
+    fn live_failure_is_visible_and_deduplicates_its_saved_notice() {
+        let mut app = D4c::default();
+        app.session = "chat".into();
+        app.running = true;
+        inject(
+            &mut app,
+            gateway::Event::Data(
+                json!({"event":"chat","payload":{"sessionKey":"chat","state":"error","runId":"run-1","errorMessage":"Model rejected"}}),
+            ),
+        );
+        assert!(!app.running);
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].role, "error");
+        inject(
+            &mut app,
+            gateway::Event::Data(
+                json!({"event":"session.message","payload":{"sessionKey":"chat","message":{"role":"custom","display":true,"customType":"run-failed-before-reply","content":"Model rejected (saved)","openclawRunError":{"runId":"run-1"}}}}),
+            ),
+        );
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].text, "Model rejected (saved)");
+        inject(
+            &mut app,
+            gateway::Event::Data(
+                json!({"event":"chat","payload":{"sessionKey":"other","state":"error","runId":"run-other","errorMessage":"Other failure"}}),
+            ),
+        );
+        assert_eq!(app.messages.len(), 1);
+    }
+    #[test]
+    fn failed_session_snapshot_recovers_a_missed_error_event() {
+        let mut app = D4c::default();
+        app.session = "chat".into();
+        app.history_request = Some(("chat.history:test".into(), "chat".into()));
+        app.running = true;
+        inject(
+            &mut app,
+            gateway::Event::Data(
+                json!({"type":"res","id":"chat.history:test","ok":true,"payload":{"sessionInfo":{"hasActiveRun":false,"status":"failed","lastRunId":"run-1","lastRunError":"Model unavailable"},"messages":[]}}),
+            ),
+        );
+        assert!(!app.running);
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].text, "Model unavailable");
+    }
+    #[test]
     fn inactive_server_cache_is_bounded() {
-        let mut app=D4c::default();
-        app.preferences.connections=(0..6).map(|i|preferences::Connection{name:i.to_string(),url:format!("wss://server-{i}.example")}).collect();
+        let mut app = D4c::default();
+        app.preferences.connections = (0..6)
+            .map(|i| preferences::Connection {
+                name: i.to_string(),
+                url: format!("wss://server-{i}.example"),
+            })
+            .collect();
         for i in 0..6 {
-            app.url=app.preferences.connections[i].url.clone();app.preferences.selected=i;app.session=format!("chat-{i}");
-            app.messages=(0..140).map(|_|ChatMessage{media:vec![],role:"user".into(),text:"cached".into(),item_id:None}).collect();
-            app.reset_connection((i+1)%6,String::new());assert!(app.server_views.len()<=2);
-            for (_,view) in &app.server_views {assert!(view.messages.len()<=100);assert!(view.messages.iter().map(message_cache_bytes).sum::<usize>()<=SERVER_CACHE_BYTES);}
+            app.url = app.preferences.connections[i].url.clone();
+            app.preferences.selected = i;
+            app.session = format!("chat-{i}");
+            app.messages = (0..140)
+                .map(|_| ChatMessage {
+                    media: vec![],
+                    role: "user".into(),
+                    text: "cached".into(),
+                    item_id: None,
+                })
+                .collect();
+            app.reset_connection((i + 1) % 6, String::new());
+            assert!(app.server_views.len() <= 2);
+            for (_, view) in &app.server_views {
+                assert!(view.messages.len() <= 100);
+                assert!(
+                    view.messages.iter().map(message_cache_bytes).sum::<usize>()
+                        <= SERVER_CACHE_BYTES
+                );
+            }
         }
     }
     #[test]
     fn empty_chat_is_restored_after_server_switch() {
-        let mut app=D4c::default();
-        app.preferences.connections=vec![preferences::Connection{name:"A".into(),url:"wss://a.example".into()},preferences::Connection{name:"B".into(),url:"wss://b.example".into()}];
-        app.url="wss://a.example".into();app.session="empty-chat-a".into();
-        app.reset_connection(1,String::new());
-        assert!(app.server_views.iter().any(|(url,v)|url=="wss://a.example" && v.session=="empty-chat-a"));
-        app.reset_connection(0,String::new());assert_eq!(app.session,"empty-chat-a");assert!(app.messages.is_empty());
+        let mut app = D4c::default();
+        app.preferences.connections = vec![
+            preferences::Connection {
+                name: "A".into(),
+                url: "wss://a.example".into(),
+            },
+            preferences::Connection {
+                name: "B".into(),
+                url: "wss://b.example".into(),
+            },
+        ];
+        app.url = "wss://a.example".into();
+        app.session = "empty-chat-a".into();
+        app.reset_connection(1, String::new());
+        assert!(
+            app.server_views
+                .iter()
+                .any(|(url, v)| url == "wss://a.example" && v.session == "empty-chat-a")
+        );
+        app.reset_connection(0, String::new());
+        assert_eq!(app.session, "empty-chat-a");
+        assert!(app.messages.is_empty());
     }
     #[test]
     fn switching_servers_restores_its_own_recent_chat() {
         let mut app = D4c::default();
-        app.preferences.connections=vec![preferences::Connection{name:"A".into(),url:"wss://a.example".into()},preferences::Connection{name:"B".into(),url:"wss://b.example".into()}];
-        app.preferences.selected=0;app.url="wss://a.example".into();app.session="chat-a".into();
-        app.messages.push(ChatMessage{media:vec![],role:"user".into(),text:"Server A".into(),item_id:Some("message:a".into())});
-        app.reset_connection(1,String::new());assert!(app.messages.is_empty());
-        app.session="chat-b".into();app.messages.push(ChatMessage{media:vec![],role:"user".into(),text:"Server B".into(),item_id:Some("message:b".into())});
-        app.reset_connection(0,String::new());assert_eq!(app.session,"chat-a");assert_eq!(app.messages[0].text,"Server A");
-        app.reset_connection(1,String::new());assert_eq!(app.session,"chat-b");assert_eq!(app.messages[0].text,"Server B");
+        app.preferences.connections = vec![
+            preferences::Connection {
+                name: "A".into(),
+                url: "wss://a.example".into(),
+            },
+            preferences::Connection {
+                name: "B".into(),
+                url: "wss://b.example".into(),
+            },
+        ];
+        app.preferences.selected = 0;
+        app.url = "wss://a.example".into();
+        app.session = "chat-a".into();
+        app.messages.push(ChatMessage {
+            media: vec![],
+            role: "user".into(),
+            text: "Server A".into(),
+            item_id: Some("message:a".into()),
+        });
+        app.reset_connection(1, String::new());
+        assert!(app.messages.is_empty());
+        app.session = "chat-b".into();
+        app.messages.push(ChatMessage {
+            media: vec![],
+            role: "user".into(),
+            text: "Server B".into(),
+            item_id: Some("message:b".into()),
+        });
+        app.reset_connection(0, String::new());
+        assert_eq!(app.session, "chat-a");
+        assert_eq!(app.messages[0].text, "Server A");
+        app.reset_connection(1, String::new());
+        assert_eq!(app.session, "chat-b");
+        assert_eq!(app.messages[0].text, "Server B");
         assert!(app.gateway.is_none());
     }
     #[test]
@@ -3926,11 +4252,26 @@ mod composer_tests {
             for height in [160.0, 780.0] {
                 let ctx = egui::Context::default();
                 let mut used = egui::Rect::NOTHING;
-                let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height))), ..Default::default() }, |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| { loading_conversation(ui); used = ui.min_rect(); });
-                });
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, height),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            loading_conversation(ui);
+                            used = ui.min_rect();
+                        });
+                    },
+                );
                 output.textures_delta.clear();
-                assert!(used.max.x <= width && used.max.y <= height, "{width}x{height}: {used:?}");
+                assert!(
+                    used.max.x <= width && used.max.y <= height,
+                    "{width}x{height}: {used:?}"
+                );
             }
         }
     }

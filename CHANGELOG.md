@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0-alpha.6 — 2026-11-19
+
+- Display failed replies in the transcript, both live and after reopening a chat.
+- Respect display flags on custom notices; deduplicate persisted and live errors
+  by run identity and recover missed failures from the session snapshot.
+- Add a dry-run-first helper for reconciling Codex-routed OpenAI model entries
+  against a fresh account catalog, preserving other providers and making a backup.
+- Recover Codex app-server request timeouts on the server after all tracked turns
+  finish. Refresh only managed child connections, with cooldown and hourly limits;
+  notify the originating chat without replaying prompts or tool actions.
+- Android version code 11; existing signing identity is preserved.
+
 ## 0.1.0-alpha.5 — 2026-11-19
 
 - Negotiate bounded lossless compression for desktop video transport, with raw

@@ -34,7 +34,22 @@ openclaw devices list
 
 Use `openclaw configure` to adjust an existing installation. D4C discovers the
 Gateway's model catalogue; it does not carry a fixed model allowlist. The Gateway's
-provider access, model policy and Codex runtime determine which models work.
+provider access, model policy and Codex runtime determine which models work. A model name in a manually configured list is not proof that the signed-in account can use it.
+
+For Codex-routed OpenAI entries, compare against `models_cache.json` in the **actual
+runtime's CODEX_HOME** after authenticating and refreshing its catalog. This helper
+rejects stale/empty catalogs, preserves other providers and runtimes, and makes a
+backup before applying a change:
+
+```sh
+python3 scripts/sync-codex-models.py --config /path/to/openclaw.json --catalog /path/to/runtime/models_cache.json
+# Review the proposed additions/removals, then run with --apply.
+```
+
+Run as the Gateway's Unix account. The helper updates configured model entries;
+it does not grant provider access or silently rewrite conversation model choices.
+Select an available model in the composer for conversations using a removed model.
+
 
 Configure managed private ingress during onboarding/configuration with these
 Gateway settings (merge with your existing configuration):
@@ -233,3 +248,24 @@ The queue and server state survive client closure. Android background delivery
 uses a visible foreground service and remains subject to battery policy, network
 availability and force-stop. A failed remote endpoint still needs operator action;
 see [MCP failure and recovery](mcp.md#failure-and-recovery).
+
+## Codex connection recovery
+
+The desktop plugin also handles Codex app-server request timeouts on Linux.
+It waits for tracked agent turns (including other agents and scheduled work) to
+finish, then sends SIGTERM only to direct children of its Gateway whose executable
+and CODEX_HOME match the affected agent's managed Codex runtime. Manual Codex
+clients, desktops and the Gateway remain running. New turns wait for an in-progress
+refresh. Connections are reopened by OpenClaw on the next request.
+
+Recovery is limited to one attempt every two minutes and three per hour per agent;
+failed attempts count. A healthy turn cancels a queued refresh for that agent.
+Results appear in the originating chat's notifications. Retry the message after
+recovery: prompts and tool actions are never replayed automatically. Model-not-found
+errors and ordinary tool timeouts do not trigger this recovery. A missing/changed
+managed runtime or insufficient permissions requires operator intervention.
+
+After updating Codex, an already-running Gateway may still hold the older runtime.
+Activate a new runtime only while conversations are idle. The model reconciliation
+helper is an explicit administrator operation; it refuses to guess a replacement
+default when an allow/deny policy restricts model selection.
