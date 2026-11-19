@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-alpha.10
+
+- Keep authenticated chat connections open across server switches and reuse workspace connections when returning to a server.
+- Load the selected conversation first. New chats open directly in the composer.
+- Android arm64 version code 15.
+
 ## 0.1.0-alpha.9
 
 - Switch Codex permissions per chat, including full access with `/permissions yolo on` and default permissions with `/permissions yolo off`.
