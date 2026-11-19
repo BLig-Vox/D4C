@@ -23,6 +23,7 @@ fn namespace_spec() -> Value {
             "limit":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0}
         },"required":["action"],"additionalProperties":false}
     }));
+    tools.push(json!({"name":"share_media","description":"Send an image or video in this chat. First call without arguments to get this chat’s export directory. Save or copy a PNG, JPEG, GIF, WebP, MP4, MKV, MOV or WebM there (up to 6 MB), then call with its filename.","inputSchema":{"type":"object","properties":{"filename":{"type":"string"}},"additionalProperties":false}}));
     for tool in &mut tools {
         tool["type"] = json!("function");
     }
@@ -60,6 +61,10 @@ fn text_result(text: impl Into<String>, success: bool) -> Value {
 fn execute(manager: &Manager, thread: &str, tool: &str, args: &Value) -> Result<Value, String> {
     if !args.is_object() {
         return Err("Tool arguments must be an object".into());
+    }
+    if tool == "share_media" {
+        return crate::chat_media::share(&manager.runtime.root, thread, args["filename"].as_str())
+            .map(|v| text_result(v.to_string(), true));
     }
     if tool == "automations" {
         let action = args["action"].as_str().ok_or("Task action is required")?;

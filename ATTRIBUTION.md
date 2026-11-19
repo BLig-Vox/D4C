@@ -20,6 +20,7 @@
 ## Fonts and icons
 
 Bundled fonts preserve their license files in assets/fonts and assets/android-fonts.
+The shadcn-egui theme supplies Inter, licensed under the SIL Open Font License (assets/fonts/Inter-OFL.txt).
 Lucide icons are supplied by the lucide-icons dependency; see its upstream ISC license.
 The selected D4C app artwork is recorded in assets/branding/README.md.
 

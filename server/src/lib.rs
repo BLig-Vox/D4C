@@ -1,3 +1,4 @@
+mod chat_media;
 pub mod auth;
 pub mod manager;
 #[path = "../../src/rfb.rs"]

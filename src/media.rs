@@ -4,8 +4,19 @@ use eframe::egui;
 use serde_json::Value;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+#[cfg(target_os = "android")]
+#[path = "media/android_player.rs"]
+mod backend;
+#[cfg(not(target_os = "android"))]
+#[path = "media/desktop_player.rs"]
+mod backend;
+mod viewer;
+use std::io::{Read, Write};
+use tempfile::NamedTempFile;
+pub use viewer::{close_fullscreen, finish_frame, is_fullscreen, reset};
+
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
 struct Permit;
 impl Drop for Permit {
@@ -18,12 +29,15 @@ pub struct Attachment {
     pub mime: String,
     pub size: usize,
     pub artifact: Option<String>,
-    pub requested: bool,
+    digest: Option<[u8; 32]>,
+    remote_identity: Option<String>,
+    visible: AtomicBool,
+    play_requested: AtomicBool,
     source: Option<(String, String)>,
     state: Mutex<State>,
 }
 enum Payload {
-    Bytes(Vec<u8>),
+    Bytes(Arc<[u8]>),
     Http {
         endpoint: String,
         token: String,
@@ -34,12 +48,20 @@ enum Payload {
 }
 enum State {
     Pending(Payload),
-    Loading(Arc<Mutex<Option<Option<egui::ColorImage>>>>),
-    Ready(Option<egui::TextureHandle>),
+    Loading(Arc<Mutex<Option<Result<Decoded, String>>>>),
+    Image(egui::TextureHandle, Option<Arc<Vec<u8>>>),
+    Video(Arc<NamedTempFile>),
+    Error(String),
+    DownloadFailed(String),
 }
-fn decode(payload: Payload) -> Option<egui::ColorImage> {
-    let bytes = match payload {
-        Payload::Bytes(bytes) => bytes,
+enum Decoded {
+    Image(egui::ColorImage, Option<Arc<Vec<u8>>>),
+    Video(NamedTempFile),
+}
+
+fn decode(payload: Payload, video: bool) -> Result<Decoded, String> {
+    let mut input: Box<dyn Read> = match payload {
+        Payload::Bytes(bytes) => Box::new(std::io::Cursor::new(bytes)),
         Payload::Http {
             endpoint,
             token,
@@ -49,7 +71,7 @@ fn decode(payload: Payload) -> Option<egui::ColorImage> {
         } => {
             let config = ureq::Agent::config_builder()
                 .max_redirects(0)
-                .timeout_global(Some(std::time::Duration::from_secs(15)))
+                .timeout_global(Some(std::time::Duration::from_secs(90)))
                 .build();
             let agent: ureq::Agent = config.into();
             let mut request = agent
@@ -61,66 +83,155 @@ fn decode(payload: Payload) -> Option<egui::ColorImage> {
                     .query("sessionKey", session)
                     .query("messageId", message);
             }
-            if source.starts_with("media://inbound/") {
-                request = request.query("variant", "thumbnail").query("width", "640");
-            }
-            let mut response = request.call().ok()?;
+            let response = request.call().map_err(|_| "Attachment download failed")?;
             if !response.status().is_success() {
-                return None;
+                return Err("Attachment download failed".into());
             }
-            response
-                .body_mut()
-                .with_config()
-                .limit(crate::uploads::FILE_LIMIT as u64)
-                .read_to_vec()
-                .ok()?
+            Box::new(response.into_body().into_reader())
         }
     };
+    if video {
+        #[cfg(target_os = "android")]
+        let directory = crate::platform::attachment_cache().map_err(|e| e.to_string())?;
+        #[cfg(target_os = "android")]
+        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        #[cfg(not(target_os = "android"))]
+        let directory = std::env::temp_dir();
+        let mut file = NamedTempFile::new_in(directory).map_err(|e| e.to_string())?;
+        const VIDEO_LIMIT: u64 = 128 * 1024 * 1024;
+        let count = std::io::copy(&mut input.take(VIDEO_LIMIT + 1), &mut file)
+            .map_err(|e| e.to_string())?;
+        if count == 0 || count > VIDEO_LIMIT {
+            return Err("Video is empty or exceeds 128 MB".into());
+        }
+        file.flush().map_err(|e| e.to_string())?;
+        return Ok(Decoded::Video(file));
+    }
+    const IMAGE_LIMIT: u64 = 32 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    input
+        .take(IMAGE_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > IMAGE_LIMIT {
+        return Err("Image exceeds 32 MB".into());
+    }
+    let (image, reduced) = decode_image(&bytes, 960)?;
+    Ok(Decoded::Image(image, reduced.then(|| Arc::new(bytes))))
+}
+
+fn decode_image(bytes: &[u8], max_side: u32) -> Result<(egui::ColorImage, bool), String> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
-        .ok()?;
+        .map_err(|_| "Unknown image format")?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(8192);
     limits.max_image_height = Some(8192);
     limits.max_alloc = Some(64 * 1024 * 1024);
     reader.limits(limits);
-    let image = reader.decode().ok()?.thumbnail(960, 720).to_rgba8();
-    Some(egui::ColorImage::from_rgba_unmultiplied(
-        [image.width() as usize, image.height() as usize],
-        image.as_raw(),
+    let decoded = reader
+        .decode()
+        .map_err(|_| "Unsupported image or image too large")?;
+    let reduced = decoded.width().max(decoded.height()) > max_side;
+    let image = if reduced {
+        decoded.thumbnail(max_side, max_side)
+    } else {
+        decoded
+    }
+    .to_rgba8();
+    Ok((
+        egui::ColorImage::from_rgba_unmultiplied(
+            [image.width() as usize, image.height() as usize],
+            image.as_raw(),
+        ),
+        reduced,
     ))
 }
 impl Attachment {
+    pub fn wants_download(&self) -> bool {
+        self.visible.load(Ordering::Relaxed)
+            && (!self.mime.starts_with("video/") || self.play_requested.load(Ordering::Relaxed))
+            && self
+                .state
+                .lock()
+                .is_ok_and(|s| matches!(&*s,State::Pending(Payload::Bytes(b)) if b.is_empty()))
+    }
     pub fn cache_bytes(&self) -> usize {
-        let payload=self.state.lock().map(|state|match &*state {
-            State::Pending(Payload::Bytes(b))=>b.len(),
-            State::Pending(Payload::Http{endpoint,token,source,session,message})=>endpoint.len()+token.len()+source.len()+session.len()+message.len(),
-            State::Loading(_)=>32*1024*1024,
-            State::Ready(Some(texture))=>texture.size().iter().product::<usize>().saturating_mul(8),
-            State::Ready(None)=>0,
-        }).unwrap_or(usize::MAX/2);
-        payload.saturating_add(self.name.len()+self.mime.len()).saturating_add(self.source.as_ref().map(|(a,b)|a.len()+b.len()).unwrap_or(0))
+        let payload = self
+            .state
+            .lock()
+            .map(|state| match &*state {
+                State::Pending(Payload::Bytes(b)) => b.len(),
+                State::Pending(Payload::Http {
+                    endpoint,
+                    token,
+                    source,
+                    session,
+                    message,
+                }) => endpoint.len() + token.len() + source.len() + session.len() + message.len(),
+                State::Loading(_) => 32 * 1024 * 1024,
+                State::Image(texture, original) => texture
+                    .size()
+                    .iter()
+                    .product::<usize>()
+                    .saturating_mul(8)
+                    .saturating_add(original.as_ref().map_or(0, |b| b.len())),
+                State::Video(_) => 256,
+                State::Error(e) | State::DownloadFailed(e) => e.len(),
+            })
+            .unwrap_or(usize::MAX / 2);
+        payload
+            .saturating_add(self.name.len() + self.mime.len())
+            .saturating_add(
+                self.source
+                    .as_ref()
+                    .map(|(a, b)| a.len() + b.len())
+                    .unwrap_or(0),
+            )
     }
 
     pub fn new(name: String, mime: String, bytes: Vec<u8>) -> Self {
+        let mime = if mime.is_empty() || mime == "application/octet-stream" {
+            media_mime(&name)
+                .unwrap_or("application/octet-stream")
+                .into()
+        } else {
+            mime
+        };
+        use sha2::Digest;
+        let digest = (!bytes.is_empty()).then(|| sha2::Sha256::digest(&bytes).into());
         Self {
             name,
             mime,
             size: bytes.len(),
             artifact: None,
-            requested: false,
+            digest,
+            remote_identity: None,
+            visible: AtomicBool::new(false),
+            play_requested: AtomicBool::new(false),
             source: None,
-            state: Mutex::new(State::Pending(Payload::Bytes(bytes))),
+            state: Mutex::new(State::Pending(Payload::Bytes(bytes.into()))),
         }
     }
-    pub fn receive(&mut self, mime: String, bytes: Vec<u8>) {
-        self.mime = mime;
+    pub fn download_failed(&mut self, message: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            *state = State::DownloadFailed(message.chars().take(300).collect());
+        }
+    }
+    pub fn receive(&mut self, mime: String, bytes: Arc<[u8]>) {
+        if self.mime == "application/octet-stream"
+            || mime.starts_with("image/")
+            || mime.starts_with("video/")
+        {
+            self.mime = mime;
+        }
         self.size = bytes.len();
         if let Ok(mut state) = self.state.lock() {
             *state = State::Pending(Payload::Bytes(bytes));
         }
     }
     pub fn receive_url(&mut self, gateway: &str, token: &str, path: &str) {
+        self.download_failed("Invalid attachment download URL");
         let Ok(uri) = gateway.parse::<tungstenite::http::Uri>() else {
             return;
         };
@@ -146,7 +257,9 @@ impl Attachment {
         }
     }
     pub fn configure_http(&mut self, gateway: &str, token: &str, session: &str) {
-        if self.source.is_none() || !self.mime.starts_with("image/") {
+        if self.source.is_none()
+            || !(self.mime.starts_with("image/") || self.mime.starts_with("video/"))
+        {
             return;
         }
         let Ok(uri) = gateway.parse::<tungstenite::http::Uri>() else {
@@ -159,6 +272,7 @@ impl Attachment {
             return;
         };
         let (source, message) = self.source.take().unwrap();
+        self.remote_identity = Some(source.clone());
         if let Ok(mut state) = self.state.lock() {
             *state = State::Pending(Payload::Http {
                 endpoint: format!("https://{authority}/__openclaw__/assistant-media"),
@@ -194,15 +308,40 @@ impl Attachment {
                 );
             }
         });
-        if !self.mime.starts_with("image/") {
+        let video = self.mime.starts_with("video/");
+        if !(video || self.mime.starts_with("image/")) {
             return;
         }
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        // Reserve layout before checking visibility so offscreen images don't all download.
-        let image_space = egui::vec2(ui.available_width().min(420.0), 160.0);
+        let width = ui.available_width().min(420.).max(1.);
+        let image_space = egui::vec2(width, (width * 0.5625).max(48.));
         let visible = ui.is_rect_visible(egui::Rect::from_min_size(ui.cursor().min, image_space));
+        self.visible.store(visible, Ordering::Relaxed);
+        if matches!(*state, State::Pending(_))
+            && video
+            && !self.play_requested.load(Ordering::Relaxed)
+        {
+            if ui.button("Play video").clicked() {
+                self.play_requested.store(true, Ordering::Relaxed);
+                ui.ctx().request_repaint();
+            } else {
+                return;
+            }
+        }
+        if matches!(&*state, State::Pending(Payload::Bytes(b)) if b.is_empty()) {
+            if self.source.is_some() || self.artifact.is_some() {
+                if visible {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(200));
+                }
+                ui.weak("Waiting for attachment…");
+            } else {
+                ui.weak("Attachment unavailable");
+            }
+            return;
+        }
         if matches!(*state, State::Pending(_)) && visible && self.source.is_none() {
             if WORKERS
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -210,7 +349,8 @@ impl Attachment {
                 })
                 .is_ok()
             {
-                let State::Pending(payload) = std::mem::replace(&mut *state, State::Ready(None))
+                let State::Pending(payload) =
+                    std::mem::replace(&mut *state, State::Error(String::new()))
                 else {
                     unreachable!()
                 };
@@ -219,7 +359,7 @@ impl Attachment {
                 let ctx = ui.ctx().clone();
                 std::thread::spawn(move || {
                     let _permit = Permit;
-                    let decoded = decode(payload);
+                    let decoded = decode(payload, video);
                     if let Ok(mut slot) = output.lock() {
                         *slot = Some(decoded);
                     }
@@ -230,29 +370,50 @@ impl Attachment {
         }
         if let State::Loading(result) = &*state {
             let decoded = result.lock().ok().and_then(|mut r| r.take());
-            if let Some(image) = decoded {
-                *state = State::Ready(image.map(|image| {
-                    ui.ctx().load_texture(
-                        format!("attachment-{}", self.name),
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    )
-                }));
+            if let Some(result) = decoded {
+                *state = match result {
+                    Ok(Decoded::Image(image, original)) => State::Image(
+                        ui.ctx()
+                            .load_texture(&self.name, image, egui::TextureOptions::LINEAR),
+                        original,
+                    ),
+                    Ok(Decoded::Video(file)) => {
+                        let file = Arc::new(file);
+                        if visible {
+                            viewer::play(file.clone(), self.name.clone());
+                        }
+                        State::Video(file)
+                    }
+                    Err(error) => State::Error(error),
+                }
             }
         }
         match &*state {
-            State::Ready(Some(texture)) => {
-                ui.add(egui::Image::new(texture).fit_to_exact_size(
-                    texture.size_vec2()
-                        * (ui.available_width().min(420.0) / texture.size_vec2().x).min(1.0),
-                ));
+            State::Image(texture, original) => {
+                let size = texture.size_vec2();
+                let scale = (width / size.x).min(320. / size.y).min(1.);
+                if ui
+                    .add(
+                        egui::Image::new(texture)
+                            .fit_to_exact_size(size * scale)
+                            .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text("Open full screen")
+                    .clicked()
+                {
+                    viewer::open_image(self.name.clone(), texture.clone(), original.clone());
+                }
             }
-            State::Ready(None) => {
-                ui.label(
-                    egui::RichText::new("Image preview unavailable")
-                        .small()
-                        .weak(),
-                );
+            State::Video(file) => viewer::inline(ui, &self.name, file),
+            State::DownloadFailed(error) => {
+                ui.weak(error);
+                if ui.button("Retry download").clicked() {
+                    *state = State::Pending(Payload::Bytes(Arc::from([])));
+                    ui.ctx().request_repaint();
+                }
+            }
+            State::Error(error) => {
+                ui.weak(error);
             }
             _ => {
                 ui.allocate_ui(image_space, |ui| {
@@ -262,6 +423,41 @@ impl Attachment {
         }
     }
 }
+pub(crate) fn media_mime(name: &str) -> Option<&'static str> {
+    Some(
+        match name.rsplit_once('.')?.1.to_ascii_lowercase().as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            "mp4" | "m4v" => "video/mp4",
+            "mov" => "video/quicktime",
+            "webm" => "video/webm",
+            "mkv" => "video/x-matroska",
+            _ => return None,
+        },
+    )
+}
+/// Keep completed and in-progress media when a tail refresh replaces its row.
+pub fn retain_loaded(new: &mut [Attachment], old: &mut Vec<Attachment>) {
+    for attachment in new {
+        let origin = |a: &Attachment| {
+            a.source
+                .as_ref()
+                .map(|s| s.0.clone())
+                .or_else(|| a.remote_identity.clone())
+        };
+        let origin_new = origin(attachment);
+        if let Some(index) = old.iter().position(|prior| {
+            attachment.artifact.is_some() && attachment.artifact == prior.artifact
+                || attachment.digest.is_some() && attachment.digest == prior.digest
+                || origin_new.is_some() && origin_new == origin(prior)
+        }) {
+            *attachment = old.remove(index);
+        }
+    }
+}
+
 pub fn from_message(message: &Value) -> Vec<Attachment> {
     let mut out: Vec<_> = message["content"]
         .as_array()
@@ -269,7 +465,10 @@ pub fn from_message(message: &Value) -> Vec<Attachment> {
         .flatten()
         .filter_map(|part| {
             let kind = part["type"].as_str()?;
-            if !matches!(kind, "image" | "image_url" | "file" | "document") {
+            if !matches!(
+                kind,
+                "image" | "image_url" | "video" | "video_url" | "file" | "document"
+            ) {
                 return None;
             }
             let mime = part["mimeType"]
@@ -278,6 +477,8 @@ pub fn from_message(message: &Value) -> Vec<Attachment> {
                 .or_else(|| part["mime_type"].as_str())
                 .unwrap_or(if kind.starts_with("image") {
                     "image/png"
+                } else if kind.starts_with("video") {
+                    "video/mp4"
                 } else {
                     "application/octet-stream"
                 })
@@ -296,6 +497,7 @@ pub fn from_message(message: &Value) -> Vec<Attachment> {
                 .as_str()
                 .or_else(|| part["source"]["data"].as_str())
                 .or_else(|| part["image_url"]["url"].as_str())
+                .or_else(|| part["video_url"]["url"].as_str())
                 .unwrap_or("");
             let encoded = if encoded.starts_with("data:") {
                 encoded.split_once(',').map(|(_, d)| d).unwrap_or("")
@@ -324,6 +526,7 @@ pub fn from_message(message: &Value) -> Vec<Attachment> {
                     .or_else(|| part["source"].as_str())
                     .or_else(|| part["source"]["url"].as_str())
                     .or_else(|| part["image_url"]["url"].as_str())
+                    .or_else(|| part["video_url"]["url"].as_str())
                     .filter(|s| {
                         s.len() < 2048
                             && (s.starts_with('/')
@@ -391,18 +594,8 @@ pub fn from_message(message: &Value) -> Vec<Attachment> {
                 {
                     continue;
                 }
-                let mime = match source
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or("")
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "png" => "image/png",
-                    "jpg" | "jpeg" => "image/jpeg",
-                    "webp" => "image/webp",
-                    "gif" => "image/gif",
-                    _ => continue,
+                let Some(mime) = media_mime(source) else {
+                    continue;
                 };
                 let mut a = Attachment::new(
                     source.rsplit('/').next().unwrap_or("Screenshot").into(),

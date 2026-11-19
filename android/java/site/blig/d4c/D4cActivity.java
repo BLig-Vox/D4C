@@ -15,17 +15,44 @@ public final class D4cActivity extends NativeActivity {
     // NativeActivity's own dlopen doesn't register the library with this Java
     // class loader, which is required to resolve our JNI result callback.
     static { System.loadLibrary("vox_d4c"); }
+    private D4cVideo video;
+    public void openVideo(long id,String path){
+        if(video!=null) video.close();
+        video=new D4cVideo(this,id,path);
+        if(!composerActive)video.suspend();
+    }
+    public void placeVideo(long id,int l,int t,int r,int b,int cl,int ct,int cr,int cb){
+        if(video!=null && video.id==id)video.place(new int[]{l,t,r,b,cl,ct,cr,cb});
+    }
+    public void playVideo(long id,boolean play){if(video!=null && video.id==id)video.play(play);}
+    public void seekVideo(long id,int position){if(video!=null && video.id==id)video.seek(position);}
+    public void closeVideo(long id){if(video!=null && video.id==id){video.close();video=null;}}
+    @Override protected void onDestroy(){if(video!=null){video.close();video=null;}super.onDestroy();}
     private android.widget.EditText composer;
     private android.widget.PopupWindow composerWindow;
     private String composerSession="";
     private long composerRevision=0;
     private boolean composerUpdating=false;
     private boolean composerActive=false;
+    private native boolean dismissChatOverlay();
+    @Override public void onBackPressed() {
+        if (!dismissChatOverlay()) super.onBackPressed();
+    }
+    public void openChatLink(String value) {
+        Uri uri = Uri.parse(value);
+        if (!("https".equalsIgnoreCase(uri.getScheme()) || "http".equalsIgnoreCase(uri.getScheme()))
+                || uri.getHost() == null) return;
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE));
+        } catch (android.content.ActivityNotFoundException | SecurityException unavailable) {
+            android.widget.Toast.makeText(this, "No app could open this link", android.widget.Toast.LENGTH_SHORT).show();
+        }
+    }
     private native void composerWindowHidden();
-    @Override protected void onResume(){super.onResume();composerActive=true;composerWindowHidden();}
+    @Override protected void onResume(){super.onResume();composerActive=true;if(video!=null)video.resume();composerWindowHidden();}
     private native void finishNativeUi();
     @Override protected void onPause(){
-        composerActive=false;hideComposer();
+        composerActive=false;hideComposer();if(video!=null)video.suspend();
         // A new Activity can be created before the old one's onDestroy. Stop
         // the old native UI before that overlap, while keeping the service alive.
         if(isFinishing())finishNativeUi();
@@ -121,6 +148,10 @@ public final class D4cActivity extends NativeActivity {
 
     @Override protected void onCreate(android.os.Bundle state){
         super.onCreate(state);
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, this::onBackPressed);
+        }
         getWindow().getDecorView().getViewTreeObserver().addOnGlobalLayoutListener(()->{android.graphics.Rect frame=new android.graphics.Rect();getWindow().getDecorView().getWindowVisibleDisplayFrame(frame);if(frame.bottom>0)visibleBottomChanged(frame.bottom);});
         deliverSession(getIntent());
         if(android.os.Build.VERSION.SDK_INT>=33&&checkSelfPermission("android.permission.POST_NOTIFICATIONS")!=android.content.pm.PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"},4105);}

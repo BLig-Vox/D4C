@@ -52,7 +52,13 @@ Wireless debugging page's separate connection port for
   emoji input and system clipboard copying. Other egui text fields are not native
   EditText controls. Keyboard settings still govern autocorrection/suggestions.
 - The visible-window bounds keep the composer above the keyboard.
-- A system document picker uploads files; sent image/file cards remain in history.
+- The system document picker uploads files up to 6 MB each. Tap chat images to
+  open the viewer. Pinch, double-tap or use the zoom controls to inspect details.
+  Videos play inside the chat and can expand to fullscreen. Playback support
+  depends on the codecs available on the device.
+- Markdown links and plain HTTP(S) links in messages open in the Android browser.
+- Codex questions and command approvals appear inline. A submitted choice stays
+  visible while the session is cached in the app.
 - Bundled symbol/emoji fallback and Android shaping handle common Unicode
   clusters, flags and skin tones. Newer unsupported emoji depend on OS coverage.
 - Chat follows paginated server history; older prompts remain reachable during

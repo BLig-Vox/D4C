@@ -160,6 +160,11 @@ impl Adapter {
             "sessions.delete" => self.call("thread/delete", json!({"threadId":k}), req),
             "sessions.archive" => self.call("thread/archive", json!({"threadId":k}), req),
             "chat.send" => self.send_turn(req),
+            "artifacts.download" => self.call(
+                "d4c/attachment/download",
+                json!({"artifactId":p["artifactId"]}),
+                req,
+            ),
             "chat.abort" => {
                 if let Some(turn) = self.active.get(&k) {
                     self.call("turn/interrupt", json!({"threadId":k,"turnId":turn}), req);
@@ -443,13 +448,13 @@ impl Adapter {
                     "agentMessage"|"reasoning"=>{}
                     _=>{
                         if let Some(message)=transcript(item){
-                            self.event("agent",json!({"sessionKey":k,"stream":"tool","runId":p["turnId"],"data":{"toolCallId":item["id"],"name":message["toolName"],"phase":if done{"result"}else{"start"},"isError":message["isError"],"result":{"text":message["content"]}}}));
+                            self.event("agent",json!({"sessionKey":k,"stream":"tool","runId":p["turnId"],"data":{"toolCallId":item["id"],"name":message["toolName"],"phase":if done{"result"}else{"start"},"isError":message["isError"],"result":if message["content"].is_array() {json!({"content":message["content"]})} else {json!({"text":message["content"]})}}}));
                         }
                     }
                 }
             }
             "serverRequest/resolved"=>{
-                if let Some(id)=self.questions.iter().find_map(|(id,q)| (q.0==p["requestId"]).then(||id.clone())){
+                if let Some(id)=self.questions.iter().find_map(|(id,q)| (q.0==p["requestId"] && q.2["sessionKey"]==p["threadId"]).then(||id.clone())){
                     self.questions.remove(&id);self.event("question.resolved",json!({"id":id,"status":"resolved"}));
                 }
             }
@@ -473,49 +478,47 @@ impl Adapter {
                 let reason = p["reason"]
                     .as_str()
                     .unwrap_or("The turn requested additional permissions.");
-                let question = format!(
-                    "{reason}\nFolder: {}\nPermissions: {}",
-                    string(&p["cwd"]),
-                    p["permissions"]
+                let details = approval_details(
+                    p,
+                    &[
+                        ("Folder", "cwd"),
+                        ("Environment", "environmentId"),
+                        ("Permissions", "permissions"),
+                    ],
                 );
                 vec![
-                    json!({"questionId":"decision","question":question,"options":[{"label":"Allow for this turn","value":"accept"},{"label":"Decline","value":"decline"}]}),
+                    json!({"questionId":"decision","question":reason,"details":details,"options":[{"label":"Allow for this turn","value":"accept"},{"label":"Decline","value":"decline"}]}),
                 ]
             }
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-                let command = method == "item/commandExecution/requestApproval";
-                let mut prompt = if command {
-                    "Allow this command?".to_owned()
+                let prompt = if method == "item/commandExecution/requestApproval" {
+                    "Allow this command?"
                 } else {
-                    "Allow these file changes?".to_owned()
+                    "Allow these file changes?"
                 };
-                // Display every detail that affects the scope of this one-time decision.
-                for (label, key) in [
-                    ("Command", "command"),
-                    ("Folder", "cwd"),
-                    ("Reason", "reason"),
-                    ("Write access", "grantRoot"),
-                    ("Item", "itemId"),
-                    ("Environment", "environmentId"),
-                    ("Network", "networkApprovalContext"),
-                    ("Additional permissions", "additionalPermissions"),
-                    ("Command actions", "commandActions"),
-                ] {
-                    if !p[key].is_null() {
-                        let detail = p[key]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| p[key].to_string());
-                        prompt.push_str(&format!("\n{label}: {detail}"));
-                    }
-                }
+                let details = approval_details(
+                    p,
+                    &[
+                        ("Command", "command"),
+                        ("Folder", "cwd"),
+                        ("Reason", "reason"),
+                        ("Write access", "grantRoot"),
+                        ("Item", "itemId"),
+                        ("Environment", "environmentId"),
+                        ("Network", "networkApprovalContext"),
+                        ("Additional permissions", "additionalPermissions"),
+                        ("Command actions", "commandActions"),
+                    ],
+                );
                 let allowed = &p["availableDecisions"];
                 let options: Vec<_> = [("Allow once", "accept"), ("Decline", "decline")]
                     .iter()
                     .filter(|(_, d)| allowed.is_null() || rows(allowed).iter().any(|v| v == *d))
                     .map(|(label, value)| json!({"label":label,"value":value}))
                     .collect();
-                vec![json!({"questionId":"decision","question":prompt,"options":options})]
+                vec![
+                    json!({"questionId":"decision","question":prompt,"details":details,"options":options}),
+                ]
             }
             "currentTime/read" => {
                 self.wire(
@@ -528,11 +531,24 @@ impl Adapter {
                 return;
             }
         };
-        let id = uuid::Uuid::new_v4().to_string();
+        // Retried notifications for the same native request must target one card.
+        let id = json!([
+            p["threadId"],
+            p["turnId"],
+            p["itemId"],
+            p["approvalId"],
+            p["startedAtMs"],
+            method,
+            v["id"]
+        ])
+        .to_string();
+        if self.questions.contains_key(&id) {
+            return;
+        }
         let expires = p["autoResolutionMs"]
             .as_u64()
             .map_or(u64::MAX, |ms| crate::activity::now().saturating_add(ms));
-        let record = json!({"id":id,"requestedPermissions":p["permissions"],"sessionKey":p["threadId"],"status":"pending","questions":qs,"expiresAtMs":expires});
+        let record = json!({"id":id,"requestedPermissions":p["permissions"],"sessionKey":p["threadId"],"itemId":p["itemId"],"approval":method.ends_with("/requestApproval"),"status":"pending","questions":qs,"expiresAtMs":expires});
         self.questions
             .insert(id, (v["id"].clone(), method.into(), record.clone()));
         self.event("question.requested", record);
@@ -589,6 +605,19 @@ impl Adapter {
             json!({"status":if cancelled{"cancelled"}else{"answered"},"answers":p["answers"]}),
         );
     }
+}
+
+fn approval_details(params: &Value, fields: &[(&str, &str)]) -> Vec<Value> {
+    fields
+        .iter()
+        .filter_map(|(label, key)| {
+            let value = params.get(*key).filter(|v| !v.is_null())?;
+            let text = value.as_str().map(str::to_owned).unwrap_or_else(|| {
+                serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+            });
+            Some(json!({"label":label,"text":text}))
+        })
+        .collect()
 }
 
 fn thread_title(thread: &Value) -> Option<String> {
@@ -656,6 +685,54 @@ fn lines(v: &Value) -> String {
         .join("\n")
 }
 
+// Non-image uploads are passed to Codex as text so it can read the file.
+// Reconstruct only D4C upload references; arbitrary host paths never become downloads.
+fn upload_part(text: &str) -> Option<Value> {
+    let line = text.strip_prefix("Attached file ")?;
+    let (_, after) = line.rsplit_once("/uploads/")?;
+    let (key, name) = after.split_once('/')?;
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.chars().any(char::is_control)
+        || !line.starts_with(&format!("{name}: /"))
+        || name.len() > 240
+        || !uuid::Uuid::parse_str(key).is_ok_and(|u| u.to_string() == key)
+    {
+        return None;
+    }
+    let mime = crate::media::media_mime(name)?;
+    Some(
+        json!({"type":"file","fileName":name,"mimeType":mime,"artifactId":format!("upload/{key}/{name}")}),
+    )
+}
+fn tool_media(item: &Value) -> Vec<Value> {
+    let mut media = Vec::new();
+    let mut add = |v: &Value| {
+        if v["artifactId"].is_string()
+            && v["mimeType"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("image/") || m.starts_with("video/"))
+            && !media
+                .iter()
+                .any(|m: &Value| m["artifactId"] == v["artifactId"])
+            && media.len() < 8
+        {
+            media.push(v.clone());
+        }
+    };
+    add(&item["d4cAttachment"]);
+    for p in rows(&item["contentItems"]) {
+        add(&p["d4cAttachment"]);
+        if item["tool"] == "share_media"
+            && let Some(text) = p["text"].as_str().filter(|s| s.len() < 8192)
+            && let Ok(result) = serde_json::from_str::<Value>(text)
+        {
+            add(&result["d4cAttachment"]);
+        }
+    }
+    media
+}
 fn transcript(item: &Value) -> Option<Value> {
     let kind = string(&item["type"]);
     let id = &item["id"];
@@ -664,7 +741,7 @@ fn transcript(item: &Value) -> Option<Value> {
             let content:Vec<_>=rows(&item["content"]).iter().map(|part|{
                 match string(&part["type"]){
                     "image"=>{let url=string(&part["url"]);json!({"type":"image","image_url":{"url":url},"mimeType":url.strip_prefix("data:").and_then(|s|s.split_once(';')).map(|r|r.0).unwrap_or("image/png")})}
-                    "text"=>part.clone(),
+                    "text"=>upload_part(string(&part["text"])).unwrap_or_else(||part.clone()),
                     "skill"|"mention"=>json!({"type":"text","text":part["name"]}),
                     _=>json!({"type":"text","text":part["path"].as_str().unwrap_or("[attachment]")})
                 }
@@ -692,8 +769,12 @@ fn transcript(item: &Value) -> Option<Value> {
                 "collabAgentToolCall" => &["prompt", "agentsStates"],
                 _ => return None,
             };
-            let content = fields
+            let mut attachments = tool_media(item);
+            let text = fields
                 .iter()
+                .filter(|key| {
+                    attachments.is_empty() || !matches!(**key, "contentItems" | "savedPath")
+                })
                 .map(|key| &item[*key])
                 .filter(|v| !v.is_null())
                 .map(|v| {
@@ -703,6 +784,14 @@ fn transcript(item: &Value) -> Option<Value> {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
+            let content = if attachments.is_empty() {
+                json!(text)
+            } else {
+                if !text.is_empty() {
+                    attachments.insert(0, json!({"type":"text","text":text}));
+                }
+                Value::Array(attachments)
+            };
             Some(
                 json!({"role":"tool","id":id,"toolCallId":id,"toolName":item["tool"].as_str().or_else(||item["name"].as_str()).unwrap_or(kind),"isError":item["status"]=="failed" || item["success"]==false,"content":content}),
             )
@@ -792,6 +881,35 @@ mod tests {
     }
 
     #[test]
+    fn stored_uploads_and_tool_images_are_visible_in_history_and_live_results() {
+        let name = "clip from chat.mp4";
+        let upload = format!("Attached file {name}: /data/uploads/{THREAD}/{name}");
+        let row =
+            transcript(&json!({"type":"userMessage","content":[{"type":"text","text":upload}]}))
+                .unwrap();
+        assert_eq!(
+            row["content"][0]["artifactId"],
+            format!("upload/{THREAD}/{name}")
+        );
+        assert!(upload_part(&format!("Attached file clip.mp4: /tmp/{THREAD}/clip.mp4")).is_none());
+        let file = json!({"type":"image","artifactId":"blob/id/image.png","fileName":"image.png","mimeType":"image/png"});
+        let item = json!({"id":"screen","type":"dynamicToolCall","tool":"screen","contentItems":[{"type":"inputText","text":"Saved","d4cAttachment":file}]});
+        assert_eq!(transcript(&item).unwrap()["content"][0], file);
+        let mut adapter = Adapter::default();
+        adapter
+            .incoming(json!({"method":"item/completed","params":{"item":item,"threadId":THREAD}}));
+        assert_eq!(
+            frames(&mut adapter)[0]["payload"]["data"]["result"]["content"][0],
+            file
+        );
+        adapter.command(super::super::rpc(
+            "artifacts.download",
+            json!({"sessionKey":THREAD,"artifactId":file["artifactId"]}),
+        ));
+        assert_eq!(frames(&mut adapter)[0]["method"], "d4c/attachment/download");
+    }
+
+    #[test]
     fn empty_draft_is_local_until_first_send() {
         let mut a = Adapter::default();
         let p = json!({"sessionKey":"draft:scratch"});
@@ -810,6 +928,23 @@ mod tests {
         assert_eq!(send["params"]["threadId"], THREAD);
         assert_eq!(send["params"]["input"][0]["text"], "hello");
         assert_eq!(send["params"]["clientUserMessageId"], "client");
+    }
+
+    #[test]
+    fn replayed_approval_stays_one_native_request_and_preserves_command_text() {
+        let mut adapter = Adapter::default();
+        let command = "echo `example`\necho '---'";
+        let event = json!({"id":7,"method":"item/commandExecution/requestApproval","params":{
+            "threadId":THREAD,"turnId":"turn","itemId":"item","command":command}});
+        adapter.incoming(event.clone());
+        adapter.incoming(event);
+        let out = frames(&mut adapter);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0]["payload"]["questions"][0]["details"][0]["text"],
+            command
+        );
+        assert_eq!(adapter.questions.len(), 1);
     }
 
     #[test]

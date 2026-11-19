@@ -342,6 +342,20 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
                             send_native(&mut upstream, request)?;
                             continue;
                         }
+                        if request["method"] == "d4c/attachment/download" {
+                            let result = crate::chat_media::download(
+                                &manager.runtime.root,
+                                request["params"]["artifactId"].as_str().unwrap_or(""),
+                            );
+                            let response = match result {
+                                Ok(value) => json!({"id":request["id"],"result":value}),
+                                Err(error) => {
+                                    json!({"id":request["id"],"error":{"code":-32602,"message":error}})
+                                }
+                            };
+                            send(&mut client, response)?;
+                            continue;
+                        }
                         if request["method"] == "d4c/attachment/store" {
                             let response = match store_attachment(
                                 &manager.runtime.root.join("uploads"),
@@ -366,7 +380,7 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
             Some(message) if message.is_text() => {
                 if let Ok(mut req) = serde_json::from_str::<Value>(message.to_text().unwrap_or(""))
                 {
-                    if compact_history_images(&mut req) {
+                    if compact_history_images(&manager.runtime.root, &mut req) {
                         send(&mut client, req)?;
                         continue;
                     }
@@ -384,40 +398,26 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
 
 // The transcript displays tool results as text. Avoid transferring base64 screenshots
 // as JSON text while retaining the original result in Codex and all user attachments.
-fn compact_history_images(response: &mut Value) -> bool {
+fn compact_history_images(root: &Path, response: &mut Value) -> bool {
+    if response["method"] == "item/completed"
+        && let Some(item) = response.pointer_mut("/params/item")
+    {
+        return crate::chat_media::project_item(root, item);
+    }
     let mut changed = false;
-    let Some(turns) = response
+    for turn in response
         .pointer_mut("/result/data")
         .and_then(Value::as_array_mut)
-    else {
-        return false;
-    };
-    for turn in turns {
+        .into_iter()
+        .flatten()
+    {
         for item in turn
             .get_mut("items")
             .and_then(Value::as_array_mut)
             .into_iter()
             .flatten()
         {
-            if item["type"] != "dynamicToolCall" {
-                continue;
-            }
-            for part in item
-                .get_mut("contentItems")
-                .and_then(Value::as_array_mut)
-                .into_iter()
-                .flatten()
-            {
-                if part["type"] == "inputImage"
-                    && part["imageUrl"]
-                        .as_str()
-                        .is_some_and(|url| url.starts_with("data:image/"))
-                {
-                    *part =
-                        json!({"type":"inputText","text":"[Tool image saved in Codex history]"});
-                    changed = true;
-                }
-            }
+            changed |= crate::chat_media::project_item(root, item);
         }
     }
     changed
@@ -427,7 +427,7 @@ fn send_native<S: Read + Write>(ws: &mut WebSocket<S>, value: Value) -> Result<(
     crate::wire::send(ws, Message::Text(value.to_string().into())).map_err(|e| e.to_string())
 }
 
-fn store_attachment(root: &Path, p: &Value) -> Result<Value> {
+pub(crate) fn store_attachment(root: &Path, p: &Value) -> Result<Value> {
     use base64::Engine as _;
     use std::os::unix::fs::OpenOptionsExt;
     let name = p["name"]
@@ -447,6 +447,7 @@ fn store_attachment(root: &Path, p: &Value) -> Result<Value> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(|_| "Invalid file encoding")?;
+    fs::create_dir_all(root).map_err(|e| e.to_string())?;
     let dir = root.join(uuid::Uuid::new_v4().to_string());
     fs::create_dir(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(name);
@@ -738,18 +739,20 @@ mod ipc_tests {
     use super::*;
     #[test]
     fn history_compacts_only_embedded_tool_images() {
+        let root = std::env::temp_dir().join(format!("d4c-history-{}", uuid::Uuid::new_v4()));
         let image = json!({"type":"inputImage","imageUrl":"data:image/png;base64,test"});
         let user = json!({"type":"userMessage","content":[image.clone()]});
         let mut response = json!({"result":{"data":[{"items":[user.clone(),
             {"type":"dynamicToolCall","contentItems":[image,{"type":"inputText","text":"ok"}]}
         ]}],"nextCursor":"older"}});
-        assert!(compact_history_images(&mut response));
+        assert!(compact_history_images(&root, &mut response));
         assert_eq!(response["result"]["nextCursor"], "older");
         let items = &response["result"]["data"][0]["items"];
         assert_eq!(items[0], user);
         assert_eq!(items[1]["contentItems"][0]["type"], "inputText");
         assert_eq!(items[1]["contentItems"][1]["text"], "ok");
-        assert!(!compact_history_images(&mut response));
+        assert!(!compact_history_images(&root, &mut response));
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn second_manager_cannot_unlink_live_socket() {

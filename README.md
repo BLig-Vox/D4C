@@ -20,6 +20,7 @@ Select a chat under its server in the sidebar. Returning to a visited server reu
 - **Chats:** start, search, rename or delete conversations in the sidebar, grouped under their server. Enter sends; Shift+Enter adds a line. The down-arrow returns to the latest message.
 - **Models:** choose from the Codex server's model catalog in the composer. Your choice and reasoning level are remembered per connection. Availability comes from the server and your provider account.
 - **Uploads:** use **+** or desktop drag-and-drop. Limits are 6 MB per file and 12 MB per draft. Sent images have previews; files have cards. Interpretation of audio, video and documents depends on the chosen runtime/model. Unsent attachments stay on their originating device.
+- **Chat media:** Open a picture to zoom or pan. Attached videos have playback and seek controls. On Android, web links open in your browser. For assistant-generated media and screenshot previews, update the workspace server alongside the app.
 - **Activity:** replies stream as Codex emits events. Tool calls have expandable details; thinking is displayed only when emitted by the server. Older messages load when scrolling up.
 - **Commands:** type `/` to discover eligible server commands and skills. Select a suggestion, fill its arguments, then send. `/vnc connect NAME` attaches a desktop to the current conversation; `/vnc disconnect` detaches it without stopping the desktop.
 - **Tasks:** ask in chat, such as “Every weekday at 9 AM, summarize my project.” Open the chat workspace's **Tasks** tab for status, history, run now, pause/resume and deletion. D4C schedules run in isolated sessions; results appear in Tasks history and notifications linked to the originating chat. Scheduled cards do not interrupt the conversation. Closing D4C does not stop a schedule.
@@ -32,19 +33,22 @@ Use **Settings → Reload current session** on an idle conversation after changi
 
 ## Prebuilt Linux install
 
-Download `d4c-0.1.0-alpha.10-linux-x86_64.tar.gz` and `SHA256SUMS` from
-[Releases](https://github.com/Blig-Vox/D4C/releases/tag/v0.1.0-alpha.10), then:
+Download `d4c-0.1.0-alpha.11-linux-x86_64.tar.gz` and `SHA256SUMS` from
+[Releases](https://github.com/Blig-Vox/D4C/releases/tag/v0.1.0-alpha.11), then:
 
 ```sh
 sha256sum --ignore-missing -c SHA256SUMS
-tar -xzf d4c-0.1.0-alpha.10-linux-x86_64.tar.gz
-cd d4c-0.1.0-alpha.10-linux-x86_64
+tar -xzf d4c-0.1.0-alpha.11-linux-x86_64.tar.gz
+cd d4c-0.1.0-alpha.11-linux-x86_64
 python3 scripts/install-desktop.py bin/vox-d4c
 ~/.local/bin/vox-d4c
 ```
 
+On Ubuntu 24.04, install the playback runtime with
+`sudo apt install libgstreamer-plugins-base1.0-0 gstreamer1.0-plugins-good gstreamer1.0-libav`.
+
 Requires glibc 2.39+ and compatible X11/Wayland and Vulkan drivers. This is a
-native Linux build, not a static binary or AppImage. The separate workspace-server
+native Linux build with GStreamer video playback, not a static binary or AppImage. The separate workspace-server
 archive includes its binary, deployment templates, scheduling tools, migration helpers and
 setup documentation; configure it for your server using the guide below.
 
@@ -55,6 +59,7 @@ Requires a current stable Rust toolchain supporting edition 2024, Python 3, syst
 ```sh
 sudo apt install build-essential pkg-config libssl-dev libvulkan1 mesa-vulkan-drivers \
   libwayland-dev libxkbcommon-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-good gstreamer1.0-libav \
   zenity libnotify-bin pulseaudio-utils sound-theme-freedesktop
 ```
 

@@ -9,8 +9,11 @@ mod commands;
 mod cron;
 mod desktop_wire;
 mod desktops;
+mod dialogs;
 mod draft_sync;
+use dialogs::ComposerPicker;
 mod gateway;
+mod links;
 mod media;
 mod notifications;
 mod platform;
@@ -58,7 +61,7 @@ fn run(options: eframe::NativeOptions) -> eframe::Result {
                 vec!["lucide".into()],
             );
             platform::install_symbol_fonts(&mut fonts);
-            cc.egui_ctx.set_fonts(fonts);
+            shadcn_egui::Theme::vega().apply_with_fonts(&cc.egui_ctx, fonts);
             #[cfg(target_os = "android")]
             android_text::install_emoji(&cc.egui_ctx);
             let mut app = D4c::default();
@@ -81,6 +84,7 @@ struct Draft {
 }
 struct ServerView {
     session: String,
+    questions: questions::Questions,
     messages: Vec<ChatMessage>,
     scroll: (f32, f32),
     desktop: desktops::UiState,
@@ -113,6 +117,7 @@ struct D4c {
     connection_url: String,
     settings_error: String,
     switch_pending: Option<usize>,
+    composer_picker: Option<ComposerPicker>,
     compact_previous: bool,
     show_cron: bool,
     workspace_open: bool,
@@ -133,7 +138,7 @@ struct D4c {
     fallback_titles: std::collections::HashMap<String, String>,
     title_requests: std::collections::HashMap<String, String>,
     media_auth: Option<String>,
-    media_requests: std::collections::HashMap<String, (String, usize, usize)>,
+    media_requests: std::collections::HashMap<String, (String, String)>,
     messages: Vec<ChatMessage>,
     input: String,
     questions: questions::Questions,
@@ -210,6 +215,7 @@ impl Default for D4c {
             connection_url: String::new(),
             settings_error: String::new(),
             switch_pending: None,
+            composer_picker: None,
             compact_previous: false,
             sidebar_open: true,
             show_cron: false,
@@ -283,6 +289,7 @@ impl Default for D4c {
 }
 impl D4c {
     fn reconnect(&mut self, ctx: &egui::Context) {
+        self.composer_picker = None;
         self.workspace_hydrated = false;
         self.permission_request = None;
         self.questions.disconnected();
@@ -303,6 +310,7 @@ impl D4c {
         }
         self.desktops.connect(&self.url, ctx);
         self.gateway = None;
+        media::reset();
         self.media_auth = None;
         self.media_requests.clear();
         self.connected = false;
@@ -354,10 +362,12 @@ impl D4c {
             {
                 messages.remove(0);
             }
+            self.questions.disconnected();
             views.push_back((
                 self.url.clone(),
                 ServerView {
                     session: self.session.clone(),
+                    questions: std::mem::take(&mut self.questions),
                     messages,
                     scroll: self.history_scroll,
                     desktop: self.desktops.capture_ui(),
@@ -397,6 +407,7 @@ impl D4c {
             .unwrap_or_default();
         if let Some(view) = restored {
             next.desktops.restore_ui(view.desktop);
+            next.questions = view.questions;
             next.session = view.session;
             next.messages = view.messages;
             next.history_scroll = view.scroll;
@@ -517,6 +528,7 @@ impl D4c {
             return;
         }
         if self.preferences.current().url != self.url {
+            media::reset();
             self.rpc("sessions.messages.unsubscribe", json!({"key":self.session}));
             if let Some(link) = self.gateway.take() {
                 self.servers.park(
@@ -566,92 +578,6 @@ impl D4c {
     }
     fn switch_connection(&mut self, index: usize, ctx: &egui::Context) {
         self.switch_to(index, ctx, None);
-    }
-    fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        let mut switch = None;
-        let mut forget = None;
-        egui::ScrollArea::vertical().id_salt("settings").show(ui,|ui|{
-            ui.set_max_width(ui.available_width().min(640.0));
-            ui.spacing_mut().interact_size.y=32.0;
-            ui.heading("Settings");ui.add_space(18.0);ui.strong("Connections");ui.add_space(8.0);
-            for (index,c) in self.preferences.connections.clone().iter().enumerate(){
-                egui::Frame::new().fill(egui::Color32::from_rgb(29,31,36)).corner_radius(10).inner_margin(12).show(ui,|ui|{
-                    ui.set_min_width((ui.available_width()).max(1.0));
-                    ui.horizontal_wrapped(|ui|{
-                        ui.strong(&c.name);
-                        if index==self.preferences.selected {ui.label(egui::RichText::new(if self.connected{"Online"}else{"Offline"}).small().color(if self.connected{egui::Color32::from_rgb(154,209,182)}else{egui::Color32::GRAY}));}
-                        else {
-                            if ui.button("Switch").clicked(){switch=Some(index);}
-                            ui.menu_button("More",|ui|{if ui.button("Remove connection").clicked(){forget=Some(index);ui.close();}});
-                        }
-                    });
-                    ui.add(egui::Label::new(egui::RichText::new(&c.url).small().weak()).wrap());
-                });ui.add_space(6.0);
-            }
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui|{
-                if ui.button(if self.connected{"Reconnect"}else{"Connect"}).clicked(){self.reconnect(ui.ctx());}
-                if ui.add_enabled(self.can_reload(), egui::Button::new("Reload current session")).on_hover_text("Refresh Codex tools and skills while the chat is idle").clicked() { self.reload_session(); }
-                if self.gateway.is_some()&&ui.button("Disconnect").clicked(){self.gateway=None;self.connected=false;self.running=false;self.active_sessions.clear();self.live.clear();self.status="Disconnected".into();self.cron.disconnected();}
-            });
-            ui.add(egui::Label::new(egui::RichText::new(&self.status).small().weak()).wrap().selectable(true));
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new("New devices need approval on the D4C server.").small().weak());
-            ui.add_space(12.0);
-            if preferences::valid_url(&self.url) {
-                egui::CollapsingHeader::new("Workspace server").show(ui, |ui| {
-                    let value = self.preferences.workspace_urls.entry(self.url.clone()).or_default();
-                    ui.add(egui::TextEdit::singleline(value).hint_text("wss://workspace-host:8443 (optional)").desired_width(f32::INFINITY));
-                    if ui.button("Save workspace URL").clicked() {
-                        if value.is_empty() || preferences::valid_url(value) {
-                            if let Err(e) = self.preferences.save() { self.settings_error = e.to_string(); }
-                            else { self.settings_error.clear(); self.desktops.connect(&self.url, ui.ctx()); }
-                        } else { self.settings_error = "Use a secure wss:// URL without credentials or query tokens".into(); }
-                    }
-                });
-            }
-            egui::CollapsingHeader::new("Add server").id_salt("add_server").show(ui,|ui|{
-                ui.add(egui::TextEdit::singleline(&mut self.connection_name).hint_text("Name").desired_width(f32::INFINITY));
-                ui.add(egui::TextEdit::singleline(&mut self.connection_url).hint_text("wss://your-server").desired_width(f32::INFINITY));
-                if ui.button("Save connection").clicked(){
-                    let url=self.connection_url.trim();let name=self.connection_name.trim();
-                    self.settings_error=if !preferences::valid_url(url){"Use a secure wss:// address without credentials or query tokens".into()}else if name.is_empty(){"Give this connection a name".into()}else if self.preferences.connections.len()>=12{"Up to 12 connections are supported".into()}else if self.preferences.connections.iter().any(|c|c.url==url){"This server is already saved".into()}else{
-                        self.preferences.connections.push(preferences::Connection{name:name.chars().take(60).collect(),url:url.into()});
-                        match self.preferences.save(){Ok(())=>{self.connection_name.clear();self.connection_url.clear();String::new()},Err(e)=>e.to_string()}
-                    };
-                }
-            });
-            ui.add_space(18.0);ui.separator();ui.add_space(12.0);ui.strong("Notifications");
-            let a=ui.checkbox(&mut self.preferences.desktop,"Desktop alerts").changed();
-            let b=ui.checkbox(&mut self.preferences.sound,"Sound").changed();
-            if a||b{if let Err(e)=self.preferences.save(){self.settings_error=e.to_string();}}
-            ui.label(egui::RichText::new("Alerts appear on the device running D4C, while the app is connected.").small().weak());
-            if ui.button("Test notification").clicked(){
-                if self.center.push(json!({"id":format!("test:{}",activity::now()/1000),"title":"D4C","body":"Notifications are ready","session":"","time":activity::now(),"kind":"test","unread":true})) {
-                    self.notifier.test(self.preferences.desktop,self.preferences.sound);
-                }
-            }
-            ui.label(egui::RichText::new(&self.notifier.status).small().weak());
-            for e in [&self.settings_error,&self.center.error]{if !e.is_empty(){ui.colored_label(egui::Color32::LIGHT_RED,e);}}
-        });
-        if let Some(index) = forget {
-            let previous = self.preferences.clone();
-            self.preferences.connections.remove(index);
-            if self.preferences.selected > index {
-                self.preferences.selected -= 1;
-            }
-            if let Err(e) = self.preferences.save() {
-                self.preferences = previous;
-                self.settings_error = e.to_string();
-            }
-        }
-        if let Some(index) = switch {
-            if !self.active_sessions.is_empty() {
-                self.switch_pending = Some(index);
-            } else {
-                self.switch_connection(index, ui.ctx());
-            }
-        }
     }
     fn notification_ui(&mut self, ui: &mut egui::Ui) {
         let unread = self.center.unread(None);
@@ -946,7 +872,7 @@ impl D4c {
         {
             *key = new.into();
         }
-        for (key, _, _) in self.media_requests.values_mut() {
+        for (key, _) in self.media_requests.values_mut() {
             if key == old {
                 *key = new.into();
             }
@@ -1005,6 +931,7 @@ impl D4c {
             return;
         }
         self.explicit_selection = true;
+        self.composer_picker = None;
         self.servers.select(&self.url, &key);
         self.desktops.open = false;
         self.show_cron = false;
@@ -1035,6 +962,7 @@ impl D4c {
             self.attachments.clear();
         }
         self.rpc("sessions.messages.unsubscribe", json!({"key":self.session}));
+        media::reset();
         self.session = key;
         self.history_dirty = false;
         let draft = self.drafts.remove(&self.session).unwrap_or_default();
@@ -1251,7 +1179,11 @@ impl D4c {
                     {
                         continue;
                     }
-                    self.questions.observe(&v);
+                    self.questions.observe_after(
+                        &v,
+                        &self.session,
+                        self.messages.last().and_then(|m| m.item_id.as_deref()),
+                    );
                     let response_id = v["id"].as_str().unwrap_or("");
                     if v["type"] == "res" {
                         if self
@@ -1402,44 +1334,42 @@ impl D4c {
                         continue;
                     }
                     let id = v["id"].as_str().unwrap_or("");
-                    if let Some((session, message, attachment)) = self.media_requests.remove(id) {
-                        if session == self.session && v["ok"] == true {
+                    if let Some((session, artifact)) = self.media_requests.remove(id) {
+                        if session == self.session {
                             let p = &v["payload"];
-                            if let Some(encoded) =
-                                p["data"].as_str().filter(|s| s.len() <= 8_000_000)
+                            let bytes = p["data"]
+                                .as_str()
+                                .filter(|s| s.len() <= 8_000_000)
+                                .and_then(|s| {
+                                    base64::engine::general_purpose::STANDARD.decode(s).ok()
+                                })
+                                .filter(|b| !b.is_empty())
+                                .map(std::sync::Arc::<[u8]>::from);
+                            for attachment in self
+                                .messages
+                                .iter_mut()
+                                .flat_map(|m| &mut m.media)
+                                .filter(|a| a.artifact.as_deref() == Some(&artifact))
                             {
-                                if let Ok(bytes) =
-                                    base64::engine::general_purpose::STANDARD.decode(encoded)
+                                if v["ok"] == true
+                                    && let Some(bytes) = bytes.as_ref()
                                 {
-                                    if let Some(media) = self
-                                        .messages
-                                        .get_mut(message)
-                                        .and_then(|m| m.media.get_mut(attachment))
-                                    {
-                                        media.receive(
-                                            p["artifact"]["mimeType"]
-                                                .as_str()
-                                                .unwrap_or("image/webp")
-                                                .into(),
-                                            bytes,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        if session == self.session
-                            && v["ok"] == true
-                            && v["payload"]["data"].as_str().is_none()
-                        {
-                            if let (Some(path), Some(token)) =
-                                (v["payload"]["url"].as_str(), self.media_auth.as_ref())
-                            {
-                                if let Some(media) = self
-                                    .messages
-                                    .get_mut(message)
-                                    .and_then(|m| m.media.get_mut(attachment))
+                                    let mime = p["artifact"]["mimeType"]
+                                        .as_str()
+                                        .unwrap_or(&attachment.mime)
+                                        .to_owned();
+                                    attachment.receive(mime, bytes.clone());
+                                } else if v["ok"] == true
+                                    && let (Some(url), Some(token)) =
+                                        (p["url"].as_str(), self.media_auth.as_ref())
                                 {
-                                    media.receive_url(&self.url, token, path);
+                                    attachment.receive_url(&self.url, token, url);
+                                } else {
+                                    attachment.download_failed(
+                                        v["error"]["message"]
+                                            .as_str()
+                                            .unwrap_or("Attachment download failed"),
+                                    );
                                 }
                             }
                         }
@@ -1674,7 +1604,7 @@ impl D4c {
                         let message = &payload["message"];
                         if message["role"] == "user" {
                             let text = message_text(message);
-                            let media = media::from_message(message);
+                            let mut media = media::from_message(message);
                             let canonical_id = message["__openclaw"]["id"]
                                 .as_str()
                                 .or_else(|| message["id"].as_str())
@@ -1706,6 +1636,7 @@ impl D4c {
                                         echo.item_id = canonical_id;
                                     }
                                     if !media.is_empty() {
+                                        media::retain_loaded(&mut media, &mut echo.media);
                                         echo.media = media;
                                     }
                                 } else {
@@ -1800,7 +1731,7 @@ impl D4c {
                                 if cron::is_scheduler_tool(tool) {
                                     self.cron.observe_tool(&self.session, m);
                                 }
-                                if let Some(row) = transcript_message(m) {
+                                if let Some(mut row) = transcript_message(m) {
                                     if let Some(client_id) = m["clientId"].as_str() {
                                         let local = format!("local:{client_id}");
                                         if let Some(echo) = previous
@@ -1809,6 +1740,14 @@ impl D4c {
                                         {
                                             echo.item_id = row.item_id.clone();
                                         }
+                                    }
+                                    if !older_page
+                                        && !row.media.is_empty()
+                                        && let Some(prev) = previous
+                                            .iter_mut()
+                                            .find(|old| same_chat_message(&row, old))
+                                    {
+                                        media::retain_loaded(&mut row.media, &mut prev.media);
                                     }
                                     self.messages.push(row);
                                 }
@@ -1896,7 +1835,6 @@ impl D4c {
                                 }
                             }
                         }
-                        self.media_requests.clear();
                         if !older_page {
                             self.recover_inflight(&payload["inFlightRun"]);
                         }
@@ -1925,7 +1863,7 @@ impl D4c {
                         let state = payload["state"].as_str().unwrap_or("");
                         if state == "delta" || state == "final" {
                             self.running = state == "delta";
-                            let snapshot_media = media::from_message(&payload["message"]);
+                            let mut snapshot_media = media::from_message(&payload["message"]);
                             let snapshot = message_text(&payload["message"]);
                             let delta = payload["deltaText"].as_str().unwrap_or("");
                             let replace = payload["replace"].as_bool().unwrap_or(false);
@@ -1957,6 +1895,7 @@ impl D4c {
                                 });
                                 if let Some(last) = self.messages.get_mut(index) {
                                     if !snapshot_media.is_empty() {
+                                        media::retain_loaded(&mut snapshot_media, &mut last.media);
                                         last.media = snapshot_media;
                                     }
                                     if !snapshot.is_empty() {
@@ -2053,7 +1992,7 @@ impl D4c {
                                 self.cron.observe_tool(&self.session, &data["result"]);
                                 self.cron.refresh();
                             }
-                            let media = media::from_message(&data["result"]);
+                            let mut media = media::from_message(&data["result"]);
                             let detail = tool_details(data);
                             let title = tool_title(
                                 name,
@@ -2073,6 +2012,7 @@ impl D4c {
                                 }
                                 m.role = title;
                                 if !media.is_empty() {
+                                    media::retain_loaded(&mut media, &mut m.media);
                                     m.media = media;
                                 }
                             } else {
@@ -2378,7 +2318,7 @@ impl D4c {
     }
     fn composer(&mut self, ui: &mut egui::Ui) {
         let composer_id = egui::Id::unique("message_input");
-        let focused = ui.memory(|m| m.has_focus(composer_id));
+        let focused = !self.dialog_open() && ui.memory(|m| m.has_focus(composer_id));
         let mut candidates = if self.slash_dismissed {
             vec![]
         } else {
@@ -2421,35 +2361,7 @@ impl D4c {
             .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                if self.permission_request.is_some() {
-                    ui.weak("Updating permissions…");
-                } else {
-                    let current = self.permission_modes.get(&self.session).cloned();
-                    let caption = current.as_ref().map_or_else(
-                        || "Permissions".to_owned(),
-                        |mode| format!("Permissions · {mode}"),
-                    );
-                    ui.add_enabled_ui(
-                        self.connected && !self.running && !self.history_loading,
-                        |ui| {
-                            ui.menu_button(caption, |ui| {
-                                for (mode, label) in [
-                                    ("default", "Default"),
-                                    ("read-only", "Read only"),
-                                    ("yolo", "Full access (YOLO)"),
-                                ] {
-                                    if ui
-                                        .selectable_label(current.as_deref() == Some(label), label)
-                                        .clicked()
-                                    {
-                                        self.set_permissions(mode);
-                                        ui.close();
-                                    }
-                                }
-                            });
-                        },
-                    );
-                }
+                self.permissions_trigger(ui);
                 if self.input.starts_with('/') && !self.slash_dismissed {
                     if !candidates.is_empty() {
                         ui.horizontal(|ui| {
@@ -2627,13 +2539,7 @@ impl D4c {
                     });
                 let response = draft_scroll.inner;
                 #[cfg(target_os = "android")]
-                android_text::show(
-                    &format!("{}|{}", self.url, self.session),
-                    &self.input,
-                    response.rect.intersect(draft_scroll.inner_rect),
-                    ui.ctx().pixels_per_point(),
-                    self.focus_composer,
-                );
+                let editor_focus = self.focus_composer;
                 if response.changed() {
                     self.slash_dismissed = false;
                     self.slash_selected = 0;
@@ -2658,60 +2564,7 @@ impl D4c {
                         self.composer_error.clear();
                         self.upload = Some((self.session.clone(), uploads::pick(ui.ctx().clone())));
                     }
-                    let old = self.model.clone();
-                    let short = self
-                        .model
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(&self.model)
-                        .to_string();
-                    egui::ComboBox::from_id_salt("model")
-                        .selected_text(if short.is_empty() {
-                            "Model".into()
-                        } else {
-                            short
-                        })
-                        .width(if ui.available_width() < 280.0 {
-                            104.0
-                        } else {
-                            130.0
-                        })
-                        .show_ui(ui, |ui| {
-                            for model in &self.models {
-                                ui.selectable_value(&mut self.model, model.clone(), model);
-                            }
-                        })
-                        .response
-                        .on_hover_text("Model");
-                    if self.model != old {
-                        self.normalize_effort();
-                        self.remember_selection();
-                        self.patch_selection();
-                    }
-                    let old = self.thinking.clone();
-                    egui::ComboBox::from_id_salt("thinking")
-                        .selected_text(&self.thinking)
-                        .width(82.0)
-                        .show_ui(ui, |ui| {
-                            for level in self
-                                .model_efforts
-                                .get(&self.model)
-                                .into_iter()
-                                .flat_map(|(levels, _)| levels)
-                            {
-                                ui.selectable_value(
-                                    &mut self.thinking,
-                                    level.clone(),
-                                    level.as_str(),
-                                );
-                            }
-                        })
-                        .response
-                        .on_hover_text("Reasoning effort");
-                    if self.thinking != old {
-                        self.remember_selection();
-                        self.patch_selection();
-                    }
+                    self.model_triggers(ui);
                     ui.horizontal(|ui| {
                         if self.running {
                             if ui
@@ -2748,6 +2601,16 @@ impl D4c {
                         }
                     });
                 });
+                #[cfg(target_os = "android")]
+                if !self.dialog_open() && !media::is_fullscreen() {
+                    android_text::show(
+                        &format!("{}|{}", self.url, self.session),
+                        &self.input,
+                        response.rect.intersect(draft_scroll.inner_rect),
+                        ui.ctx().pixels_per_point(),
+                        editor_focus,
+                    );
+                }
                 if !self.composer_error.is_empty() {
                     ui.colored_label(egui::Color32::LIGHT_RED, &self.composer_error);
                 }
@@ -2827,6 +2690,7 @@ impl D4c {
         );
         self.sessions.retain(|(k, _)| k != key);
         self.session_settings.remove(key);
+        self.questions.forget_session(key);
         self.drafts.remove(key);
         self.fallback_titles.remove(key);
         self.title_requests.retain(|_, k| k != key);
@@ -3056,12 +2920,14 @@ fn message_text(v: &Value) -> String {
 impl eframe::App for D4c {
     #[cfg(target_os = "android")]
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        media::reset();
         let _ = self.save_server_drafts();
         self.servers.select(&self.url, &self.session);
         self.servers.save();
     }
     #[cfg(not(target_os = "android"))]
     fn on_exit(&mut self) {
+        media::reset();
         let _ = self.save_server_drafts();
         self.servers.select(&self.url, &self.session);
         self.servers.save();
@@ -3076,14 +2942,29 @@ impl eframe::App for D4c {
                 ui.set_clip_rect(visible);
                 self.render_ui(ui);
             });
-            android_text::flush_clipboard(ui.ctx());
+            android_text::set_modal_visible(self.dialog_open() || media::is_fullscreen());
+            android_text::flush_platform_commands(ui.ctx());
             // NativeActivity's content rectangle can change without a resize
             // event; refresh while the keyboard animates even if no keys arrive.
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(50));
         }
         #[cfg(not(target_os = "android"))]
-        self.render_ui(ui);
+        {
+            self.render_ui(ui);
+            // Only dispatch web links from untrusted chat Markdown to the host.
+            ui.ctx().output_mut(|out| {
+                out.commands.retain(|cmd| match cmd {
+                    egui::OutputCommand::OpenUrl(link) => {
+                        link.url.split_once("://").is_some_and(|(scheme, _)| {
+                            scheme.eq_ignore_ascii_case("https")
+                                || scheme.eq_ignore_ascii_case("http")
+                        })
+                    }
+                    _ => true,
+                })
+            });
+        }
     }
 }
 impl D4c {
@@ -3091,29 +2972,30 @@ impl D4c {
         if !self.connected {
             return;
         }
-        let mut requests = vec![];
-        for (i, message) in self.messages.iter_mut().enumerate() {
-            for (j, media) in message.media.iter_mut().enumerate() {
-                if let Some(token) = self.media_auth.as_ref() {
-                    media.configure_http(&self.url, token, &self.session);
-                }
-                if self.media_requests.len() + requests.len() >= 4 {
-                    break;
-                }
-                if media.size == 0 && !media.requested {
-                    if let Some(id) = media.artifact.as_ref() {
-                        media.requested = true;
-                        requests.push((i, j, id.clone()));
-                    }
-                }
+        let mut requests = Vec::new();
+        for media in self.messages.iter_mut().flat_map(|m| &mut m.media) {
+            if let Some(token) = self.media_auth.as_ref() {
+                media.configure_http(&self.url, token, &self.session);
+            }
+            if let Some(id) = media.artifact.as_ref()
+                && self.media_requests.len() + requests.len() < 4
+                && media.wants_download()
+                && !self
+                    .media_requests
+                    .values()
+                    .any(|(s, a)| s == &self.session && a == id)
+                && !requests.contains(id)
+            {
+                requests.push(id.clone());
             }
         }
-        for (i, j, artifact) in requests {
+        for artifact in requests {
             if let Some(id) = self.rpc(
                 "artifacts.download",
-                json!({"sessionKey":self.session,"artifactId":artifact,"previewWidth":640}),
+                json!({"sessionKey":self.session,"artifactId":artifact}),
             ) {
-                self.media_requests.insert(id, (self.session.clone(), i, j));
+                self.media_requests
+                    .insert(id, (self.session.clone(), artifact));
             }
         }
     }
@@ -3191,6 +3073,10 @@ impl D4c {
             });
     }
     fn render_ui(&mut self, ui: &mut egui::Ui) {
+        #[cfg(target_os = "android")]
+        if android_text::take_modal_back() && !media::close_fullscreen() {
+            self.dismiss_dialog();
+        }
         #[cfg(target_os = "android")]
         if let Some((session, text, revision)) = android_text::begin(ui.ctx()) {
             if session == format!("{}|{}", self.url, self.session) {
@@ -3571,117 +3457,6 @@ impl D4c {
             self.sidebar_open = sidebar_open;
         }
 
-        if let Some(index) = self.switch_pending {
-            let mut accept = false;
-            let mut cancel = false;
-            egui::Window::new("Switch server?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER,[0.0,0.0]).default_width(280.0).show(ui.ctx(),|ui|{
-                ui.label("Work is still running on this server. It will continue there while you switch.");
-                ui.horizontal(|ui|{if ui.button("Stay here").clicked(){cancel=true;}if ui.button("Switch server").clicked(){accept=true;}});
-            });
-            if cancel {
-                self.switch_pending = None;
-            }
-            if accept {
-                self.switch_pending = None;
-                self.switch_connection(index, ui.ctx());
-            }
-        }
-        if let Some((key, title)) = self.delete_chat.clone() {
-            let mut cancel = false;
-            let mut confirm = false;
-            egui::Window::new("Delete chat?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .max_width((ui.ctx().content_rect().width() - 48.0).clamp(180.0, 340.0))
-                .show(ui.ctx(), |ui| {
-                    ui.label(&title);
-                    ui.label("This removes the chat and its transcript.");
-                    if !self.delete_error.is_empty() {
-                        ui.colored_label(egui::Color32::LIGHT_RED, &self.delete_error);
-                    }
-                    ui.horizontal(|ui| {
-                        cancel = ui
-                            .add_enabled(self.delete_pending.is_none(), egui::Button::new("Cancel"))
-                            .clicked();
-                        confirm = ui
-                            .add_enabled(
-                                self.connected
-                                    && self.delete_pending.is_none()
-                                    && !self.active_sessions.contains(&key),
-                                egui::Button::new(if self.delete_pending.is_some() {
-                                    "Deleting…"
-                                } else {
-                                    "Delete"
-                                }),
-                            )
-                            .clicked();
-                    });
-                });
-            if cancel {
-                self.delete_chat = None;
-            } else if confirm {
-                self.delete_error.clear();
-                self.delete_pending = self
-                    .rpc(
-                        "sessions.delete",
-                        json!({"key":key,"deleteTranscript":true}),
-                    )
-                    .map(|id| (id, key));
-            }
-        }
-        if let Some((key, mut name)) = self.rename.clone() {
-            let mut cancel = false;
-            let mut save = false;
-            egui::Window::new("Rename chat")
-                .max_width((ui.ctx().content_rect().width() - 48.0).max(180.0))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
-                    ui.label("Chat name");
-                    let input = ui.add(egui::TextEdit::singleline(&mut name).desired_width(300.0));
-                    if !self.rename_error.is_empty() {
-                        ui.colored_label(egui::Color32::LIGHT_RED, &self.rename_error);
-                    }
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        cancel = ui
-                            .add_enabled(self.rename_pending.is_none(), egui::Button::new("Cancel"))
-                            .clicked();
-                        save = ui
-                            .add_enabled(
-                                self.rename_pending.is_none() && !name.trim().is_empty(),
-                                egui::Button::new("Save"),
-                            )
-                            .clicked()
-                            || (input.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                && !name.trim().is_empty()
-                                && self.rename_pending.is_none());
-                    });
-                });
-            if cancel {
-                self.rename = None;
-            } else {
-                self.rename = Some((key.clone(), name.clone()));
-                if save {
-                    let req =
-                        gateway::rpc("sessions.patch", json!({"key":key,"label":name.trim()}));
-                    if let Some(g) = &self.gateway {
-                        let id = req["id"].as_str().unwrap_or("").to_string();
-                        if g.tx.send(req).is_ok() {
-                            self.rename_pending = Some(id);
-                            self.rename_error.clear();
-                        } else {
-                            self.rename_error = "Codex disconnected".into();
-                        }
-                    } else {
-                        self.rename_error = "Connect to rename chats".into();
-                    }
-                }
-            }
-        }
         if self.workspace_open && !compact && !self.settings_open && !self.notifications_open {
             egui::Panel::right("chat_workspace")
                 .default_size(360.0_f32.min(ui.available_width() * 0.45))
@@ -3784,12 +3559,16 @@ impl D4c {
                                     });
                                 });
                             }
+                            let message_ids = self.messages.iter().filter_map(|m| m.item_id.as_deref()).collect();
+                            let mut cards = self.questions.cards_by_anchor(&self.session, &message_ids);
+                            let mut replies = Vec::new();
                             let mut index = 0;
                             while index < self.messages.len() {
+                                let group_start = index;
                                 let message = &self.messages[index];
-                                if is_tool_message(message) {
+                                if is_tool_message(message) && message.media.is_empty() {
                                     let start = index;
-                                    while index < self.messages.len() && is_tool_message(&self.messages[index]) { index += 1; }
+                                    while index < self.messages.len() && is_tool_message(&self.messages[index]) && self.messages[index].media.is_empty() { index += 1; }
                                     egui::CollapsingHeader::new(format!("Activity · {} tool calls", index - start))
                                         .id_salt(("tool_group", &self.session, message.item_id.as_deref().unwrap_or("tool")))
                                         .show(ui, |ui| {
@@ -3802,12 +3581,26 @@ impl D4c {
                                     ui.push_id((&self.session, index), |ui| message_bubble(ui, message, &mut self.markdown_cache));
                                     index += 1;
                                 }
+                                for row in &self.messages[group_start..index] {
+                                    if let Some(id) = row.item_id.as_deref()
+                                        && let Some(records) = cards.remove(&Some(id))
+                                    {
+                                        replies.extend(self.questions.ui_after(ui, self.connected, records));
+                                    }
+                                }
                                 ui.add_space(12.0);
                             }
-                            // Scheduled work stays in Tasks and owner-linked notifications.
-                            for request in self.questions.ui(ui, &self.session, self.connected) {
-                                if let Some(g) = &self.gateway {
-                                    let _ = g.tx.send(request);
+                            if let Some(records) = cards.remove(&None) {
+                                replies.extend(self.questions.ui_after(ui, self.connected, records));
+                            }
+                            for request in replies {
+                                match &self.gateway {
+                                    Some(g) => {
+                                        if let Err(error) = g.tx.send(request) {
+                                            self.questions.delivery_failed(&error.0);
+                                        }
+                                    }
+                                    None => self.questions.delivery_failed(&request),
                                 }
                             }
                             if self.running {
@@ -3885,6 +3678,8 @@ impl D4c {
             }
         }
         self.desktops.viewer_ui(ui.ctx());
+        media::finish_frame(ui.ctx());
+        self.dialogs_ui(ui.ctx(), compact);
         self.cron.flush(self.gateway.as_ref());
         #[cfg(target_os = "android")]
         android_text::finish();
@@ -4048,29 +3843,14 @@ fn message_bubble(
                                 media.ui(ui);
                                 ui.add_space(6.0);
                             }
-                            if outgoing {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&message.text)
-                                            .size(14.0)
-                                            .color(egui::Color32::from_gray(237)),
-                                    )
-                                    .wrap()
-                                    .selectable(true),
-                                );
-                            } else {
-                                ui.style_mut().text_styles.insert(
-                                    egui::TextStyle::Body,
-                                    egui::FontId::proportional(14.0),
-                                );
-                                ui.visuals_mut().override_text_color =
-                                    Some(egui::Color32::from_gray(225));
-                                egui_commonmark::CommonMarkViewer::new().show(
-                                    ui,
-                                    cache,
-                                    &display_text,
-                                );
-                            }
+                            ui.style_mut()
+                                .text_styles
+                                .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+                            egui_commonmark::CommonMarkViewer::new().show(
+                                ui,
+                                cache,
+                                &links::markdown(&display_text),
+                            );
                         }
                     });
                 });

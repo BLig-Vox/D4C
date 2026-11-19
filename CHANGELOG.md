@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-alpha.11
+
+- Open chat links on Android, inspect images at full size, and play attached videos with seeking and fullscreen controls.
+- Read Markdown questions and approvals in the conversation and select the exact response offered by Codex.
+- Updated native dialogs and mobile sheets using shared shadcn-style controls.
+- The workspace server can deliver shared media and desktop screenshots over the paired chat connection.
+
 ## 0.1.0-alpha.10
 
 - Keep authenticated chat connections open across server switches and reuse workspace connections when returning to a server.

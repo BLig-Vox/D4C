@@ -41,6 +41,8 @@ pub fn detach() {
     *LAST.lock().unwrap() = None;
     *EDIT.lock().unwrap() = None;
     VISIBLE_BOTTOM.store(0, Ordering::Release);
+    set_modal_visible(false);
+    take_modal_back();
     APPLIED_REVISION.store(0, Ordering::Release);
 }
 pub fn begin(ctx: &egui::Context) -> Option<(String, String, u64)> {
@@ -252,12 +254,15 @@ pub extern "system" fn Java_site_blig_d4c_D4cActivity_composerWindowHidden(
 
 /// egui-winit uses an in-process clipboard on Android. Forward all UI copy
 /// commands (including Markdown code blocks) to the actual Android clipboard.
-pub fn flush_clipboard(ctx: &egui::Context) {
+pub fn flush_platform_commands(ctx: &egui::Context) {
     let texts = ctx.output_mut(|output| {
         let mut texts = Vec::new();
         output.commands.retain(|command| {
             if let egui::OutputCommand::CopyText(text) = command {
-                texts.push(text.clone());
+                texts.push((false, text.clone()));
+                false
+            } else if let egui::OutputCommand::OpenUrl(link) = command {
+                texts.push((true, link.url.clone()));
                 false
             } else {
                 true
@@ -268,7 +273,7 @@ pub fn flush_clipboard(ctx: &egui::Context) {
     let Some(app) = crate::platform::android_app() else {
         return;
     };
-    for text in texts {
+    for (is_link, text) in texts {
         let activity_app = app.clone();
         app.run_on_java_main_thread(Box::new(move || {
             let vm = unsafe { jni::JavaVM::from_raw(activity_app.vm_as_ptr().cast()) };
@@ -278,14 +283,18 @@ pub fn flush_clipboard(ctx: &egui::Context) {
                 let text = env.new_string(&text)?;
                 env.call_method(
                     activity.as_ref(),
-                    jni_str!("copyText"),
+                    if is_link {
+                        jni_str!("openChatLink")
+                    } else {
+                        jni_str!("copyText")
+                    },
                     jni_sig!("(Ljava/lang/String;)V"),
                     &[JValue::Object(&text)],
                 )?;
                 Ok(())
             });
             if let Err(error) = result {
-                eprintln!("D4C Android clipboard: {error}");
+                eprintln!("D4C Android platform action: {error}");
             }
         }));
     }
@@ -297,4 +306,25 @@ pub extern "system" fn Java_site_blig_d4c_D4cActivity_finishNativeUi(
     _this: JObject<'_>,
 ) {
     eframe::request_android_activity_exit();
+}
+
+static MODAL_VISIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static MODAL_BACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn set_modal_visible(visible: bool) {
+    MODAL_VISIBLE.store(visible, Ordering::Release);
+}
+pub fn take_modal_back() -> bool {
+    MODAL_BACK.swap(false, Ordering::AcqRel)
+}
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_site_blig_d4c_D4cActivity_dismissChatOverlay(
+    _env: jni::EnvUnowned<'_>,
+    _this: JObject<'_>,
+) -> jni::sys::jboolean {
+    let consume = MODAL_VISIBLE.load(Ordering::Acquire);
+    if consume {
+        MODAL_BACK.store(true, Ordering::Release);
+        wake();
+    }
+    consume.into()
 }
