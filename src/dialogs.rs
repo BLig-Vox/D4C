@@ -461,14 +461,28 @@ impl D4c {
             .next()
             .filter(|name| !name.is_empty())
             .unwrap_or("Model");
-        let trigger = ui
-            .add_enabled(
+        // Split the remaining toolbar space on narrow screens so a long model
+        // name cannot displace the reasoning selector or the send action.
+        let available = ui.available_width();
+        let narrow = available < 260.0;
+        let trigger = if narrow {
+            ui.add_enabled_ui(!self.models.is_empty(), |ui| {
+                ui.add_sized(
+                    egui::vec2((available * 0.59 - 4.0).max(1.0), 30.0),
+                    egui::Button::new(model).truncate(),
+                )
+            })
+            .inner
+            .on_hover_text(model)
+        } else {
+            ui.add_enabled(
                 !self.models.is_empty(),
                 neutral(model)
                     .size(ButtonSize::Sm)
                     .icon_end(shadcn_egui::icons::lucide::CHEVRON_DOWN),
             )
-            .on_hover_text("Model");
+            .on_hover_text("Model")
+        };
         self.picker_trigger(ComposerPicker::Model, trigger);
         let has_efforts = self
             .model_efforts
@@ -479,15 +493,25 @@ impl D4c {
         } else {
             &self.thinking
         };
-        let trigger = ui
-            .add_enabled(
+        let trigger = if narrow {
+            ui.add_enabled_ui(has_efforts, |ui| {
+                ui.add_sized(
+                    egui::vec2((available * 0.41).max(1.0), 30.0),
+                    egui::Button::new(effort).frame(false).truncate(),
+                )
+            })
+            .inner
+            .on_hover_text("Reasoning effort")
+        } else {
+            ui.add_enabled(
                 has_efforts,
                 Button::new(effort)
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Sm)
                     .icon_end(shadcn_egui::icons::lucide::CHEVRON_DOWN),
             )
-            .on_hover_text("Reasoning effort");
+            .on_hover_text("Reasoning effort")
+        };
         self.picker_trigger(ComposerPicker::Effort, trigger);
     }
 

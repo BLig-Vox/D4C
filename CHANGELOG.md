@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.0-alpha.14
+
+- Align Markdown bullets with the first line of wrapped list items.
+- Keep model and reasoning controls on one row on narrow screens.
+
 ## 0.1.0-alpha.13
 
 - Model, reasoning effort and permissions now open directly above their desktop composer controls.

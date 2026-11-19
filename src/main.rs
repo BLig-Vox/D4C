@@ -2563,7 +2563,7 @@ impl D4c {
                     let tools_width = (ui.available_width() - 42.0).max(1.0);
                     ui.allocate_ui_with_layout(
                         egui::vec2(tools_width, 0.0),
-                        egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                        egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             ui.set_min_width(tools_width);
                             ui.spacing_mut().item_spacing.x = 4.0;
@@ -3857,6 +3857,10 @@ fn message_bubble(
                             ui.style_mut()
                                 .text_styles
                                 .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+                            // CommonMark starts wrapped list bodies in horizontal UIs. Their
+                            // first line must use the text height, not the toolbar button height.
+                            ui.spacing_mut().interact_size.y =
+                                ui.text_style_height(&egui::TextStyle::Body);
                             egui_commonmark::CommonMarkViewer::new().show(
                                 ui,
                                 cache,
