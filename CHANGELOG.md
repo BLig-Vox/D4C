@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-alpha.12
+
+- Search chats across servers with Ctrl+K on desktop, a visible focus ring and an inline clear button.
+- Updated the chat composer with compact attachment, permission, model and reasoning controls and a right-aligned send button.
+- Centered the sidebar chat menu alongside the title and selection indicator.
+
 ## 0.1.0-alpha.11
 
 - Open chat links on Android, inspect images at full size, and play attached videos with seeking and fullscreen controls.

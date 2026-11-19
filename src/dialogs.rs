@@ -2,7 +2,7 @@ use super::{D4c, activity, egui, gateway, json, preferences};
 use shadcn_egui::{
     Theme,
     components::{
-        button::{Button, ButtonVariant},
+        button::{Button, ButtonSize, ButtonVariant},
         card::{Card, CardSize},
         dialog::Dialog,
         input::Input,
@@ -433,8 +433,12 @@ impl D4c {
         if ui
             .add_enabled(
                 self.connected && !self.running && !self.history_loading,
-                neutral(caption),
+                Button::new(caption.clone())
+                    .icon(shadcn_egui::icons::lucide::SHIELD)
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::IconSm),
             )
+            .on_hover_text(caption)
             .clicked()
         {
             self.composer_picker = Some(ComposerPicker::Permissions);
@@ -449,7 +453,12 @@ impl D4c {
             .filter(|name| !name.is_empty())
             .unwrap_or("Model");
         if ui
-            .add_enabled(!self.models.is_empty(), neutral(model))
+            .add_enabled(
+                !self.models.is_empty(),
+                neutral(model)
+                    .size(ButtonSize::Sm)
+                    .icon_end(shadcn_egui::icons::lucide::CHEVRON_DOWN),
+            )
             .on_hover_text("Model")
             .clicked()
         {
@@ -465,7 +474,13 @@ impl D4c {
             &self.thinking
         };
         if ui
-            .add_enabled(has_efforts, neutral(effort))
+            .add_enabled(
+                has_efforts,
+                Button::new(effort)
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Sm)
+                    .icon_end(shadcn_egui::icons::lucide::CHEVRON_DOWN),
+            )
             .on_hover_text("Reasoning effort")
             .clicked()
         {

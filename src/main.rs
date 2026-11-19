@@ -2317,6 +2317,13 @@ impl D4c {
         }
     }
     fn composer(&mut self, ui: &mut egui::Ui) {
+        use shadcn_egui::{
+            Theme,
+            components::button::{Button, ButtonSize, ButtonVariant},
+            icons::lucide,
+        };
+        let theme = Theme::current(ui.ctx());
+        let palette = theme.palette();
         let composer_id = egui::Id::unique("message_input");
         let focused = !self.dialog_open() && ui.memory(|m| m.has_focus(composer_id));
         let mut candidates = if self.slash_dismissed {
@@ -2355,13 +2362,15 @@ impl D4c {
             });
         }
         egui::Frame::new()
-            .fill(egui::Color32::from_rgb(32, 33, 37))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(61)))
-            .corner_radius(16)
+            .fill(palette.card)
+            .stroke(egui::Stroke::new(
+                if focused { 2.0 } else { 1.0 },
+                if focused { palette.ring } else { palette.input },
+            ))
+            .corner_radius(12)
             .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                self.permissions_trigger(ui);
                 if self.input.starts_with('/') && !self.slash_dismissed {
                     if !candidates.is_empty() {
                         ui.horizontal(|ui| {
@@ -2519,7 +2528,7 @@ impl D4c {
                                 } else if self.task_chat {
                                     "What should I do, and when? e.g. Every morning at 9…"
                                 } else {
-                                    "Message…  / for commands"
+                                    "Message…"
                                 })
                                 .frame(egui::Frame::NONE)
                                 .event_filter(egui::EventFilter {
@@ -2549,28 +2558,41 @@ impl D4c {
                     response.request_focus();
                     self.focus_composer = false;
                 }
-                ui.add_space(5.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().interact_size.y = 36.0;
-                    if ui
-                        .add_enabled(
-                            self.upload.is_none(),
-                            egui::Button::new(icon_text(lucide_icons::Icon::Plus, 18.0))
-                                .frame(false),
-                        )
-                        .on_hover_text("Attach files · 6 MB per file, 12 MB total")
-                        .clicked()
-                    {
-                        self.composer_error.clear();
-                        self.upload = Some((self.session.clone(), uploads::pick(ui.ctx().clone())));
-                    }
-                    self.model_triggers(ui);
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let tools_width = (ui.available_width() - 42.0).max(1.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(tools_width, 0.0),
+                        egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                        |ui| {
+                            ui.set_min_width(tools_width);
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            if ui
+                                .add_enabled(
+                                    self.upload.is_none(),
+                                    Button::new("Attach files")
+                                        .icon(lucide::PAPERCLIP)
+                                        .variant(ButtonVariant::Ghost)
+                                        .size(ButtonSize::IconSm),
+                                )
+                                .on_hover_text("Attach files · 6 MB per file, 12 MB total")
+                                .clicked()
+                            {
+                                self.composer_error.clear();
+                                self.upload =
+                                    Some((self.session.clone(), uploads::pick(ui.ctx().clone())));
+                            }
+                            self.permissions_trigger(ui);
+                            self.model_triggers(ui);
+                        },
+                    );
                     ui.horizontal(|ui| {
                         if self.running {
                             if ui
                                 .add(
-                                    egui::Button::new(icon_text(lucide_icons::Icon::Square, 17.0))
-                                        .min_size(egui::vec2(32.0, 32.0)),
+                                    Button::new("Stop response")
+                                        .icon(lucide::SQUARE)
+                                        .size(ButtonSize::Icon),
                                 )
                                 .on_hover_text("Stop response")
                                 .clicked()
@@ -2588,8 +2610,9 @@ impl D4c {
                                     && self.upload.is_none()
                                     && (!self.input.trim().is_empty()
                                         || !self.attachments.is_empty()),
-                                egui::Button::new(icon_text(lucide_icons::Icon::ArrowUp, 19.0))
-                                    .min_size(egui::vec2(32.0, 32.0)),
+                                Button::new("Send")
+                                    .icon(lucide::ARROW_UP)
+                                    .size(ButtonSize::Icon),
                             )
                             .on_hover_text("Send · Enter")
                             .clicked()
@@ -3255,6 +3278,13 @@ impl D4c {
         } else {
             (ui.available_width() * 0.30).clamp(240.0, 420.0)
         };
+        if !self.dialog_open()
+            && !media::is_fullscreen()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::K))
+        {
+            self.sidebar_open = true;
+            ui.memory_mut(|memory| memory.request_focus(egui::Id::new("sidebar-search-input")));
+        }
         let mut sidebar_open = self.sidebar_open;
         egui::Panel::left("sidebar")
             .exact_size(sidebar_width)
@@ -3266,27 +3296,8 @@ impl D4c {
                     .inner_margin(egui::Margin::same(16)),
             )
             .show_collapsible(ui, &mut sidebar_open, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(icon_text(lucide_icons::Icon::Search, 16.0));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.session_search)
-                            .id(egui::Id::new("session_search"))
-                            .hint_text("Search chats")
-                            .desired_width((ui.available_width() - 32.0).max(60.0)),
-                    );
-                    if !self.session_search.is_empty()
-                        && ui
-                            .add(
-                                egui::Button::new(icon_text(lucide_icons::Icon::X, 15.0))
-                                    .frame(false),
-                            )
-                            .on_hover_text("Clear search")
-                            .clicked()
-                    {
-                        self.session_search.clear();
-                    }
-                });
-                ui.add_space(6.0);
+                sidebar_search(ui, &mut self.session_search);
+                ui.add_space(8.0);
                 let query = self.session_search.trim().to_lowercase();
                 let mut matches = 0;
                 let list_height = (ui.available_height() - 56.0).max(20.0);
@@ -3968,6 +3979,90 @@ fn server_row(
     }
     (label.clicked() || expand.clicked(), add.clicked())
 }
+fn sidebar_search(ui: &mut egui::Ui, query: &mut String) {
+    let id = egui::Id::new("sidebar-search-input");
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::hover());
+    let focused = ui.memory(|m| m.has_focus(id));
+    let accent = egui::Color32::from_rgb(137, 216, 200);
+    let muted = egui::Color32::from_rgb(170, 177, 189);
+    let stroke = if focused {
+        accent
+    } else if ui.rect_contains_pointer(rect) {
+        egui::Color32::from_gray(89)
+    } else {
+        egui::Color32::from_rgb(60, 66, 75)
+    };
+    ui.painter().rect(
+        rect,
+        20,
+        egui::Color32::from_rgb(32, 36, 42),
+        egui::Stroke::new(1.0, stroke),
+        egui::StrokeKind::Inside,
+    );
+    let lens = rect.left_center() + egui::vec2(21.0, 0.0);
+    ui.painter()
+        .circle_filled(lens, 13.0, egui::Color32::from_rgb(43, 58, 59));
+    ui.painter().text(
+        lens,
+        egui::Align2::CENTER_CENTER,
+        char::from(lucide_icons::Icon::Search),
+        egui::FontId::new(15.0, egui::FontFamily::Name("lucide".into())),
+        accent,
+    );
+    let clearable = !query.is_empty();
+    let tail = egui::Rect::from_center_size(
+        rect.right_center() - egui::vec2(26.0, 0.0),
+        egui::vec2(40.0, 32.0),
+    );
+    let edit = egui::Rect::from_min_max(
+        rect.min + egui::vec2(41.0, 0.0),
+        egui::pos2(tail.left(), rect.bottom()),
+    );
+    let action = ui.interact(tail, id.with("action"), egui::Sense::click());
+    if clearable {
+        ui.painter().text(
+            tail.center(),
+            egui::Align2::CENTER_CENTER,
+            char::from(lucide_icons::Icon::X),
+            egui::FontId::new(15.0, egui::FontFamily::Name("lucide".into())),
+            muted,
+        );
+        action.clone().on_hover_text("Clear search");
+    } else if !cfg!(target_os = "android") {
+        let cap = egui::Rect::from_center_size(tail.center(), egui::vec2(36.0, 19.0));
+        ui.painter()
+            .rect_filled(cap, 5, egui::Color32::from_rgb(47, 52, 60));
+        ui.painter().text(
+            cap.center(),
+            egui::Align2::CENTER_CENTER,
+            "Ctrl K",
+            egui::FontId::proportional(10.0),
+            muted,
+        );
+    }
+    let leading = egui::Rect::from_min_max(rect.min, egui::pos2(edit.left(), rect.bottom()));
+    if ui
+        .interact(leading, id.with("lens"), egui::Sense::click())
+        .clicked()
+        || action.clicked()
+    {
+        if action.clicked() {
+            query.clear();
+        }
+        ui.memory_mut(|m| m.request_focus(id));
+    }
+    ui.put(
+        edit,
+        egui::TextEdit::singleline(query)
+            .id(id)
+            .frame(egui::Frame::NONE)
+            .hint_text(egui::RichText::new("Search chats").color(muted))
+            .vertical_align(egui::Align::Center)
+            .desired_width(edit.width()),
+    );
+}
+
 fn navigation_footer(ui: &mut egui::Ui) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::click());
@@ -4102,22 +4197,40 @@ fn chat_row(
     let mut edit = false;
     let mut delete = false;
     if actions {
-        ui.scope_builder(egui::UiBuilder::new().max_rect(edit_rect), |ui| {
-            ui.menu_button(icon_text(lucide_icons::Icon::Ellipsis, 16.0), |ui| {
-                if ui.button("Rename").clicked() {
-                    edit = true;
-                    ui.close();
-                }
-                if ui
-                    .add_enabled(!running, egui::Button::new("Delete…"))
-                    .clicked()
-                {
-                    delete = true;
-                    ui.close();
-                }
-            })
-            .response
+        let action = ui
+            .interact(
+                edit_rect,
+                ui.scope_id().with(("chat_actions", key)),
+                egui::Sense::click(),
+            )
             .on_hover_text("Chat actions");
+        action.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Chat actions")
+        });
+        if action.hovered() || action.has_focus() {
+            ui.painter()
+                .rect_filled(edit_rect, 6, ui.visuals().widgets.hovered.bg_fill);
+        }
+        let center = edit_rect.center();
+        for offset in [-4.0, 0.0, 4.0] {
+            ui.painter().circle_filled(
+                center + egui::vec2(offset, 0.0),
+                1.2,
+                ui.visuals().text_color(),
+            );
+        }
+        egui::Popup::menu(&action).show(|ui| {
+            if ui.button("Rename").clicked() {
+                edit = true;
+                ui.close();
+            }
+            if ui
+                .add_enabled(!running, egui::Button::new("Delete…"))
+                .clicked()
+            {
+                delete = true;
+                ui.close();
+            }
         });
     }
     (response.clicked(), edit, delete)
