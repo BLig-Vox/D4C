@@ -71,14 +71,7 @@ pub(crate) fn key() -> io::Result<SigningKey> {
 fn request(method: &str, params: Value) -> Value {
     json!({"type":"req","id":format!("{method}:{}",uuid::Uuid::new_v4()),"method":method,"params":params})
 }
-pub fn connect(url: String, token: String, ctx: eframe::egui::Context) -> Gateway {
-    connect_mode(url, token, ctx, false)
-}
-/// A metadata-only catalog connection: no transcript subscription or tool streams.
-pub fn connect_catalog(url: String, ctx: eframe::egui::Context) -> Gateway {
-    connect_mode(url, String::new(), ctx, true)
-}
-fn connect_mode(url: String, _token: String, ctx: eframe::egui::Context, catalog: bool) -> Gateway {
+pub fn connect(url: String, _token: String, ctx: eframe::egui::Context) -> Gateway {
     let (out_tx, out_rx) = mpsc::channel::<Value>();
     let (event_tx, event_rx) = mpsc::channel::<Event>();
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -109,7 +102,6 @@ fn connect_mode(url: String, _token: String, ctx: eframe::egui::Context, catalog
             let started = Instant::now();
             let mut received = started;
             let mut ping = started;
-            let mut catalog_refresh = started;
             loop {
                 if stop.load(Ordering::Relaxed) {
                     let _ = socket.close(None);
@@ -126,10 +118,6 @@ fn connect_mode(url: String, _token: String, ctx: eframe::egui::Context, catalog
                     ping = Instant::now();
                 }
                 if ready {
-                    if catalog && catalog_refresh.elapsed() >= Duration::from_secs(30) {
-                        adapter.command(request("sessions.list", json!({})));
-                        catalog_refresh = Instant::now();
-                    }
                     while let Ok(req) = out_rx.try_recv() {
                         adapter.command(req);
                     }
@@ -157,11 +145,6 @@ fn connect_mode(url: String, _token: String, ctx: eframe::egui::Context, catalog
                                     send(&mut socket, json!({"method":"initialized"}))?;
                                     ready = true;
                                     emit(Event::Status("Connected".into()));
-                                    adapter.command(request("sessions.list", json!({})));
-                                    if !catalog {
-                                        adapter.command(request("models.list", json!({})));
-                                        adapter.command(request("question.list", json!({})));
-                                    }
                                 } else {
                                     adapter.incoming(v);
                                 }

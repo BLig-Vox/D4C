@@ -491,7 +491,7 @@ impl D4c {
             }
         }
     }
-    fn switch_with_token(&mut self, index: usize, ctx: &egui::Context, token: String) {
+    fn switch_to(&mut self, index: usize, ctx: &egui::Context, target: Option<String>) {
         if index >= self.preferences.connections.len() {
             return;
         }
@@ -528,27 +528,44 @@ impl D4c {
                 );
             }
         }
-        self.reset_connection(index, token);
-        if self.token.is_empty()
-            && let Some((link, media_token, online, status)) = self.servers.take_warm(&self.url)
+        if self.desktops.workspace.link.is_some() {
+            self.servers
+                .rows
+                .entry(self.url.clone())
+                .or_default()
+                .workspace = Some(std::mem::take(&mut self.desktops.workspace));
+        }
+        self.reset_connection(index, String::new());
+        if let Some(key) = target
+            && key != self.session
         {
+            let load = !key.starts_with("draft:");
+            self.select_session(key, load);
+        }
+        if let Some((link, media_token, online, status)) = self.servers.take_warm(&self.url) {
             self.gateway = Some(link);
             self.media_auth = media_token;
             self.connected = online;
             self.status = status;
-            self.desktops.connect(&self.url, ctx);
+            if let Some(workspace) = self
+                .servers
+                .rows
+                .get_mut(&self.url)
+                .and_then(|r| r.workspace.take())
+            {
+                self.desktops.workspace = workspace;
+            } else {
+                self.desktops.connect(&self.url, ctx);
+            }
             if online {
-                self.refresh_sessions();
-                self.rpc("models.list", json!({}));
-                self.rpc("question.list", json!({}));
-                self.hydrate_chat();
+                self.activate_chat();
             }
         } else {
             self.reconnect(ctx);
         }
     }
     fn switch_connection(&mut self, index: usize, ctx: &egui::Context) {
-        self.switch_with_token(index, ctx, String::new());
+        self.switch_to(index, ctx, None);
     }
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         let mut switch = None;
@@ -996,9 +1013,11 @@ impl D4c {
         self.notifications_open = false;
         self.task_chat = false;
         self.center.read(Some(&key));
-        self.desktops
-            .workspace
-            .rpc("notification.read", json!({"session":key}));
+        if self.desktops.workspace.ready {
+            self.desktops
+                .workspace
+                .rpc("notification.read", json!({"session":key}));
+        }
         if self.session == key && load {
             return;
         }
@@ -1017,7 +1036,6 @@ impl D4c {
         }
         self.rpc("sessions.messages.unsubscribe", json!({"key":self.session}));
         self.session = key;
-        self.rpc("sessions.messages.subscribe", json!({"key":self.session}));
         self.history_dirty = false;
         let draft = self.drafts.remove(&self.session).unwrap_or_default();
         self.input = draft.input;
@@ -1068,14 +1086,9 @@ impl D4c {
             self.patch_selection();
         }
         if load {
-            if let Some(id) = self.rpc(
-                "chat.history",
-                json!({"sessionKey":self.session,"limit":100,"toolResultMaxChars":2000}),
-            ) {
-                self.history_request = Some((id, self.session.clone()));
-                self.history_loading = true;
-            }
+            self.request_selected_history();
         }
+        self.rpc("sessions.messages.subscribe", json!({"key":self.session}));
         self.slash_selected = 0;
         self.slash_dismissed = false;
         self.focus_composer = true;
@@ -1115,20 +1128,28 @@ impl D4c {
             Err(_) => {}
         }
     }
+    fn activate_chat(&mut self) {
+        self.hydrate_chat();
+        self.refresh_sessions();
+        self.rpc("models.list", json!({}));
+        self.rpc("question.list", json!({}));
+    }
+    fn request_selected_history(&mut self) {
+        if !self.session.starts_with("draft:") {
+            if let Some(id) = self.rpc(
+                "chat.history",
+                json!({"sessionKey":self.session,"limit":100,"toolResultMaxChars":2000}),
+            ) {
+                self.history_request = Some((id, self.session.clone()));
+                self.history_loading = self.messages.is_empty();
+            }
+        }
+    }
     fn hydrate_chat(&mut self) {
+        self.request_selected_history();
         self.rpc("sessions.messages.subscribe", json!({"key":self.session}));
         self.refresh_commands();
         self.cron.refresh();
-        if self.session.starts_with("draft:") {
-            return;
-        }
-        if let Some(id) = self.rpc(
-            "chat.history",
-            json!({"sessionKey":self.session,"limit":100,"toolResultMaxChars":2000}),
-        ) {
-            self.history_request = Some((id, self.session.clone()));
-            self.history_loading = true;
-        }
     }
     fn events(&mut self, ctx: &egui::Context) {
         let events: Vec<_> = self
@@ -1145,7 +1166,7 @@ impl D4c {
                     self.connected = s == "Connected";
                     self.status = s;
                     if self.connected {
-                        self.hydrate_chat();
+                        self.activate_chat();
                     }
                 }
                 gateway::Event::Error(s) => {
@@ -1153,6 +1174,8 @@ impl D4c {
                         self.restore_unsent(&params);
                     }
                     self.connected = false;
+                    self.list_pending = false;
+                    self.list_dirty = false;
                     self.reload_request = None;
                     self.sent_requests.clear();
                     self.questions.disconnected();
@@ -3513,30 +3536,7 @@ impl D4c {
                             if index == self.preferences.selected {
                                 self.select_session(target, load);
                             } else {
-                                self.switch_connection(index, ui.ctx());
-                                if self.preferences.selected == index {
-                                    if self.session != target {
-                                        self.messages.clear();
-                                        self.history_initialized = false;
-                                        self.older_cursor = None;
-                                        self.restore_scroll = None;
-                                        self.drafts.insert(
-                                            self.session.clone(),
-                                            Draft {
-                                                input: std::mem::take(&mut self.input),
-                                                attachments: std::mem::take(&mut self.attachments),
-                                            },
-                                        );
-                                        self.session = target;
-                                        let draft =
-                                            self.drafts.remove(&self.session).unwrap_or_default();
-                                        self.input = draft.input;
-                                        self.attachments = draft.attachments;
-                                    }
-                                    self.explicit_selection = true;
-                                    self.servers.select(&self.url, &self.session);
-                                    self.settings_open = false;
-                                }
+                                self.switch_to(index, ui.ctx(), Some(target));
                             }
                             if compact {
                                 self.sidebar_open = false;
@@ -3724,7 +3724,7 @@ impl D4c {
                     self.workspace_ui(ui);
                 } else if self.settings_open {
                     self.settings_ui(ui);
-                } else if !self.connected && self.messages.is_empty() {
+                } else if !self.connected && self.messages.is_empty() && !self.session.starts_with("draft:") {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(if self.gateway.is_some() { "Connecting" } else { "Offline" }).weak());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4624,6 +4624,27 @@ mod composer_tests {
             }
         }
     }
+    #[test]
+    fn cold_chat_requests_history_before_resume_and_discovery() {
+        let mut app = D4c::default();
+        let (out, commands) = std::sync::mpsc::channel();
+        let (_events, incoming) = std::sync::mpsc::channel();
+        app.gateway = Some(gateway::test_gateway(out, incoming));
+        app.session = "cold-chat".into();
+        app.activate_chat();
+        let first = commands.try_recv().unwrap();
+        assert_eq!(first["method"], "chat.history");
+        assert_eq!(first["params"]["sessionKey"], "cold-chat");
+        assert!(app.history_loading);
+        app.select_session("draft:new".into(), false);
+        assert!(
+            commands
+                .try_iter()
+                .all(|request| request["method"] != "chat.history")
+        );
+        assert!(!app.history_loading);
+    }
+
     #[test]
     fn empty_chat_is_restored_after_server_switch() {
         let mut app = D4c::default();

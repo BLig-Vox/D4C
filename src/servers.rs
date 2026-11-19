@@ -19,7 +19,7 @@ pub struct Server {
     pub status: String,
     pub selected: Option<String>,
     link: Option<gateway::Gateway>,
-    warm: bool,
+    pub workspace: Option<crate::workspace::Workspace>,
     media_token: Option<String>,
     refresh: Instant,
 }
@@ -32,7 +32,7 @@ impl Default for Server {
             status: "Connecting…".into(),
             selected: None,
             link: None,
-            warm: false,
+            workspace: None,
             media_token: None,
             refresh: Instant::now(),
         }
@@ -105,7 +105,6 @@ impl Catalogs {
     ) {
         let row = self.rows.entry(url.to_owned()).or_default();
         row.link = Some(link);
-        row.warm = true;
         row.media_token = token;
         row.online = online;
         row.status = status.to_owned();
@@ -116,10 +115,6 @@ impl Catalogs {
         url: &str,
     ) -> Option<(gateway::Gateway, Option<String>, bool, String)> {
         let row = self.rows.get_mut(url)?;
-        if !row.warm {
-            return None;
-        }
-        row.warm = false;
         Some((
             row.link.take()?,
             row.media_token.take(),
@@ -140,17 +135,20 @@ impl Catalogs {
             let row = self.rows.entry(connection.url.clone()).or_default();
             if connection.url == active {
                 row.link = None;
-                row.warm = false;
                 row.media_token = None;
                 continue;
             }
             if row.link.is_none() {
-                row.link = Some(gateway::connect_catalog(
+                row.link = Some(gateway::connect(
                     connection.url.clone(),
+                    String::new(),
                     ctx.clone(),
                 ));
             }
-            if row.warm && row.online && row.refresh.elapsed() >= Duration::from_secs(30) {
+            if let Some(workspace) = &mut row.workspace {
+                workspace.poll();
+            }
+            if row.online && row.refresh.elapsed() >= Duration::from_secs(30) {
                 if let Some(link) = &row.link {
                     let _ = link.tx.send(gateway::rpc(
                         "sessions.list",
@@ -168,6 +166,12 @@ impl Catalogs {
                 match event {
                     gateway::Event::Status(status) => {
                         row.online = status == "Connected";
+                        if row.online {
+                            if let Some(link) = &row.link {
+                                let _ = link.tx.send(gateway::rpc("sessions.list", json!({})));
+                            }
+                            row.refresh = Instant::now();
+                        }
                         row.status = status;
                     }
                     gateway::Event::Error(error) => {
@@ -259,6 +263,27 @@ impl Catalogs {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn first_visit_promotes_the_background_socket_even_during_handshake() {
+        let mut catalogs = Catalogs {
+            rows: BTreeMap::new(),
+            dirty: false,
+            last_save: Instant::now(),
+        };
+        let (out, commands) = mpsc::channel();
+        let (events, incoming) = mpsc::channel();
+        catalogs.rows.entry("doom".into()).or_default().link =
+            Some(gateway::test_gateway(out, incoming));
+        let (link, _, online, _) = catalogs.take_warm("doom").unwrap();
+        assert!(!online);
+        events
+            .send(gateway::Event::Status("Connected".into()))
+            .unwrap();
+        assert!(matches!(link.rx.try_recv(), Ok(gateway::Event::Status(_))));
+        link.tx.send(json!("same socket")).unwrap();
+        assert_eq!(commands.try_recv().unwrap(), json!("same socket"));
+    }
 
     #[test]
     fn switching_hosts_returns_the_same_transport_and_its_own_credentials() {
