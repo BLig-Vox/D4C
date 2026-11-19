@@ -10,7 +10,7 @@ use shadcn_egui::{
     },
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(super) enum ComposerPicker {
     Permissions,
     Model,
@@ -421,6 +421,18 @@ impl D4c {
 }
 
 impl D4c {
+    fn picker_trigger(&mut self, kind: ComposerPicker, response: egui::Response) {
+        let active = self
+            .composer_picker
+            .as_ref()
+            .is_some_and(|(open, _)| *open == kind);
+        if response.clicked() && active {
+            self.composer_picker = None;
+        } else if active || response.clicked() {
+            self.composer_picker = Some((kind, response));
+        }
+    }
+
     pub(super) fn permissions_trigger(&mut self, ui: &mut egui::Ui) {
         if self.permission_request.is_some() {
             ui.weak("Updating permissions…");
@@ -430,7 +442,7 @@ impl D4c {
             || "Permissions".into(),
             |label| format!("Permissions · {label}"),
         );
-        if ui
+        let trigger = ui
             .add_enabled(
                 self.connected && !self.running && !self.history_loading,
                 Button::new(caption.clone())
@@ -438,11 +450,8 @@ impl D4c {
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::IconSm),
             )
-            .on_hover_text(caption)
-            .clicked()
-        {
-            self.composer_picker = Some(ComposerPicker::Permissions);
-        }
+            .on_hover_text(caption);
+        self.picker_trigger(ComposerPicker::Permissions, trigger);
     }
 
     pub(super) fn model_triggers(&mut self, ui: &mut egui::Ui) {
@@ -452,18 +461,15 @@ impl D4c {
             .next()
             .filter(|name| !name.is_empty())
             .unwrap_or("Model");
-        if ui
+        let trigger = ui
             .add_enabled(
                 !self.models.is_empty(),
                 neutral(model)
                     .size(ButtonSize::Sm)
                     .icon_end(shadcn_egui::icons::lucide::CHEVRON_DOWN),
             )
-            .on_hover_text("Model")
-            .clicked()
-        {
-            self.composer_picker = Some(ComposerPicker::Model);
-        }
+            .on_hover_text("Model");
+        self.picker_trigger(ComposerPicker::Model, trigger);
         let has_efforts = self
             .model_efforts
             .get(&self.model)
@@ -473,7 +479,7 @@ impl D4c {
         } else {
             &self.thinking
         };
-        if ui
+        let trigger = ui
             .add_enabled(
                 has_efforts,
                 Button::new(effort)
@@ -481,15 +487,12 @@ impl D4c {
                     .size(ButtonSize::Sm)
                     .icon_end(shadcn_egui::icons::lucide::CHEVRON_DOWN),
             )
-            .on_hover_text("Reasoning effort")
-            .clicked()
-        {
-            self.composer_picker = Some(ComposerPicker::Effort);
-        }
+            .on_hover_text("Reasoning effort");
+        self.picker_trigger(ComposerPicker::Effort, trigger);
     }
 
     fn picker_ui(&mut self, ctx: &egui::Context, compact: bool) {
-        let Some(picker) = self.composer_picker else {
+        let Some((picker, trigger)) = self.composer_picker.clone() else {
             return;
         };
         let title = match picker {
@@ -498,23 +501,46 @@ impl D4c {
             ComposerPicker::Effort => "Reasoning effort",
         };
         let mut selection = None;
-        let mut cancel = false;
-        let dismissed = surface(ctx, compact, title, title, |ui| {
+        let mut options = |ui: &mut egui::Ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
             let mut option = |key: &str, label: &str, selected: bool, enabled: bool| {
-                let variant = if selected {
-                    ButtonVariant::Secondary
-                } else {
-                    ButtonVariant::Ghost
-                };
-                let label = if selected {
-                    format!("✓  {label}")
-                } else {
-                    label.to_owned()
-                };
-                if ui
-                    .add_enabled(enabled, Button::new(label).expanded(true).variant(variant))
-                    .clicked()
-                {
+                let row = ui
+                    .add_enabled_ui(enabled, |ui| {
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), if compact { 42.0 } else { 32.0 }),
+                            egui::Sense::click(),
+                        );
+                        response.widget_info(|| {
+                            egui::WidgetInfo::selected(
+                                egui::WidgetType::Button,
+                                enabled,
+                                selected,
+                                label,
+                            )
+                        });
+                        let colors = Theme::current(ui.ctx());
+                        let colors = colors.palette();
+                        if selected || response.hovered() || response.has_focus() {
+                            ui.painter().rect_filled(rect, 6, colors.accent);
+                        }
+                        let text_rect = egui::Rect::from_min_max(
+                            rect.min + egui::vec2(10.0, 0.0),
+                            rect.max - egui::vec2(32.0, 0.0),
+                        );
+                        super::paint_ellipsis(ui, text_rect, label, 14.0, colors.foreground);
+                        if selected {
+                            ui.painter().text(
+                                rect.right_center() - egui::vec2(16.0, 0.0),
+                                egui::Align2::CENTER_CENTER,
+                                char::from(lucide_icons::Icon::Check),
+                                egui::FontId::new(15.0, egui::FontFamily::Name("lucide".into())),
+                                colors.foreground,
+                            );
+                        }
+                        response
+                    })
+                    .inner;
+                if row.clicked() {
                     selection = Some(key.to_owned());
                 }
             };
@@ -550,9 +576,37 @@ impl D4c {
                     }
                 }
             }
-            cancel = ui.add(neutral("Cancel").expanded(true)).clicked();
-        });
-        if dismissed || cancel || selection.is_some() {
+        };
+        let dismissed = if compact {
+            surface(ctx, true, title, title, options)
+        } else {
+            let mut open = true;
+            let palette = Theme::current(ctx);
+            let palette = palette.palette();
+            egui::Popup::from_response(&trigger)
+                .id(trigger.id.with("choices"))
+                .align(egui::RectAlign::TOP_START)
+                .gap(5.0)
+                .width(220.0)
+                .open_bool(&mut open)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .frame(
+                    egui::Frame::new()
+                        .stroke(egui::Stroke::new(1.0, palette.border))
+                        .fill(palette.popover)
+                        .inner_margin(5)
+                        .corner_radius(9),
+                )
+                .show(|ui| {
+                    ui.set_width(210.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt(title)
+                        .max_height(320.0)
+                        .show(ui, |ui| options(ui));
+                });
+            !open
+        };
+        if dismissed || selection.is_some() {
             self.composer_picker = None;
         }
         let Some(value) = selection else { return };

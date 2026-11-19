@@ -117,7 +117,7 @@ struct D4c {
     connection_url: String,
     settings_error: String,
     switch_pending: Option<usize>,
-    composer_picker: Option<ComposerPicker>,
+    composer_picker: Option<(ComposerPicker, egui::Response)>,
     compact_previous: bool,
     show_cron: bool,
     workspace_open: bool,

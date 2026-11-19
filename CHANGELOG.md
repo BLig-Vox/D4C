@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.0-alpha.13
+
+- Model, reasoning effort and permissions now open directly above their desktop composer controls.
+- Compact layouts retain bottom sheets, with full-width options and a checkmark beside the current selection.
+
 ## 0.1.0-alpha.12
 
 - Search chats across servers with Ctrl+K on desktop, a visible focus ring and an inline clear button.
