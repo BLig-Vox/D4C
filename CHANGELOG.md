@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reuse a per-desktop VNC connection for fresh screenshots. Recover a lost capture connection once and back off failed VNC handshakes across viewer, screenshot, and input requests.
+
 - Restore native desktop tools from migrated compaction checkpoints and relocate saved workspace settings when resuming a chat. Older desktop tool names use the same conversation binding and human takeover checks.
 
 - Page full Codex history one turn at a time and replace embedded desktop-tool screenshots with a text marker during replay. This prevents screenshot-heavy conversations from repeatedly disconnecting when switching servers. Original screenshots remain in Codex history.

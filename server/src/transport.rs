@@ -1,7 +1,6 @@
 use crate::{
     auth,
     manager::{Actor, Manager},
-    rfb,
     store::Result,
 };
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
@@ -547,8 +546,7 @@ fn viewer(mut socket: Socket, manager: Manager, id: &str, compressed: bool) -> R
         .sock
         .set_read_timeout(Some(Duration::from_millis(1)))
         .map_err(|e| e.to_string())?;
-    let mut session =
-        rfb::Session::connect(manager.runtime.port(id)?).map_err(|e| e.to_string())?;
+    let mut session = manager.runtime.connect_vnc(id)?;
     send(
         &mut socket,
         json!({"type":"framebuffer","width":session.width,"height":session.height,"name":session.name,"encoding":"rfb-bgrx32","transport":if compressed {crate::desktop_wire::NAME}else{"raw"}}),

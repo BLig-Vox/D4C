@@ -13,10 +13,91 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+#[derive(Default)]
+struct ConnectGate {
+    failure: Option<(Instant, Duration, String)>,
+}
+impl ConnectGate {
+    fn connect<T>(&mut self, open: impl FnOnce() -> Result<T>) -> Result<T> {
+        if let Some((at, delay, reason)) = &self.failure {
+            let elapsed = at.elapsed();
+            if elapsed < *delay {
+                return Err(format!(
+                    "{reason}; retry in {}s",
+                    (*delay - elapsed).as_secs() + 1
+                ));
+            }
+        }
+        match open() {
+            Ok(value) => {
+                self.failure = None;
+                Ok(value)
+            }
+            Err(reason) => {
+                let delay = self
+                    .failure
+                    .as_ref()
+                    .map_or(5, |(_, last, _)| (last.as_secs() * 2).min(60));
+                self.failure = Some((Instant::now(), Duration::from_secs(delay), reason.clone()));
+                Err(reason)
+            }
+        }
+    }
+}
+type DesktopSlots<T> = Mutex<HashMap<String, Arc<Mutex<T>>>>;
+fn slot<T: Default>(slots: &DesktopSlots<T>, id: &str) -> Result<Arc<Mutex<T>>> {
+    safe_id(id)?;
+    Ok(slots
+        .lock()
+        .map_err(|_| "Desktop connections unavailable")?
+        .entry(id.to_owned())
+        .or_default()
+        .clone())
+}
+
+struct Capture {
+    session: rfb::Session,
+    decoder: rfb::Decoder,
+}
+impl Capture {
+    fn frame(&mut self) -> Result<Vec<u8>> {
+        let s = &mut self.session;
+        let d = &mut self.decoder;
+        s.request(false).map_err(|e| e.to_string())?;
+        let start = Instant::now();
+        let mut buf = [0; 65536];
+        while start.elapsed() < Duration::from_secs(8) {
+            match s.socket.read(&mut buf) {
+                Ok(0) => return Err("VNC disconnected before the screenshot arrived".into()),
+                Ok(n) => {
+                    let changed = d.feed(&buf[..n]).map_err(|e| e.to_string())?;
+                    if (s.width, s.height) != (d.width, d.height) {
+                        s.width = d.width;
+                        s.height = d.height;
+                        s.request(false).map_err(|e| e.to_string())?;
+                    } else if changed {
+                        return d.png().map_err(|e| e.to_string());
+                    }
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Err("Timed out waiting for a fresh VNC screenshot".into())
+    }
+}
 pub struct Runtime {
     pub root: PathBuf,
     units: PathBuf,
-    input: Mutex<HashMap<String, Arc<Mutex<Option<rfb::Session>>>>>,
+    input: DesktopSlots<Option<rfb::Session>>,
+    connections: DesktopSlots<ConnectGate>,
+    captures: DesktopSlots<Option<Capture>>,
 }
 fn command(program: &str, args: &[&str]) -> Result<String> {
     let mut c = Command::new(program);
@@ -63,7 +144,9 @@ impl Runtime {
         Ok(Self {
             root,
             units,
-            input: Mutex::new(HashMap::new()),
+            input: Default::default(),
+            connections: Default::default(),
+            captures: Default::default(),
         })
     }
     /// Remove legacy desktop RAM limits without restarting its container.
@@ -194,6 +277,14 @@ impl Runtime {
             "systemctl",
             &["--user", "stop", &format!("d4c-{id}.service")],
         )?;
+        self.captures
+            .lock()
+            .map_err(|_| "Capture lock unavailable")?
+            .remove(id);
+        self.connections
+            .lock()
+            .map_err(|_| "Connection lock unavailable")?
+            .remove(id);
         self.input
             .lock()
             .map_err(|_| "Input lock poisoned")?
@@ -217,7 +308,23 @@ impl Runtime {
         // Persistent home/work files are deliberately retained. A separate explicit purge is required.
         Ok(())
     }
-    pub fn port(&self, id: &str) -> Result<u16> {
+    pub fn connect_vnc(&self, id: &str) -> Result<rfb::Session> {
+        let gate = slot(&self.connections, id)?;
+        let mut gate = gate.lock().map_err(|_| "VNC connection gate unavailable")?;
+        gate.connect(|| {
+            rfb::Session::connect(self.port(id)?).map_err(|e| {
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) {
+                    "VNC setup timed out waiting for the desktop".into()
+                } else {
+                    format!("VNC setup: {e}")
+                }
+            })
+        })
+    }
+    fn port(&self, id: &str) -> Result<u16> {
         safe_id(id)?;
         let out = command("podman", &["port", &format!("d4c-{id}"), "5900/tcp"])?;
         out.lines()
@@ -261,7 +368,7 @@ impl Runtime {
         };
         let mut slot = slot.lock().map_err(|_| "Input session poisoned")?;
         if slot.is_none() {
-            *slot = Some(rfb::Session::connect(self.port(id)?).map_err(|e| e.to_string())?);
+            *slot = Some(self.connect_vnc(id)?);
         }
         // Re-check the authoritative control mode immediately before dispatch, after network setup.
         let db = store.lock().map_err(|_| "Database lock poisoned")?;
@@ -303,29 +410,76 @@ impl Runtime {
         Ok(())
     }
     pub fn screenshot(&self, id: &str) -> Result<Vec<u8>> {
-        let mut s = rfb::Session::connect(self.port(id)?).map_err(|e| e.to_string())?;
-        let mut d = rfb::Decoder::new(s.width, s.height).map_err(|e| e.to_string())?;
-        s.request(false).map_err(|e| e.to_string())?;
-        let start = Instant::now();
-        let mut b = [0; 65536];
-        while start.elapsed() < Duration::from_secs(8) {
-            use std::io::Read;
-            match s.socket.read(&mut b) {
-                Ok(0) => return Err("VNC disconnected".into()),
-                Ok(n) => {
-                    d.feed(&b[..n]).map_err(|e| e.to_string())?;
-                    if d.updates > 0 {
-                        return d.png().map_err(|e| e.to_string());
-                    }
-                }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                    ) => {}
-                Err(e) => return Err(e.to_string()),
+        let capture = slot(&self.captures, id)?;
+        let mut capture = capture.lock().map_err(|_| "Capture unavailable")?;
+        // Reuse the negotiated stream and its zlib state. A stale stream can be
+        // replaced once because a read-only screenshot is safe to request again.
+        let mut retry = capture.is_some();
+        loop {
+            if capture.is_none() {
+                let session = self.connect_vnc(id)?;
+                let decoder =
+                    rfb::Decoder::new(session.width, session.height).map_err(|e| e.to_string())?;
+                *capture = Some(Capture { session, decoder });
             }
+            let result = capture.as_mut().unwrap().frame();
+            if result.is_ok() {
+                return result;
+            }
+            *capture = None;
+            if !retry {
+                return result;
+            }
+            retry = false;
         }
-        Err("Screenshot timed out".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_handshakes_share_a_cooldown_and_success_resets_it() {
+        let mut gate = ConnectGate::default();
+        assert!(gate.connect::<()>(|| Err("busy".into())).is_err());
+        assert!(gate.connect::<()>(|| panic!("repeated handshake")).is_err());
+        gate.failure.as_mut().unwrap().0 -= Duration::from_secs(6);
+        assert!(gate.connect::<()>(|| Err("still busy".into())).is_err());
+        assert_eq!(gate.failure.as_ref().unwrap().1, Duration::from_secs(10));
+        gate.failure.as_mut().unwrap().0 -= Duration::from_secs(11);
+        assert!(gate.connect(|| Ok(())).is_ok());
+        assert!(gate.failure.is_none());
+    }
+
+    #[test]
+    fn sequential_screenshots_request_and_decode_fresh_frames_on_one_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let peer = std::thread::spawn(move || {
+            for color in [32, 127] {
+                let mut request = [0; 10];
+                server.read_exact(&mut request).unwrap();
+                assert_eq!(request, [3, 0, 0, 0, 0, 0, 0, 1, 0, 1]);
+                server
+                    .write_all(&[
+                        0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, color, 0, 0, 0,
+                    ])
+                    .unwrap();
+            }
+        });
+        let mut capture = Capture {
+            session: rfb::Session {
+                socket: client,
+                width: 1,
+                height: 1,
+                name: String::new(),
+            },
+            decoder: rfb::Decoder::new(1, 1).unwrap(),
+        };
+        assert_ne!(capture.frame().unwrap(), capture.frame().unwrap());
+        assert!(capture.frame().is_err());
+        peer.join().unwrap();
     }
 }

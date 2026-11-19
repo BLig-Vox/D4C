@@ -48,7 +48,18 @@ impl Session {
         let mut n = [0];
         s.read_exact(&mut n)?;
         if n[0] == 0 {
-            return Err(err("VNC rejected connection"));
+            let mut length = [0; 4];
+            s.read_exact(&mut length)?;
+            let len = u32be(&length) as usize;
+            if len == 0 || len > 4096 {
+                return Err(err("VNC rejected connection"));
+            }
+            let mut reason = vec![0; len];
+            s.read_exact(&mut reason)?;
+            return Err(err(&format!(
+                "VNC rejected connection: {}",
+                String::from_utf8_lossy(&reason)
+            )));
         }
         let mut types = vec![0; n[0] as usize];
         s.read_exact(&mut types)?;
