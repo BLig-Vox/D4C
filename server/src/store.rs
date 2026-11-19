@@ -262,7 +262,7 @@ impl Store {
             return Err("name_exists".into());
         }
         let id = uuid::Uuid::new_v4().to_string();
-        self.put("desktop",&id,Some(0),json!({"name":name,"distro":"archlinux","desktop":"xfce","width":1280,"height":800,"cpus":1,"desired":"stopped","status":"new","mode":"agent","controller":null,"leaseUntil":0,"createdAt":now()}))
+        self.put("desktop",&id,Some(0),json!({"name":name,"distro":"archlinux","desktop":"xfce","width":1280,"height":800,"desired":"stopped","status":"new","mode":"agent","controller":null,"leaseUntil":0,"createdAt":now()}))
     }
     pub fn rename_desktop(&mut self, id: &str, name: &str, rev: u64) -> Result<Value> {
         let name = name.trim();

@@ -23,25 +23,23 @@ impl Manager {
     pub fn new(mut db: Store, runtime: Runtime) -> Self {
         if let Ok(desktops) = db.list("desktop") {
             for mut desktop in desktops.into_iter().filter(|d| d["deleted"] != true) {
-                match runtime.remove_memory_limit(&desktop) {
+                match runtime.remove_resource_limits(&desktop) {
                     Ok(()) => {
                         let Some(id) = desktop["id"].as_str().map(str::to_owned) else {
                             continue;
                         };
                         let revision = desktop["rev"].as_u64().unwrap_or(0);
-                        if desktop
-                            .as_object_mut()
-                            .expect("Desktop object")
-                            .remove("memoryMb")
-                            .is_none()
-                        {
+                        let fields = desktop.as_object_mut().expect("Desktop object");
+                        let had_memory = fields.remove("memoryMb").is_some();
+                        let had_cpu = fields.remove("cpus").is_some();
+                        if !had_memory && !had_cpu {
                             continue;
                         }
                         if let Err(error) = db.put("desktop", &id, Some(revision), desktop) {
-                            eprintln!("Desktop RAM limit removal persistence failed: {error}");
+                            eprintln!("Desktop resource limit removal persistence failed: {error}");
                         }
                     }
-                    Err(error) => eprintln!("Desktop RAM limit removal failed: {error}"),
+                    Err(error) => eprintln!("Desktop resource limit removal failed: {error}"),
                 }
             }
         }

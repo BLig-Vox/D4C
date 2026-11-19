@@ -84,7 +84,7 @@ impl Adapter {
         let context = json!({"params":{"key":k}});
         let mut options = json!({"sandbox":"workspace-write","approvalPolicy":"on-request"});
         if is_thread(k) {
-            options["threadId"] = json!(k);
+            options = json!({"threadId":k});
             options["excludeTurns"] = json!(true);
             self.call("thread/resume", options, context);
         } else {
@@ -114,7 +114,7 @@ impl Adapter {
                 self.call("model/list", params, req);
             }
             "sessions.messages.subscribe" if !is_thread(&k) => self.ok(&req, json!({})),
-            "sessions.messages.subscribe" | "chat.send" | "sessions.patch"
+            "sessions.messages.subscribe" | "chat.send" | "sessions.patch" | "permissions.set"
                 if !self.loaded.contains(&k) =>
             {
                 self.open(&k, req);
@@ -134,6 +134,18 @@ impl Adapter {
             "chat.history" => {
                 let params = json!({"threadId":k,"itemsView":"full","sortDirection":"desc","limit":20,"cursor":p["cursor"]});
                 self.call("thread/turns/list", params, req);
+            }
+            "permissions.set" => {
+                let (sandbox, approval) = match string(&p["mode"]) {
+                    "yolo" => ("dangerFullAccess", "never"),
+                    "default" => ("workspaceWrite", "on-request"),
+                    "read-only" => ("readOnly", "on-request"),
+                    _ => {
+                        self.fail(&req, "Unknown permission mode");
+                        return;
+                    }
+                };
+                self.call("thread/settings/update", json!({"threadId":k,"approvalPolicy":approval,"sandboxPolicy":{"type":sandbox}}), req);
             }
             "sessions.patch" if p["label"].is_string() => {
                 let params = json!({"threadId":k,"name":p["label"]});
@@ -251,7 +263,7 @@ impl Adapter {
                     self.aliases.insert(k.clone(), id.into());
                     self.event("session.created", json!({"previousKey":k,"sessionKey":id}));
                 }
-                self.event("session.settings",json!({"sessionKey":id,"model":r["model"],"thinkingLevel":r["reasoningEffort"]}));
+                self.event("session.settings",json!({"sessionKey":id,"model":r["model"],"thinkingLevel":r["reasoningEffort"],"sandbox":r["sandbox"]["type"],"approval":r["approvalPolicy"]}));
                 for cmd in queue {
                     self.command(cmd);
                 }
@@ -391,7 +403,7 @@ impl Adapter {
             "thread/started"=>{self.remember_thread(&p["thread"]);self.event("sessions.changed",json!({"sessionKey":p["thread"]["id"]}));}
             "thread/settings/updated" => {
                 let settings = &p["threadSettings"];
-                self.event("session.settings",json!({"sessionKey":k,"model":settings["model"],"thinkingLevel":settings["effort"]}));
+                self.event("session.settings",json!({"sessionKey":k,"model":settings["model"],"thinkingLevel":settings["effort"],"sandbox":settings["sandboxPolicy"]["type"],"approval":settings["approvalPolicy"]}));
             }
             "thread/name/updated"|"thread/unarchived"|"thread/status/changed"=>{
                 if method=="thread/status/changed" && p["status"]["type"]!="active"{self.active.remove(k);}
@@ -744,6 +756,39 @@ mod tests {
             thread_title(&json!({"name":"My chat","preview":header})).as_deref(),
             Some("My chat")
         );
+    }
+
+    #[test]
+    fn permissions_resume_without_overrides_and_update_only_the_selected_thread() {
+        let mut adapter = Adapter::default();
+        adapter.command(super::super::rpc(
+            "sessions.messages.subscribe",
+            json!({"key":THREAD}),
+        ));
+        let resume = frames(&mut adapter).pop().unwrap();
+        assert_eq!(resume["method"], "thread/resume");
+        assert!(resume["params"].get("sandbox").is_none());
+        assert!(resume["params"].get("approvalPolicy").is_none());
+        adapter.incoming(json!({"id":resume["id"],"result":{"thread":{"id":THREAD},"sandbox":{"type":"dangerFullAccess"},"approvalPolicy":"never"}}));
+        let resumed = frames(&mut adapter);
+        assert!(resumed.iter().any(|msg| msg["event"] == "session.settings"
+            && msg["payload"]["sandbox"] == "dangerFullAccess"));
+        for (mode, sandbox, approval) in [
+            ("yolo", "dangerFullAccess", "never"),
+            ("default", "workspaceWrite", "on-request"),
+            ("read-only", "readOnly", "on-request"),
+        ] {
+            adapter.command(super::super::rpc(
+                "permissions.set",
+                json!({"key":THREAD,"mode":mode}),
+            ));
+            let update = frames(&mut adapter).pop().unwrap();
+            assert_eq!(update["method"], "thread/settings/update");
+            assert_eq!(
+                update["params"],
+                json!({"threadId":THREAD,"sandboxPolicy":{"type":sandbox},"approvalPolicy":approval})
+            );
+        }
     }
 
     #[test]

@@ -39,6 +39,18 @@ pub fn parse(payload: &Value) -> Vec<Command> {
             })
         })
         .collect();
+    commands.retain(|c| !matches!(c.token.as_str(), "/permission" | "/permissions"));
+    commands.push(Command {
+        token: "/permissions".into(),
+        description: "Change this chat’s permissions".into(),
+        source: "native".into(),
+        aliases: vec!["/permission".into()],
+        args: vec![serde_json::json!({"name":"mode","choices":[
+            {"value":"default","label":"Workspace writes · ask for approval"},
+            {"value":"read-only","label":"Read only · ask for approval"},
+            {"value":"yolo","label":"Full filesystem and network · no approval prompts"}
+        ]})],
+    });
     commands.sort_by(|a, b| a.token.cmp(&b.token));
     commands.dedup_by(|a, b| a.token == b.token);
     commands

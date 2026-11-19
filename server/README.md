@@ -12,7 +12,7 @@ The manager authenticates devices and serves chat, workspace state and desktops 
 
 The deployment uses `/var/lib/d4c` for manager state and `/var/lib/d4c/codex` for Codex credentials, workspace and history. The service mount namespace hides manager keys, the raw manager socket and manager database from shell tools. An additional systemd socket on the tailnet interface can preserve a previously saved chat URL.
 
-The timer and `/usr/local/libexec/d4c-scheduler` run once per server. Scheduled turns have separate run history. Each desktop uses its own rootless Podman container, home, workspace, X server and DBus session. Up to two desktops can run at once, each with one CPU and a PID limit. Their RAM and swap share the host's normal resource management. The build supervisor's memory cap applies during compilation.
+The timer and `/usr/local/libexec/d4c-scheduler` run once per server. Scheduled turns have separate run history. Each desktop uses its own rootless Podman container, home, workspace, X server and DBus session. Up to two desktops can run at once, each with a PID limit. CPU, RAM and swap share the host’s available capacity. Accessible Linux DRM render nodes are passed through for compatible GPU workloads. The build supervisor's memory cap applies during compilation.
 
 Human takeover is enforced server-side. When a controller lease expires, the manager releases held input and keeps agent input paused until a user selects **Return to agent**. Deleting a desktop removes the unit and container and retains its files.
 

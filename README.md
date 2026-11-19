@@ -98,3 +98,9 @@ Tested protocol version: Codex CLI 0.169.0. The legacy runtime is needed only to
 ## License
 
 MIT for D4C's original code. Vendored Rust patches and bundled fonts retain their own licenses; see [ATTRIBUTION.md](ATTRIBUTION.md), `vendor/` and the font license files in `assets/`.
+
+### Chat permissions and desktop hardware
+
+Open **Permissions** in the chat composer, or enter `/permissions` (alias `/permission`). Choose **Default** for workspace writes with approval requests, **Read only** for read-only sandboxing, or **Full access (YOLO)** for unsandboxed commands with network access and no approval prompts. Use `/permissions yolo on` and `/permissions yolo off` to toggle full access. Turning it off restores Default. Each selection applies to its Codex thread and takes effect for subsequent turns.
+
+D4C desktops share the CPUs available to their host. On Linux, the workspace manager passes accessible DRM render devices into new desktop containers. Hardware acceleration requires a host GPU, compatible userspace drivers and support in the application. The VNC connection itself does not provide a GPU.

@@ -149,10 +149,20 @@ impl Runtime {
             captures: Default::default(),
         })
     }
-    /// Remove legacy desktop RAM limits without restarting its container.
-    pub fn remove_memory_limit(&self, d: &Value) -> Result<()> {
+    /// Remove legacy desktop CPU and RAM limits without restarting its container.
+    pub fn remove_resource_limits(&self, d: &Value) -> Result<()> {
         let id = d["id"].as_str().ok_or("Missing desktop ID")?;
         self.prepare(d)?;
+        let exists = Command::new("podman")
+            .args(["container", "exists", &format!("d4c-{id}")])
+            .status()
+            .map_err(|e| e.to_string())?;
+        if exists.code() == Some(1) {
+            return Ok(()); // Stopped Quadlet desktops can have only a unit until next start.
+        }
+        if !exists.success() {
+            return Err("Cannot inspect desktop container".into());
+        }
         // The CLI treats --memory=0 as unchanged. The local API accepts OCI's
         // explicit -1 sentinel, updating both persistent configuration and cgroups.
         command("systemctl", &["--user", "start", "podman.socket"])?;
@@ -165,7 +175,7 @@ impl Runtime {
         stream
             .set_write_timeout(Some(Duration::from_secs(30)))
             .map_err(|e| e.to_string())?;
-        let body = r#"{"memory":{"limit":-1,"swap":-1}}"#;
+        let body = r#"{"cpu":{"quota":-1},"memory":{"limit":-1,"swap":-1}}"#;
         write!(stream, "POST /v4.0.0/libpod/containers/d4c-{id}/update HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
         let mut response = String::new();
         stream
@@ -178,7 +188,7 @@ impl Runtime {
             .is_some_and(|line| line.split_whitespace().nth(1) == Some("201"))
         {
             return Err(format!(
-                "Podman RAM limit removal failed: {}",
+                "Podman resource limit removal failed: {}",
                 response.chars().take(1000).collect::<String>()
             ));
         }
@@ -197,6 +207,26 @@ impl Runtime {
                 .find_map(|line| line.strip_prefix("0::"))
                 .ok_or("Desktop cgroup v2 path missing")?;
             let cgroup = PathBuf::from("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+            let quota = fs::read_to_string(cgroup.join("cpu.max")).map_err(|e| e.to_string())?;
+            if quota.split_whitespace().next() != Some("max") {
+                // Older Podman containers retain NanoCpus when updating OCI resources.
+                // The regenerated Quadlet handles recreation; lift the live v2 quota
+                // without disturbing the desktop process or its current CPU period.
+                let period = quota
+                    .split_whitespace()
+                    .nth(1)
+                    .ok_or("Missing CPU period")?;
+                let control = cgroup.join("cpu.max");
+                fs::write(&control, format!("max {period}")).map_err(|e| e.to_string())?;
+                if fs::read_to_string(control)
+                    .map_err(|e| e.to_string())?
+                    .split_whitespace()
+                    .next()
+                    != Some("max")
+                {
+                    return Err("Desktop CPU quota removal failed".into());
+                }
+            }
             for name in ["memory.max", "memory.swap.max"] {
                 if fs::read_to_string(cgroup.join(name))
                     .map_err(|e| e.to_string())?
@@ -229,11 +259,37 @@ impl Runtime {
         }
         let width = d["width"].as_u64().unwrap_or(1280).clamp(640, 2560);
         let height = d["height"].as_u64().unwrap_or(800).clamp(480, 1600);
-        let cpus = d["cpus"].as_u64().unwrap_or(1).clamp(1, 2);
+        let mut gpu_devices = String::new();
+        let mut render_nodes = Vec::new();
+        if let Ok(entries) = fs::read_dir("/dev/dri") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name
+                    .to_str()
+                    .and_then(|n| n.strip_prefix("renderD"))
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .is_some()
+                    && fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(entry.path())
+                        .is_ok()
+                {
+                    render_nodes.push(entry.path());
+                }
+            }
+        }
+        render_nodes.sort();
+        for node in &render_nodes {
+            gpu_devices.push_str(&format!("AddDevice={}\n", node.display()));
+        }
+        if !render_nodes.is_empty() {
+            gpu_devices.push_str("GroupAdd=keep-groups\n");
+        }
         let home = base.join("home");
         let work = base.join("work");
         let unit = format!(
-            "[Unit]\nDescription=D4C desktop {id}\nStartLimitIntervalSec=120\nStartLimitBurst=5\n[Container]\nImage=localhost/d4c-arch-xfce:1\nContainerName=d4c-{id}\nNetwork=pasta:--no-map-gw\nPublishPort=127.0.0.1::5900\nVolume={home}:/home/desktop\nVolume={work}:/workspace\nEnvironment=D4C_WIDTH={width}\nEnvironment=D4C_HEIGHT={height}\nWorkingDir=/workspace\nPodmanArgs=--cpus={cpus} --pids-limit=512\n[Service]\nRestart=on-failure\nRestartSec=3\nTimeoutStartSec=45\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription=D4C desktop {id}\nStartLimitIntervalSec=120\nStartLimitBurst=5\n[Container]\nImage=localhost/d4c-arch-xfce:1\nContainerName=d4c-{id}\nNetwork=pasta:--no-map-gw\nPublishPort=127.0.0.1::5900\nVolume={home}:/home/desktop\nVolume={work}:/workspace\nEnvironment=D4C_WIDTH={width}\nEnvironment=D4C_HEIGHT={height}\nWorkingDir=/workspace\n{gpu_devices}PodmanArgs=--pids-limit=512\n[Service]\nRestart=on-failure\nRestartSec=3\nTimeoutStartSec=45\n[Install]\nWantedBy=default.target\n",
             home = home.display(),
             work = work.display()
         );

@@ -175,6 +175,8 @@ struct D4c {
     active_sessions: std::collections::HashSet<String>,
     drafts: std::collections::HashMap<String, Draft>,
     upload: Option<(String, std::sync::mpsc::Receiver<uploads::UploadResult>)>,
+    permission_modes: std::collections::HashMap<String, String>,
+    permission_request: Option<(String, String)>,
     composer_error: String,
     list_pending: bool,
     list_dirty: bool,
@@ -271,6 +273,8 @@ impl Default for D4c {
             active_sessions: Default::default(),
             drafts: Default::default(),
             upload: None,
+            permission_modes: Default::default(),
+            permission_request: None,
             composer_error: String::new(),
             list_pending: false,
             list_dirty: false,
@@ -280,6 +284,7 @@ impl Default for D4c {
 impl D4c {
     fn reconnect(&mut self, ctx: &egui::Context) {
         self.workspace_hydrated = false;
+        self.permission_request = None;
         self.questions.disconnected();
         for (_, params) in std::mem::take(&mut self.pending_sends) {
             self.restore_unsent(&params);
@@ -1156,6 +1161,7 @@ impl D4c {
                     self.delete_pending = None;
                     self.running = false;
                     self.status = s;
+                    self.permission_request = None;
                     self.command_request = None;
                     self.rename_pending = None;
                     self.history_request = None;
@@ -1166,6 +1172,18 @@ impl D4c {
                 gateway::Event::Data(v) => {
                     if v["event"] == "session.settings" {
                         let settings = &v["payload"];
+                        if let (Some(key), Some(sandbox)) = (
+                            settings["sessionKey"].as_str(),
+                            settings["sandbox"].as_str(),
+                        ) {
+                            let label = match (sandbox, settings["approval"].as_str()) {
+                                ("dangerFullAccess", Some("never")) => "Full access (YOLO)",
+                                ("workspaceWrite", Some("on-request")) => "Default",
+                                ("readOnly", _) => "Read only",
+                                _ => "Custom permissions",
+                            };
+                            self.permission_modes.insert(key.into(), label.into());
+                        }
                         if let (Some(key), Some(model)) =
                             (settings["sessionKey"].as_str(), settings["model"].as_str())
                             && !self.selection_edited.contains(key)
@@ -1213,6 +1231,20 @@ impl D4c {
                     self.questions.observe(&v);
                     let response_id = v["id"].as_str().unwrap_or("");
                     if v["type"] == "res" {
+                        if self
+                            .permission_request
+                            .as_ref()
+                            .is_some_and(|(id, _)| id == response_id)
+                        {
+                            let (_, key) = self.permission_request.take().unwrap();
+                            if key == self.session && v["ok"] != true {
+                                self.composer_error = v["error"]["message"]
+                                    .as_str()
+                                    .unwrap_or("Permission change failed")
+                                    .into();
+                            }
+                            continue;
+                        }
                         if let Some(params) = self.sent_requests.remove(response_id) {
                             if v["ok"] == false {
                                 self.restore_unsent(&params);
@@ -2366,6 +2398,35 @@ impl D4c {
             .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
+                if self.permission_request.is_some() {
+                    ui.weak("Updating permissions…");
+                } else {
+                    let current = self.permission_modes.get(&self.session).cloned();
+                    let caption = current.as_ref().map_or_else(
+                        || "Permissions".to_owned(),
+                        |mode| format!("Permissions · {mode}"),
+                    );
+                    ui.add_enabled_ui(
+                        self.connected && !self.running && !self.history_loading,
+                        |ui| {
+                            ui.menu_button(caption, |ui| {
+                                for (mode, label) in [
+                                    ("default", "Default"),
+                                    ("read-only", "Read only"),
+                                    ("yolo", "Full access (YOLO)"),
+                                ] {
+                                    if ui
+                                        .selectable_label(current.as_deref() == Some(label), label)
+                                        .clicked()
+                                    {
+                                        self.set_permissions(mode);
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        },
+                    );
+                }
                 if self.input.starts_with('/') && !self.slash_dismissed {
                     if !candidates.is_empty() {
                         ui.horizontal(|ui| {
@@ -2793,6 +2854,16 @@ impl D4c {
         self.defaults_dirty = true;
     }
 
+    fn set_permissions(&mut self, mode: &str) {
+        self.composer_error.clear();
+        self.permission_request = self
+            .rpc("permissions.set", json!({"key":self.session,"mode":mode}))
+            .map(|id| (id, self.session.clone()));
+        if self.permission_request.is_none() {
+            self.composer_error = "Reconnect to change permissions".into();
+        }
+    }
+
     fn send(&mut self, ctx: &egui::Context) {
         if !self.connected
             || self.running
@@ -2806,7 +2877,25 @@ impl D4c {
         {
             return;
         }
+        if self.permission_request.is_some() {
+            return;
+        }
         let text = std::mem::take(&mut self.input);
+        let mut words = text.split_whitespace();
+        if matches!(words.next(), Some("/permission" | "/permissions")) {
+            match (words.next(), words.next(), words.next()) {
+                (Some("yolo"), Some("off"), None) => self.set_permissions("default"),
+                (Some("yolo"), Some("on"), None) => self.set_permissions("yolo"),
+                (Some(mode @ ("read-only" | "default" | "yolo")), None, None) => {
+                    self.set_permissions(mode);
+                }
+                _ => {
+                    self.input = "/permissions ".into();
+                    self.slash_dismissed = false;
+                }
+            }
+            return;
+        }
         if self.desktops.slash(&text, &self.session, &self.url, ctx) {
             return;
         }
@@ -3723,6 +3812,7 @@ impl D4c {
                             }
                             if self.running {
                                 self.live.entry(self.session.clone()).or_default().ui(ui);
+                                ui.add_space(12.0);
                             }
                             if self.jump_latest { ui.scroll_to_cursor(Some(egui::Align::BOTTOM)); }
                         });
