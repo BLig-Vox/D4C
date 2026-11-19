@@ -27,6 +27,7 @@ def main():
         names = ['LICENSE', 'README.md', 'docs/setup.md', 'docs/mcp.md', 'scripts/build-limited.py']
         if server:
             names += ['server/README.md', 'scripts/configure-server.py', 'scripts/install-mcp-queue.py',
+                      'scripts/stage-codex.py', 'vendor/ponytail/LICENSE', 'vendor/ponytail/skills/ponytail/SKILL.md',
                       'scripts/isolate-scheduled-chats.py', 'scripts/sync-codex-models.py']
             for directory in ['server/deploy', 'server/openclaw-plugin', 'server/openclaw-skills',
                               'server/systemd', 'server/scripts', 'server/codex-image-budget', 'server/desktop']:

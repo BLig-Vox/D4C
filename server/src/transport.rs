@@ -94,6 +94,10 @@ pub fn serve(manager: Manager, config: &Value) -> Result<()> {
             eprintln!("IPC failed: {e}");
         }
     });
+    let codex_socket = config["codexSocket"].as_str().map(std::path::PathBuf::from);
+    if codex_socket.as_ref().is_some_and(|p| !p.is_absolute()) {
+        return Err("codexSocket requires an absolute Unix socket path".into());
+    }
     let listener = TcpListener::bind(address).map_err(|e| e.to_string())?;
     manager.reconcile();
     let watcher = manager.clone();
@@ -144,9 +148,10 @@ pub fn serve(manager: Manager, config: &Value) -> Result<()> {
         let tls = tls.clone();
         let manager = manager.clone();
         let host = host.clone();
+        let codex_socket = codex_socket.clone();
         std::thread::spawn(move || {
             let _guard = guard;
-            if let Err(e) = connection_task(tcp, tls, manager, &host) {
+            if let Err(e) = connection_task(tcp, tls, manager, &host, codex_socket.as_deref()) {
                 eprintln!("Connection ended peer={peer:?}: {e}");
             }
         });
@@ -161,6 +166,7 @@ fn connection_task(
     tls: Arc<ServerConfig>,
     manager: Manager,
     host: &str,
+    codex_socket: Option<&Path>,
 ) -> Result<()> {
     tcp.set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(|e| e.to_string())?;
@@ -232,6 +238,11 @@ fn connection_task(
         .map_err(|e| e.to_string())?;
     if path == "/control" {
         control(socket, manager, id)
+    } else if path == "/codex" {
+        codex(
+            socket,
+            codex_socket.ok_or("Direct Codex is not configured")?,
+        )
     } else if let Some(desktop) = path.strip_prefix("/vnc/") {
         uuid::Uuid::parse_str(desktop).map_err(|_| "Invalid desktop ID")?;
         viewer(socket, manager, desktop, compressed)
@@ -262,6 +273,69 @@ impl Heartbeat {
         Ok(())
     }
 }
+/// One upstream WebSocket per paired client. The Codex service owns the threads
+/// and turns, so leaving the app only closes this subscription.
+fn codex(mut client: Socket, path: &Path) -> Result<()> {
+    use std::os::unix::net::UnixStream;
+    let stream = UnixStream::connect(path).map_err(|e| format!("Codex socket: {e}"))?;
+    let timeout = |e: io::Error| e.to_string();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(timeout)?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(timeout)?;
+    let (mut upstream, _) = tungstenite::client("ws://localhost/", stream)
+        .map_err(|e| format!("Codex handshake: {e}"))?;
+    let tick = Some(Duration::from_millis(10));
+    upstream.get_mut().set_read_timeout(tick).map_err(timeout)?;
+    client
+        .get_mut()
+        .sock
+        .set_read_timeout(tick)
+        .map_err(timeout)?;
+    client.set_config(|cfg| {
+        cfg.max_frame_size = Some(16 << 20);
+        cfg.max_message_size = Some(16 << 20);
+    });
+    let mut heartbeat = Heartbeat::new();
+    loop {
+        heartbeat.poll(&mut client)?;
+        match receive_codex(&mut client)? {
+            Some(Message::Close(_)) => return Ok(()),
+            Some(message) => {
+                heartbeat.received = Instant::now();
+                if message.is_text() {
+                    crate::wire::send(&mut upstream, message).map_err(|e| e.to_string())?;
+                }
+            }
+            None => {}
+        }
+        match receive_codex(&mut upstream)? {
+            Some(Message::Close(_)) => return Ok(()),
+            Some(message) if message.is_text() => {
+                crate::wire::send(&mut client, message).map_err(|e| e.to_string())?;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn receive_codex<S: Read + Write>(socket: &mut WebSocket<S>) -> Result<Option<Message>> {
+    match socket.read() {
+        Ok(message) => Ok(Some(message)),
+        Err(tungstenite::Error::Io(e))
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn control(mut socket: Socket, manager: Manager, client: String) -> Result<()> {
     let snapshot = manager
         .db

@@ -22,3 +22,9 @@
 Bundled fonts preserve their license files in assets/fonts and assets/android-fonts.
 Lucide icons are supplied by the lucide-icons dependency; see its upstream ISC license.
 The selected D4C app artwork is recorded in assets/branding/README.md.
+
+The bundled Ponytail coding skill is by Dietrich Gebert and contributors,
+licensed under MIT. D4C vendors the skill from commit
+`96608e078b2d5ea607c5c3b8b5a54d1c1fba6846`.
+See [upstream](https://github.com/DietrichGebert/ponytail) and
+[the included license](vendor/ponytail/LICENSE).

@@ -1,4 +1,4 @@
-//! Inactive server catalogs carry metadata only; the selected server owns chat/VNC.
+//! Each visited host retains its own authenticated chat transport across switches.
 use crate::{gateway, preferences};
 use eframe::egui;
 use serde_json::{Value, json};
@@ -19,6 +19,9 @@ pub struct Server {
     pub status: String,
     pub selected: Option<String>,
     link: Option<gateway::Gateway>,
+    warm: bool,
+    media_token: Option<String>,
+    refresh: Instant,
 }
 impl Default for Server {
     fn default() -> Self {
@@ -29,6 +32,9 @@ impl Default for Server {
             status: "Connecting…".into(),
             selected: None,
             link: None,
+            warm: false,
+            media_token: None,
+            refresh: Instant::now(),
         }
     }
 }
@@ -89,6 +95,39 @@ fn parse_sessions(items: &Value) -> Vec<Session> {
         .collect()
 }
 impl Catalogs {
+    pub fn park(
+        &mut self,
+        url: &str,
+        link: gateway::Gateway,
+        token: Option<String>,
+        online: bool,
+        status: &str,
+    ) {
+        let row = self.rows.entry(url.to_owned()).or_default();
+        row.link = Some(link);
+        row.warm = true;
+        row.media_token = token;
+        row.online = online;
+        row.status = status.to_owned();
+    }
+
+    pub fn take_warm(
+        &mut self,
+        url: &str,
+    ) -> Option<(gateway::Gateway, Option<String>, bool, String)> {
+        let row = self.rows.get_mut(url)?;
+        if !row.warm {
+            return None;
+        }
+        row.warm = false;
+        Some((
+            row.link.take()?,
+            row.media_token.take(),
+            row.online,
+            row.status.clone(),
+        ))
+    }
+
     pub fn poll(
         &mut self,
         connections: &[preferences::Connection],
@@ -101,6 +140,8 @@ impl Catalogs {
             let row = self.rows.entry(connection.url.clone()).or_default();
             if connection.url == active {
                 row.link = None;
+                row.warm = false;
+                row.media_token = None;
                 continue;
             }
             if row.link.is_none() {
@@ -108,6 +149,15 @@ impl Catalogs {
                     connection.url.clone(),
                     ctx.clone(),
                 ));
+            }
+            if row.warm && row.online && row.refresh.elapsed() >= Duration::from_secs(30) {
+                if let Some(link) = &row.link {
+                    let _ = link.tx.send(gateway::rpc(
+                        "sessions.list",
+                        json!({"includeDerivedTitles":true}),
+                    ));
+                }
+                row.refresh = Instant::now();
             }
             let events: Vec<_> = row
                 .link
@@ -125,6 +175,17 @@ impl Catalogs {
                         row.status = error;
                     }
                     gateway::Event::Data(value) => {
+                        if value["id"] == "connect" && value["ok"] == true {
+                            row.media_token = value["payload"]["auth"]["deviceToken"]
+                                .as_str()
+                                .map(str::to_owned);
+                        }
+                        if !value["id"]
+                            .as_str()
+                            .is_some_and(|id| id.starts_with("sessions.list:"))
+                        {
+                            continue;
+                        }
                         if value["ok"] == true {
                             row.sessions = parse_sessions(&value["payload"]["sessions"]);
                             self.dirty = true;
@@ -191,5 +252,41 @@ impl Catalogs {
             self.dirty = false;
         }
         self.last_save = Instant::now();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn switching_hosts_returns_the_same_transport_and_its_own_credentials() {
+        let mut catalogs = Catalogs {
+            rows: BTreeMap::new(),
+            dirty: false,
+            last_save: Instant::now(),
+        };
+        let mut commands = Vec::new();
+        for host in ["first", "second"] {
+            let (tx, rx) = mpsc::channel();
+            let (_events, incoming) = mpsc::channel();
+            catalogs.park(
+                host,
+                gateway::test_gateway(tx, incoming),
+                Some(host.into()),
+                true,
+                "Connected",
+            );
+            commands.push(rx);
+        }
+        for (index, host) in ["first", "second"].into_iter().enumerate() {
+            let (link, token, online, _) = catalogs.take_warm(host).unwrap();
+            assert_eq!(token.as_deref(), Some(host));
+            assert!(online);
+            link.tx.send(json!(host)).unwrap();
+            assert_eq!(commands[index].recv().unwrap(), json!(host));
+            assert!(catalogs.take_warm(host).is_none());
+        }
     }
 }

@@ -490,8 +490,36 @@ impl D4c {
             self.settings_error = e.to_string();
             return;
         }
+        if self.preferences.current().url != self.url {
+            self.rpc("sessions.messages.unsubscribe", json!({"key":self.session}));
+            if let Some(link) = self.gateway.take() {
+                self.servers.park(
+                    &self.url,
+                    link,
+                    self.media_auth.take(),
+                    self.connected,
+                    &self.status,
+                );
+            }
+        }
         self.reset_connection(index, token);
-        self.reconnect(ctx);
+        if self.token.is_empty()
+            && let Some((link, media_token, online, status)) = self.servers.take_warm(&self.url)
+        {
+            self.gateway = Some(link);
+            self.media_auth = media_token;
+            self.connected = online;
+            self.status = status;
+            self.desktops.connect(&self.url, ctx);
+            if online {
+                self.refresh_sessions();
+                self.rpc("models.list", json!({}));
+                self.rpc("question.list", json!({}));
+                self.hydrate_chat();
+            }
+        } else {
+            self.reconnect(ctx);
+        }
     }
     fn switch_connection(&mut self, index: usize, ctx: &egui::Context) {
         self.switch_with_token(index, ctx, String::new());
@@ -928,6 +956,18 @@ impl D4c {
             Err(_) => {}
         }
     }
+    fn hydrate_chat(&mut self) {
+        self.rpc("sessions.messages.subscribe", json!({"key":self.session}));
+        self.refresh_commands();
+        self.cron.refresh();
+        if let Some(id) = self.rpc(
+            "chat.history",
+            json!({"sessionKey":self.session,"limit":100,"toolResultMaxChars":2000}),
+        ) {
+            self.history_request = Some((id, self.session.clone()));
+            self.history_loading = true;
+        }
+    }
     fn events(&mut self, ctx: &egui::Context) {
         let events: Vec<_> = self
             .gateway
@@ -943,18 +983,7 @@ impl D4c {
                     self.connected = s == "Connected";
                     self.status = s;
                     if self.connected {
-                        self.rpc("sessions.messages.subscribe", json!({"key":self.session}));
-                        self.refresh_commands();
-                        self.cron.refresh();
-                        {
-                            if let Some(id) = self.rpc(
-                                "chat.history",
-                                json!({"sessionKey":self.session,"limit":100,"toolResultMaxChars":2000}),
-                            ) {
-                                self.history_request = Some((id, self.session.clone()));
-                                self.history_loading = true;
-                            }
-                        }
+                        self.hydrate_chat();
                     }
                 }
                 gateway::Event::Error(s) => {
