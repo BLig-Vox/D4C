@@ -91,6 +91,17 @@ fn decode(payload: Payload) -> Option<egui::ColorImage> {
     ))
 }
 impl Attachment {
+    pub fn cache_bytes(&self) -> usize {
+        let payload=self.state.lock().map(|state|match &*state {
+            State::Pending(Payload::Bytes(b))=>b.len(),
+            State::Pending(Payload::Http{endpoint,token,source,session,message})=>endpoint.len()+token.len()+source.len()+session.len()+message.len(),
+            State::Loading(_)=>32*1024*1024,
+            State::Ready(Some(texture))=>texture.size().iter().product::<usize>().saturating_mul(8),
+            State::Ready(None)=>0,
+        }).unwrap_or(usize::MAX/2);
+        payload.saturating_add(self.name.len()+self.mime.len()).saturating_add(self.source.as_ref().map(|(a,b)|a.len()+b.len()).unwrap_or(0))
+    }
+
     pub fn new(name: String, mime: String, bytes: Vec<u8>) -> Self {
         Self {
             name,

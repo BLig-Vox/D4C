@@ -205,7 +205,7 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
                 "{base}/{}",
                 desktop
                     .as_ref()
-                    .map(|id| format!("vnc/{id}"))
+                    .map(|id| format!("vnc/{id}?transport={}", crate::desktop_wire::NAME))
                     .unwrap_or("control".into())
             );
             let result = (|| -> Result<(), String> {
@@ -213,11 +213,12 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
                 connected.store(true, Ordering::Relaxed);
                 emit(Event::Status("Online".into()));
                 let mut decoder = None;
+                let mut compressed = false;
                 let mut last_frame = std::time::Instant::now();
                 let mut pending = false;
                 let mut last_received = std::time::Instant::now();
                 let mut last_ping = std::time::Instant::now();
-                let framebuffer_deadline = std::time::Instant::now() + Duration::from_secs(45);
+                let mut frame_progress = std::time::Instant::now();
                 let mut received_frame = false;
                 loop {
                     if cancel.load(Ordering::Relaxed) {
@@ -234,7 +235,7 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
                     }
                     if desktop.is_some()
                         && !received_frame
-                        && std::time::Instant::now() >= framebuffer_deadline
+                        && frame_progress.elapsed() >= Duration::from_secs(45)
                     {
                         return Err("Desktop did not send a framebuffer".into());
                     }
@@ -255,6 +256,8 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
                         Ok(Message::Text(t)) => {
                             let v: Value = serde_json::from_str(&t).map_err(|e| e.to_string())?;
                             if v["type"] == "framebuffer" {
+                                compressed =
+                                    v["transport"].as_str() == Some(crate::desktop_wire::NAME);
                                 decoder = Some(
                                     rfb::Decoder::new(
                                         v["width"].as_u64().ok_or("Width missing")? as u16,
@@ -285,7 +288,17 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
                         }
                         Ok(Message::Binary(bytes)) => {
                             if let Some(d) = decoder.as_mut() {
-                                pending |= d.feed(&bytes).map_err(|e| e.to_string())?;
+                                let decoded = if compressed {
+                                    Some(
+                                        crate::desktop_wire::decode(&bytes)
+                                            .map_err(|e| e.to_string())?,
+                                    )
+                                } else {
+                                    None
+                                };
+                                let data = decoded.as_deref().unwrap_or(&bytes);
+                                pending |= d.feed(data).map_err(|e| e.to_string())?;
+                                frame_progress = std::time::Instant::now();
                                 received_frame |= pending;
                             }
                         }

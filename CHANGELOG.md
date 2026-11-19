@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0-alpha.5 — 2026-11-19
+
+- Negotiate bounded lossless compression for desktop video transport, with raw
+  compatibility for earlier clients and servers. Decode and validate each chunk.
+- Keep first-frame downloads alive while data makes progress.
+- Restore recent chat and desktop placement per server, including rapid switches
+  and empty chats. Cache at most two inactive servers and 100 rows / 16 MiB each.
+- Replace desktop loading spinners with responsive skeletons, compact recovery
+  controls, and a retained preview when reopening a minimized viewer.
+- Preserve takeover protections until a fresh desktop frame arrives.
+- Android version code 10; existing app data and signing identity are preserved.
+
 ## 0.1.0-alpha.4 — 2026-11-19
 
 - Recover temporary WebSocket write failures by flushing the queued frame once;

@@ -15,7 +15,7 @@ A native Rust client for your OpenClaw servers. Chat, stream replies and tool ac
 5. For shared drafts, desktop control and synchronized notification state, install the [workspace manager](docs/setup.md#3-persistent-workspace-and-desktops). It pairs devices separately.
 6. Install the [MCP queue](docs/mcp.md) once on each server to connect MCP services from chat.
 
-Use **Settings → Workspace server** if the manager runs on another hostname or port. Without an override, D4C uses the Gateway hostname on port `8443`. Saved connections and model/reasoning choices are device-local; conversations and agent work belong to OpenClaw.
+Use **Settings → Workspace server** if the manager runs on another hostname or port. Without an override, D4C uses the Gateway hostname on port `8443`. Saved connections and model/reasoning choices are device-local; conversations and agent work belong to OpenClaw. Switching servers keeps a bounded recent-chat preview and each server’s floating desktop position. Live connections are reopened for the selected server; cached pixels never enable input. Install matching client and manager updates for lossless compressed desktop delivery; older versions use the raw transport.
 
 ## Daily use
 
@@ -39,13 +39,13 @@ D4C uses OpenClaw's native MCP registry. The included helper queues connection c
 
 ## Prebuilt Linux install
 
-Download `d4c-0.1.0-alpha.4-linux-x86_64.tar.gz` and `SHA256SUMS` from
-[Releases](https://github.com/Blig-Vox/D4C/releases/tag/v0.1.0-alpha.4), then:
+Download `d4c-0.1.0-alpha.5-linux-x86_64.tar.gz` and `SHA256SUMS` from
+[Releases](https://github.com/Blig-Vox/D4C/releases/tag/v0.1.0-alpha.5), then:
 
 ```sh
 sha256sum --ignore-missing -c SHA256SUMS
-tar -xzf d4c-0.1.0-alpha.4-linux-x86_64.tar.gz
-cd d4c-0.1.0-alpha.4-linux-x86_64
+tar -xzf d4c-0.1.0-alpha.5-linux-x86_64.tar.gz
+cd d4c-0.1.0-alpha.5-linux-x86_64
 python3 scripts/install-desktop.py bin/vox-d4c
 ~/.local/bin/vox-d4c
 ```

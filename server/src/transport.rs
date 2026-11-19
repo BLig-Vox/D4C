@@ -169,6 +169,7 @@ fn connection_task(
     let _ = tcp.set_nodelay(true);
     let stream = StreamOwned::new(ServerConnection::new(tls).map_err(|e| e.to_string())?, tcp);
     let mut path = String::new();
+    let mut compressed = false;
     let ws_config = WebSocketConfig::default()
         .max_message_size(Some(1024 * 1024))
         .max_frame_size(Some(1024 * 1024));
@@ -176,6 +177,10 @@ fn connection_task(
         stream,
         |req: &tungstenite::handshake::server::Request, response| {
             path = req.uri().path().to_string();
+            compressed = req.uri().query().is_some_and(|q| {
+                q.split('&')
+                    .any(|part| part == format!("transport={}", crate::desktop_wire::NAME))
+            });
             let valid_origin = req.headers().get("origin").is_none_or(|v| {
                 v.to_str().is_ok_and(|o| {
                     o == format!("https://{host}") || o == format!("https://{host}:8443")
@@ -229,7 +234,7 @@ fn connection_task(
         control(socket, manager, id)
     } else if let Some(desktop) = path.strip_prefix("/vnc/") {
         uuid::Uuid::parse_str(desktop).map_err(|_| "Invalid desktop ID")?;
-        viewer(socket, manager, desktop)
+        viewer(socket, manager, desktop, compressed)
     } else {
         Err("Unknown endpoint".into())
     }
@@ -315,7 +320,7 @@ fn control(mut socket: Socket, manager: Manager, client: String) -> Result<()> {
         }
     }
 }
-fn viewer(mut socket: Socket, manager: Manager, id: &str) -> Result<()> {
+fn viewer(mut socket: Socket, manager: Manager, id: &str, compressed: bool) -> Result<()> {
     socket
         .get_mut()
         .sock
@@ -325,7 +330,7 @@ fn viewer(mut socket: Socket, manager: Manager, id: &str) -> Result<()> {
         rfb::Session::connect(manager.runtime.port(id)?).map_err(|e| e.to_string())?;
     send(
         &mut socket,
-        json!({"type":"framebuffer","width":session.width,"height":session.height,"name":session.name,"encoding":"rfb-bgrx32"}),
+        json!({"type":"framebuffer","width":session.width,"height":session.height,"name":session.name,"encoding":"rfb-bgrx32","transport":if compressed {crate::desktop_wire::NAME}else{"raw"}}),
     )?;
     session
         .socket
@@ -342,8 +347,15 @@ fn viewer(mut socket: Socket, manager: Manager, id: &str) -> Result<()> {
         }
         match session.socket.read(&mut bytes) {
             Ok(0) => return Err("VNC disconnected".into()),
-            Ok(n) => crate::wire::send(&mut socket, Message::Binary(bytes[..n].to_vec().into()))
-                .map_err(|e| e.to_string())?,
+            Ok(n) => {
+                let packet = if compressed {
+                    crate::desktop_wire::encode(&bytes[..n]).map_err(|e| e.to_string())?
+                } else {
+                    bytes[..n].to_vec()
+                };
+                crate::wire::send(&mut socket, Message::Binary(packet.into()))
+                    .map_err(|e| e.to_string())?;
+            }
             Err(e)
                 if matches!(
                     e.kind(),

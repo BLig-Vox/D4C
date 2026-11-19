@@ -12,3 +12,6 @@ pub mod observer;
 
 #[path = "../../src/wire.rs"]
 pub mod wire;
+
+#[path = "../../src/desktop_wire.rs"]
+pub mod desktop_wire;

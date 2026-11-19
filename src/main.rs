@@ -8,6 +8,7 @@ mod android_uploads;
 mod commands;
 mod cron;
 mod desktops;
+mod desktop_wire;
 mod draft_sync;
 mod gateway;
 mod media;
@@ -78,9 +79,13 @@ struct Draft {
     input: String,
     attachments: Vec<uploads::Attachment>,
 }
+struct ServerView {session:String,messages:Vec<ChatMessage>,scroll:(f32,f32),desktop:desktops::UiState}
+const SERVER_CACHE_BYTES:usize=16*1024*1024;
+fn message_cache_bytes(m:&ChatMessage)->usize {m.media.iter().fold(m.text.len(),|n,a|n.saturating_add(a.cache_bytes()))}
 struct D4c {
     desktops: desktops::Desktops,
     servers: servers::Catalogs,
+    server_views:std::collections::VecDeque<(String,ServerView)>,
     explicit_selection: bool,
     jump_latest: bool,
     workspace_hydrated: bool,
@@ -171,6 +176,7 @@ impl Default for D4c {
         Self {
             desktops: Default::default(),
             servers,
+            server_views:Default::default(),
             explicit_selection: remembered.is_some(),
             jump_latest: false,
             workspace_hydrated: false,
@@ -295,7 +301,18 @@ impl D4c {
             .rows
             .get(&preferences.current().url)
             .and_then(|row| row.selected.clone());
+        let mut views=std::mem::take(&mut self.server_views);
+        views.retain(|(url,_)|url!=&self.url);
+        if preferences::valid_url(&self.url) {
+            let mut messages=std::mem::take(&mut self.messages);
+            messages.drain(..messages.len().saturating_sub(100));
+            while messages.iter().map(|m|message_cache_bytes(m) as u128).sum::<u128>()>SERVER_CACHE_BYTES as u128 && !messages.is_empty(){messages.remove(0);}
+            views.push_back((self.url.clone(),ServerView{session:self.session.clone(),messages,scroll:self.history_scroll,desktop:self.desktops.capture_ui()}));
+        }
+        let restored=views.iter().position(|(url,_)|url==&preferences.current().url).and_then(|n|views.remove(n)).map(|(_,v)|v);
+        while views.len()>2 {views.pop_front();}
         let mut next = Self::default();
+        next.server_views=views;
         next.servers = servers;
         next.session =
             remembered.unwrap_or_else(|| format!("agent:main:d4c-{}", uuid::Uuid::new_v4()));
@@ -306,7 +323,11 @@ impl D4c {
         next.token = token;
         next.sidebar_open = self.sidebar_open;
         next.compact_previous = self.compact_previous;
-        next.settings_open = true;
+        next.settings_open = self.settings_open;
+        next.sessions=next.servers.rows.get(&next.url).map(|row|row.sessions.iter().map(|s|(s.key.clone(),s.title.clone())).collect()).unwrap_or_default();
+        if let Some(view)=restored {
+            next.desktops.restore_ui(view.desktop);next.session=view.session;next.messages=view.messages;next.history_scroll=view.scroll;next.restore_scroll=Some(view.scroll.1);
+        }
         next.restore_server_drafts();
         *self = next;
     }
@@ -2910,6 +2931,7 @@ impl D4c {
                                 self.switch_connection(index, ui.ctx());
                                 if self.preferences.selected == index {
                                     if self.session != target {
+                                        self.messages.clear();self.history_initialized=false;self.older_cursor=None;self.restore_scroll=None;
                                         self.drafts.insert(
                                             self.session.clone(),
                                             Draft {
@@ -3865,6 +3887,38 @@ mod composer_tests {
         app.gateway = Some(gateway::test_gateway(out, rx));
         tx.send(event).unwrap();
         app.events(&egui::Context::default());
+    }
+    #[test]
+    fn inactive_server_cache_is_bounded() {
+        let mut app=D4c::default();
+        app.preferences.connections=(0..6).map(|i|preferences::Connection{name:i.to_string(),url:format!("wss://server-{i}.example")}).collect();
+        for i in 0..6 {
+            app.url=app.preferences.connections[i].url.clone();app.preferences.selected=i;app.session=format!("chat-{i}");
+            app.messages=(0..140).map(|_|ChatMessage{media:vec![],role:"user".into(),text:"cached".into(),item_id:None}).collect();
+            app.reset_connection((i+1)%6,String::new());assert!(app.server_views.len()<=2);
+            for (_,view) in &app.server_views {assert!(view.messages.len()<=100);assert!(view.messages.iter().map(message_cache_bytes).sum::<usize>()<=SERVER_CACHE_BYTES);}
+        }
+    }
+    #[test]
+    fn empty_chat_is_restored_after_server_switch() {
+        let mut app=D4c::default();
+        app.preferences.connections=vec![preferences::Connection{name:"A".into(),url:"wss://a.example".into()},preferences::Connection{name:"B".into(),url:"wss://b.example".into()}];
+        app.url="wss://a.example".into();app.session="empty-chat-a".into();
+        app.reset_connection(1,String::new());
+        assert!(app.server_views.iter().any(|(url,v)|url=="wss://a.example" && v.session=="empty-chat-a"));
+        app.reset_connection(0,String::new());assert_eq!(app.session,"empty-chat-a");assert!(app.messages.is_empty());
+    }
+    #[test]
+    fn switching_servers_restores_its_own_recent_chat() {
+        let mut app = D4c::default();
+        app.preferences.connections=vec![preferences::Connection{name:"A".into(),url:"wss://a.example".into()},preferences::Connection{name:"B".into(),url:"wss://b.example".into()}];
+        app.preferences.selected=0;app.url="wss://a.example".into();app.session="chat-a".into();
+        app.messages.push(ChatMessage{media:vec![],role:"user".into(),text:"Server A".into(),item_id:Some("message:a".into())});
+        app.reset_connection(1,String::new());assert!(app.messages.is_empty());
+        app.session="chat-b".into();app.messages.push(ChatMessage{media:vec![],role:"user".into(),text:"Server B".into(),item_id:Some("message:b".into())});
+        app.reset_connection(0,String::new());assert_eq!(app.session,"chat-a");assert_eq!(app.messages[0].text,"Server A");
+        app.reset_connection(1,String::new());assert_eq!(app.session,"chat-b");assert_eq!(app.messages[0].text,"Server B");
+        assert!(app.gateway.is_none());
     }
     #[test]
     fn skeleton_fits_mobile_and_desktop() {

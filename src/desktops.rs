@@ -12,12 +12,17 @@ pub struct Desktops {
     rename: Option<(String, String)>,
     delete: Option<String>,
     viewer: Option<Viewer>,
+    pending_restore:Option<UiState>,
     focused_session: Option<String>,
     bound_desktop: Option<String>,
     bubble_positions: std::collections::HashMap<String, egui::Pos2>,
     choose_other: bool,
     pending_create: Option<PendingCreate>,
 }
+#[derive(Clone,Default)]
+pub(crate) struct UiState {positions:std::collections::HashMap<String,egui::Pos2>,viewer:Option<Placement>}
+#[derive(Clone)]
+struct Placement {id:String,bubble:Option<egui::Pos2>,expanded:bool,zoom:f32,fullscreen:bool,rect:Option<egui::Rect>}
 struct PendingCreate {
     session: String,
     name: String,
@@ -47,8 +52,38 @@ struct Viewer {
     initial_fit: bool,
     float_rect: Option<egui::Rect>,
 }
+fn desktop_skeleton(ui:&mut egui::Ui,width:u16,height:u16) {
+    let available=ui.available_size();
+    let size=egui::vec2(available.x.max(1.0),available.y.max(40.0).min(available.x*height as f32/width.max(1) as f32).max(1.0));
+    let (rect,_)=ui.allocate_exact_size(size,egui::Sense::hover());let painter=ui.painter();
+    painter.rect_filled(rect,8.0,egui::Color32::from_rgb(18,20,24));
+    let pulse=(22.0+8.0*(ui.input(|i|i.time) as f32*2.4).sin()) as u8;
+    let color=egui::Color32::from_white_alpha(pulse);
+    let bar=|x:f32,y:f32,w:f32,h:f32|egui::Rect::from_min_size(rect.min+egui::vec2(x,y),egui::vec2(w.max(1.0),h.max(1.0))).intersect(rect);
+    painter.rect_filled(bar(0.0,0.0,rect.width(),22.0),6.0,color);
+    for n in 0..3 {painter.circle_filled(rect.min+egui::vec2(12.0+n as f32*10.0,11.0),2.0,egui::Color32::from_white_alpha(65));}
+    if rect.height()>100.0 {
+        let inner=rect.shrink2(egui::vec2(14.0,36.0));
+        painter.rect_filled(inner,6.0,egui::Color32::from_white_alpha(7));
+        for (n,fraction) in [0.68,0.82,0.45,0.73].into_iter().enumerate(){
+            let y=inner.top()+18.0+n as f32*22.0;if y+8.0>inner.bottom(){break;}
+            painter.rect_filled(egui::Rect::from_min_size(egui::pos2(inner.left()+14.0,y),egui::vec2((inner.width()-28.0)*fraction,8.0)),4.0,color);
+        }
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(66));
+}
+impl Viewer {
+    fn pause(&mut self) { self.buttons=0;self.expanded=false;self.link=None;self.waiting_for_frame=true; }
+}
 impl Desktops {
+    pub(crate) fn capture_ui(&self)->UiState {
+        if let Some(state)=self.pending_restore.as_ref(){return state.clone();}
+        UiState {positions:self.bubble_positions.clone(),viewer:self.viewer.as_ref().map(|v|Placement{id:v.id.clone(),bubble:v.bubble_pos,expanded:v.expanded,zoom:v.zoom,fullscreen:v.fullscreen,rect:v.float_rect})}
+    }
+    pub(crate) fn restore_ui(&mut self,state:UiState) {self.pending_restore=Some(state);}
+
     pub fn connect(&mut self, url: &str, ctx: &egui::Context) {
+        if self.pending_restore.is_none() && self.viewer.is_some(){self.pending_restore=Some(self.capture_ui());}
         self.viewer = None;
         self.focused_session = None;
         self.bound_desktop = None;
@@ -78,6 +113,8 @@ impl Desktops {
         if self.focused_session.as_deref() == Some(session) && self.bound_desktop == id {
             return;
         }
+        let restored=self.pending_restore.take();
+        if let Some(state)=restored.as_ref(){self.bubble_positions=state.positions.clone();}
         if let Some(old) = self.viewer.take() {
             if old.buttons != 0 {
                 self.workspace.rpc(
@@ -99,6 +136,10 @@ impl Desktops {
             self.view(&desktop, url, ctx);
             if let Some(v) = self.viewer.as_mut() {
                 v.bubble_pos = self.bubble_positions.get(session).copied();
+                if let Some(placement)=restored.and_then(|s|s.viewer).filter(|p|p.id==v.id) {
+                    v.bubble_pos=placement.bubble;v.zoom=placement.zoom;v.fullscreen=placement.fullscreen;v.float_rect=placement.rect;v.reset_float=placement.rect.is_some();v.expanded=placement.expanded;
+                    if v.expanded {v.link=Some(workspace::connect(v.base.clone(),Some(v.id.clone()),ctx.clone()));}
+                }
             }
         }
     }
@@ -550,19 +591,22 @@ impl Desktops {
 
             ui.spacing_mut().item_spacing=egui::vec2(6.0,6.0);
             ui.horizontal(|ui|{
-                let actions=if mobile{174.0}else{190.0};
+                let actions=if mobile{210.0}else{226.0};
                 let width=(ui.available_width()-actions).max(70.0);
                 ui.allocate_ui_with_layout(egui::vec2(width,40.0),egui::Layout::top_down(egui::Align::LEFT),|ui|{
                     ui.set_width(width);ui.set_min_height(40.0);
                     ui.horizontal(|ui|{ui.label(icon_text(lucide_icons::Icon::Monitor,15.0));ui.add(egui::Label::new(egui::RichText::new(&v.name).size(14.0).strong()).truncate());});
                     ui.horizontal(|ui|{
-                        if in_use&&!human{ui.add(egui::Spinner::new().size(10.0));}
+                        if in_use&&!human{ui.label(egui::RichText::new("●").size(9.0).color(egui::Color32::from_rgb(143,191,178)));}
                         let status=if own{"Your control"}else if human{"Human control"}else if in_use{"Computer in use"}else{"Agent mode"};
                         ui.label(egui::RichText::new(status).size(10.0).color(if human{egui::Color32::from_rgb(223,187,121)}else{egui::Color32::from_rgb(143,191,178)}));
                     });
                 });
-                if ui.add_enabled(!pending_control,egui::Button::new(egui::RichText::new(if human{"Return to agent"}else{"Take over"}).size(11.0)).min_size(egui::vec2(if mobile{86.0}else{102.0},36.0))).clicked(){
+                if ui.add_enabled(!pending_control && self.workspace.ready && self.workspace.status=="Online" && (stream_live||human),egui::Button::new(egui::RichText::new(if human{"Return to agent"}else{"Take over"}).size(11.0)).min_size(egui::vec2(if mobile{86.0}else{102.0},36.0))).clicked(){
                     self.workspace.rpc(if human{"desktop.return_agent"}else{"desktop.claim"},json!({"id":v.id}));v.last_claim=std::time::Instant::now();own=false;v.buttons=0;
+                }
+                if ui.add(egui::Button::new(icon_text(lucide_icons::Icon::RotateCw,16.0)).frame(false).min_size(egui::vec2(32.0,36.0))).on_hover_text(&v.status).clicked(){
+                    if let Some(link)=v.link.as_ref(){link.reconnect();}v.waiting_for_frame=true;v.status="Reconnecting…".into();
                 }
                 if ui.add(egui::Button::new(icon_text(if v.fullscreen{lucide_icons::Icon::Minimize}else{lucide_icons::Icon::Maximize},16.0)).frame(false).min_size(egui::vec2(32.0,36.0))).on_hover_text(if v.fullscreen{"Restore window"}else{"Fullscreen"}).clicked(){v.fullscreen=!v.fullscreen;if !v.fullscreen{v.reset_float=true;}}
                 if ui.add(egui::Button::new(icon_text(lucide_icons::Icon::Minus,17.0)).frame(false).min_size(egui::vec2(32.0,36.0))).on_hover_text("Minimize to bubble").clicked(){close=true;}
@@ -588,18 +632,13 @@ impl Desktops {
                 if v.last_claim.elapsed()>std::time::Duration::from_secs(10){self.workspace.rpc("desktop.claim",json!({"id":v.id}));v.last_claim=std::time::Instant::now();}
             }
             if !stream_live {
-                ui.horizontal_wrapped(|ui| {
-                    ui.add(egui::Spinner::new().size(14.0));
-                    let status = if v.status == "Online" { "Desktop disconnected. Reconnecting…" } else { &v.status };
-                    ui.label(egui::RichText::new(status).size(12.0));
-                    if ui.button("Reconnect").clicked() {
-                        if let Some(link) = v.link.as_ref() { link.reconnect(); }
-                        v.waiting_for_frame = true;
-                        v.status = "Reconnecting…".into();
-                    }
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(if v.texture.is_some(){"Reconnecting"}else{"Connecting"}).size(11.0).weak());
+                    crate::loading_bar(ui, 70.0, 3.0);
                 });
-                if v.texture.is_some() { ui.label(egui::RichText::new("Last received image — waiting for live desktop").small().weak()); }
+                if v.status.starts_with("Approve") || v.status.contains("authentication") {ui.colored_label(egui::Color32::LIGHT_RED,&v.status);}
             }
+            if v.texture.is_none() {desktop_skeleton(ui,v.width,v.height);}
             if !self.workspace.error.is_empty(){ui.colored_label(egui::Color32::LIGHT_RED,&self.workspace.error);}
             if let Some(texture)=v.texture.as_ref(){
                 let available=ui.available_size().max(egui::vec2(100.0,100.0));
@@ -607,7 +646,7 @@ impl Desktops {
                 let size=egui::vec2(v.width as f32*ratio,v.height as f32*ratio);
                 egui::ScrollArea::both().id_salt(("vnc_pan",&v.id)).auto_shrink([false,false]).scroll_source(egui::scroll_area::ScrollSource{scroll_bar:true,drag:if mobile&&!v.touch_control||!own{egui::scroll_area::DragScroll::Always}else{egui::scroll_area::DragScroll::Never},mouse_wheel:!own||mobile&&!v.touch_control}).show(ui,|ui|{
                     let interactive=own && (!mobile||v.touch_control);
-                    let response=ui.add(egui::Image::new((texture.id(),size)).sense(if interactive{egui::Sense::click_and_drag()}else{egui::Sense::hover()}));
+                    let response=ui.add(egui::Image::new((texture.id(),size)).tint(if stream_live {egui::Color32::WHITE}else{egui::Color32::from_gray(145)}).sense(if interactive{egui::Sense::click_and_drag()}else{egui::Sense::hover()}));
                     if interactive {
                         if response.clicked()||response.drag_started(){response.request_focus();}
                         let events=ctx.input(|i|i.events.clone());
@@ -631,7 +670,7 @@ impl Desktops {
                         }}}
                     }
                 });
-            }else{ui.allocate_space(egui::vec2(ui.available_width(),(default_size.y-132.0).max(80.0)));}
+            }
         });
         if !was_fullscreen {
             if let Some(shown) = shown {
@@ -645,10 +684,7 @@ impl Desktops {
                     json!({"id":v.id,"type":"pointer","x":0,"y":0,"buttons":0}),
                 );
             }
-            v.buttons = 0;
-            v.expanded = false;
-            v.link = None;
-            v.texture = None;
+            v.pause();
             ctx.request_repaint();
         }
     }
@@ -744,6 +780,44 @@ mod tests {
             );
         }
         desktops
+    }
+    #[test]
+    fn quick_switch_keeps_pending_viewer_placement() {
+        let mut d=Desktops::default();
+        let state=UiState{positions:std::collections::HashMap::from([("chat".into(),egui::pos2(50.0,80.0))]),viewer:Some(Placement{id:"desktop-a".into(),bubble:Some(egui::pos2(50.0,80.0)),expanded:true,zoom:1.5,fullscreen:true,rect:None})};
+        d.restore_ui(state);let captured=d.capture_ui();
+        assert_eq!(captured.positions["chat"],egui::pos2(50.0,80.0));
+        let v=captured.viewer.unwrap();assert_eq!(v.id,"desktop-a");assert!(v.expanded && v.fullscreen);assert_eq!(v.zoom,1.5);
+        d.connect("wss://localhost:9",&egui::Context::default());
+        assert_eq!(d.capture_ui().viewer.unwrap().id,"desktop-a");
+    }
+    #[test]
+    fn minimized_viewer_keeps_its_last_image() {
+        let ctx=egui::Context::default();let mut d=Desktops::default();
+        d.view(&json!({"id":"test","name":"Desktop"}),"wss://a.example",&ctx);
+        let v=d.viewer.as_mut().unwrap();v.texture=Some(ctx.load_texture("retained",egui::ColorImage::new([1,1],vec![egui::Color32::BLACK]),egui::TextureOptions::LINEAR));v.expanded=true;v.pause();
+        assert!(v.texture.is_some());assert!(!v.expanded);assert!(v.waiting_for_frame);assert!(v.link.is_none());
+    }
+    #[test]
+    fn viewer_does_not_grow_between_frames() {
+        let ctx=egui::Context::default();let mut d=Desktops::default();
+        d.view(&json!({"id":"test","name":"Desktop"}),"wss://a.example",&ctx);
+        let v=d.viewer.as_mut().unwrap();v.expanded=true;
+        let mut first=0.0;
+        for frame in 0..60 {
+            let mut output=ctx.run_ui(egui::RawInput{screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(1440.0,900.0))),..Default::default()},|ui|{d.viewer_ui(ui.ctx());});output.textures_delta.clear();
+            let height=d.viewer.as_ref().unwrap().float_rect.unwrap().height();
+            if frame==5{first=height;}if frame>5{assert!(height<=first+1.0,"viewer grew from {first} to {height}");} assert!(height<=680.0,"unexpected height {height}");
+        }
+    }
+    #[test]
+    fn desktop_skeleton_fits_phone_and_desktop() {
+        for width in [320.0,390.0,900.0] {
+            let ctx=egui::Context::default();let mut used=egui::Rect::NOTHING;
+            let mut output=ctx.run_ui(egui::RawInput{screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(width,300.0))),..Default::default()},|ui|{
+                desktop_skeleton(ui,1280,800);used=ui.min_rect();
+            });output.textures_delta.clear();assert!(used.max.x<=width && used.max.y<=300.0);
+        }
     }
     #[test]
     fn reopening_bound_chat_restores_bubble_without_video_connection() {
