@@ -22,7 +22,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             connections: vec![Connection {
-                name: "OpenClaw".into(),
+                name: "Codex".into(),
                 url: String::new(),
             }],
             selected: 0,
@@ -75,8 +75,8 @@ impl Settings {
                         (value["model"].as_str(), value["thinking"].as_str())
                     {
                         if model.len() <= 256
-                            && ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
-                                .contains(&thinking)
+                            && thinking.len() <= 64
+                            && !thinking.chars().any(char::is_control)
                         {
                             s.model_defaults
                                 .insert(url.clone(), (model.into(), thinking.into()));

@@ -1,0 +1,11 @@
+[Unit]
+Description=D4C paired chat on tailnet port %i
+After=tailscaled.service
+Requires=tailscaled.service
+
+[Socket]
+BindToDevice=tailscale0
+ListenStream=%i
+
+[Install]
+WantedBy=sockets.target

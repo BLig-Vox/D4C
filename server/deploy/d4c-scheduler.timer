@@ -1,0 +1,11 @@
+[Unit]
+Description=Check D4C scheduled tasks
+
+[Timer]
+OnBootSec=10s
+OnUnitInactiveSec=5s
+AccuracySec=1s
+Unit=d4c-scheduler.service
+
+[Install]
+WantedBy=timers.target

@@ -1,271 +1,141 @@
-# Server setup
+# Set up a D4C server
 
-This guide targets Linux with systemd, rootless Podman and Tailscale. Examples use
-`gateway.example.ts.net` and `100.64.0.10`; replace them with your own values.
-OpenClaw 2026.11.5 and Codex CLI 0.169.0 were used during development. Check the
-linked upstream guides before upgrading; their configuration interfaces can change.
+D4C connects to a paired TLS manager. The manager forwards native chat traffic to a persistent Codex app server over a private Unix socket. The same manager serves workspace data and desktops. Install the server components once on each host, then pair each desktop or phone.
 
-## 1. OpenClaw and Codex authentication
+## Prepare the host
 
-Install a supported Node.js/npm release and OpenClaw on the server. Use a dedicated
-Unix account for your Gateway and agent workspace. Sign into Tailscale on both the
-server and every client device. Keep your D4C checkout available on the server.
+Use Linux with systemd, Tailscale, Python 3, Node.js/npm and Codex CLI. The service templates were exercised with systemd 262 and Codex CLI 0.169.0. Install the distribution packages for rootless Podman, Quadlet, pasta, subordinate UID/GID mappings and a user DBus session for desktops. Install Python's `croniter` and `websocket-client` for the scheduler. Check that the system Python can import both.
 
-```sh
-npm install -g openclaw@2026.11.5
-openclaw onboard --classic
-```
+Enable HTTPS certificates for your tailnet, sign in with Tailscale on each device, and allow the intended clients to reach the server's private ports. Use the server's complete Tailscale DNS name for TLS.
 
-In onboarding, choose your provider and model, complete its browser/device-code
-sign-in, configure a local Gateway and workspace, and install the background service.
-For OpenAI/Codex-backed operation, choose the offered OpenAI/device-code route and
-authorized Codex runtime. If your installation requires the standalone Codex CLI,
-install it according to its own official instructions and complete `codex login`
-as the same Unix user. A D4C client token is a Gateway credential; it does not
-replace provider authentication. Never send provider passwords or API keys in chat.
-
-Confirm the service and available models from the server:
-
-```sh
-openclaw gateway status
-openclaw models list
-openclaw devices list
-```
-
-Use `openclaw configure` to adjust an existing installation. D4C discovers the
-Gateway's model catalogue; it does not carry a fixed model allowlist. The Gateway's
-provider access, model policy and Codex runtime determine which models work. A model name in a manually configured list is not proof that the signed-in account can use it.
-
-For Codex-routed OpenAI entries, compare against `models_cache.json` in the **actual
-runtime's CODEX_HOME** after authenticating and refreshing its catalog. This helper
-rejects stale/empty catalogs, preserves other providers and runtimes, and makes a
-backup before applying a change:
-
-```sh
-python3 scripts/sync-codex-models.py --config /path/to/openclaw.json --catalog /path/to/runtime/models_cache.json
-# Review the proposed additions/removals, then run with --apply.
-```
-
-Run as the Gateway's Unix account. The helper updates configured model entries;
-it does not grant provider access or silently rewrite conversation model choices.
-Select an available model in the composer for conversations using a removed model.
-
-
-Configure managed private ingress during onboarding/configuration with these
-Gateway settings (merge with your existing configuration):
-
-```json
-{
-  "gateway": {
-    "bind": "loopback",
-    "tailscale": { "mode": "serve" }
-  }
-}
-```
-
-Keep Gateway authentication enabled. Give the Gateway account the Tailscale
-operator privileges required by your deployment. HTTPS certificates/Serve must be
-enabled in the tailnet. Use OpenClaw's managed Serve setup so its listener owns the
-route; do not overwrite another service's existing route. An alternative trusted
-TLS reverse proxy requires the upstream trusted-proxy settings and credentials.
-D4C requires `wss://`; a bare tailnet IP with plain `ws://` is not accepted.
-
-See [OpenClaw getting started](https://docs.openclaw.ai/start/getting-started) and
-[managed Tailscale ingress](https://docs.openclaw.ai/gateway/tailscale) for the
-complete authentication and service setup.
-
-## 2. Pair D4C
-
-In D4C, open Settings, add `wss://gateway.example.ts.net`, save and switch to it.
-If token authentication is required, enter the Gateway token in the password field.
-It stays in memory for the current connection; server URLs never contain tokens.
-Then, as the Gateway user:
-
-```sh
-openclaw devices list
-openclaw devices approve REQUEST_ID
-```
-
-Approve only the request belonging to your device. Reconnect in D4C. Requested
-operator scopes must be approved by your Gateway; scheduling writes need
-`operator.admin` in the development baseline. Pair each client independently.
-No private identity file should be copied between desktop and phone.
-
-Chat/transcript persistence is already server-side through OpenClaw. Continue with
-the manager for shared drafts, notification/read state and persistent desktops.
-
-## 3. Persistent workspace and desktops
-
-Run administrative commands on the **server**, not on the Android device. The
-manager and OpenClaw Gateway can live on the same host. For the first alpha, the
-desktop plugin communicates over a local Unix socket, so a remote manager needs
-its own colocated Gateway/plugin; there is no cross-host raw IPC tunnel.
-
-Install build tools, rootless Podman (with Quadlet and pasta), uidmap, dbus-user-session,
-Python 3 and Tailscale using your distribution's packages. Create the dedicated
-manager account and persistent user instance:
+Run the following from the unpacked server release or the repository root. Examples use GNU utilities and a shell with a dedicated `d4c` account. Create the account once on a fresh host.
 
 ```sh
 sudo useradd --create-home --shell /bin/bash d4c
 sudo loginctl enable-linger d4c
+sudo npm install --global --prefix /usr @openai/codex@0.169.0
+/usr/bin/codex --version
+/usr/bin/python3 -c 'import croniter, websocket'
+sudo install -m 0755 bin/vox-d4c-server /usr/local/bin/d4c-server
 ```
 
-Check that `/etc/subuid` and `/etc/subgid` contain non-overlapping ranges for `d4c`.
-Its user systemd instance and rootless Podman must work before starting the manager.
-Build the binaries through the memory guard:
+For a source checkout, build the manager with the project's memory guard and install the resulting binary in place of the release binary.
 
 ```sh
-python3 scripts/build-limited.py --limit-mb 2000 -- \
-  cargo build --manifest-path server/Cargo.toml --locked -j 1
+python3 scripts/build-limited.py --limit-mb 2000 -- cargo build --manifest-path server/Cargo.toml --locked -j 1
 sudo install -m 0755 server/target/debug/vox-d4c-server /usr/local/bin/d4c-server
 ```
 
-Build the desktop image **as d4c**, under its rootless Podman store. Run from this
-checkout, which must be readable by that account:
+Check that the `d4c` account has non-overlapping ranges in `/etc/subuid` and `/etc/subgid`. Build the desktop image in that account's Podman store from a directory it can read.
 
 ```sh
-D4C_UID=$(id -u d4c)
-sudo -u d4c env XDG_RUNTIME_DIR=/run/user/"$D4C_UID" \
-  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/"$D4C_UID"/bus \
+d4c_uid=$(id -u d4c)
+sudo -u d4c env HOME="$(getent passwd d4c | cut -d: -f6)" XDG_RUNTIME_DIR="/run/user/$d4c_uid" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$d4c_uid/bus" \
   podman build -t localhost/d4c-arch-xfce:1 server/desktop
 ```
 
-Package installation/image builds also use memory; perform them when your server
-has sufficient headroom. Rust's build guard does not cap an unrelated Podman build.
+## Install the manager, Codex and scheduler
 
-Render templates using the Unix user that actually runs OpenClaw:
-
-```sh
-python3 scripts/configure-server.py \
-  --hostname gateway.example.ts.net \
-  --listen 100.64.0.10:8443 \
-  --openclaw-user YOUR_GATEWAY_USER
-```
-
-The renderer discovers the `d4c` UID/home and the Gateway UID. Review
-`target/deploy/manager.json` and the generated services. Default paths are
-`/etc/d4c`, `/var/lib/d4c` and `/run/d4c`; edit generated files together if you
-choose other paths. `hostname` must match the manager TLS certificate. Only
-loopback and Tailscale listen addresses are accepted.
+Replace the example hostname and address with values for this host. These commands install a **fresh configuration**. For an existing manager, retain its database, TLS keys and other settings, back up its configuration, and merge the `codexSocket` setting from the generated file. Keep its device approvals and desktop data in place.
 
 ```sh
+python3 scripts/configure-server.py --hostname gateway.example.ts.net --listen 100.64.0.10:8443
 sudo install -d -m 0750 -o root -g d4c /etc/d4c /etc/d4c/tls
-sudo install -d -m 0700 -o d4c -g d4c /var/lib/d4c
+sudo install -d -m 0700 -o d4c -g d4c /var/lib/d4c /var/lib/d4c/codex /var/lib/d4c/uploads /var/lib/d4c/schedules
 sudo install -m 0640 -o root -g d4c target/deploy/manager.json /etc/d4c/manager.json
-sudo install -m 0644 target/deploy/d4c-*.service target/deploy/d4c-*.timer /etc/systemd/system/
+sudo install -m 0644 target/deploy/*.service target/deploy/*.socket target/deploy/*.timer target/deploy/*.path /etc/systemd/system/
+sudo install -m 0644 target/deploy/d4c-codex-tmpfiles.conf /etc/tmpfiles.d/d4c-codex.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/d4c-codex.conf
+sudo install -D -m 0755 server/scripts/d4c-scheduler.py /usr/local/libexec/d4c-scheduler
+sudo install -D -m 0755 server/scripts/d4c-refresh-codex.py /usr/local/libexec/d4c-refresh-codex.py
 sudo systemctl daemon-reload
 sudo systemctl start d4c-certificate.service
-sudo systemctl enable --now d4c-certificate.timer d4c-manager.service
 ```
 
-The certificate job obtains a tailnet certificate, grants the manager group read
-access to its key, and renewal restarts only the manager. Restrict tailnet ACLs to
-the intended devices. The supplied systemd service caps manager resources and
-enables the dedicated user's bus; no machine-specific numeric UID is shipped.
+Codex 0.169.0 creates a mode-0600 Unix socket under a private per-user directory in `/tmp` and links `/run/d4c-codex/app.sock` to it. The tmpfiles rule creates this directory on boot. The service shares this directory across its private mount namespace. Its work directory is `/var/lib/d4c/codex/workspace`. Uploaded attachments appear read-only at `/var/lib/d4c/uploads`.
 
-### Pair the workspace service
+### Migrate an existing OpenClaw host
 
-D4C defaults to the same DNS hostname on port 8443. Use Settings → Workspace server
-to save a different secure URL for the selected Gateway. Save and reconnect; each
-client stores this override locally. Pair it separately on the manager:
+For a migration, complete this step **before** creating the new workspace or launching the Codex service. Wait for active work to finish, take the final snapshot while the legacy service is idle, then stop and disable its gateway and schedule workers. Use the paths for the actual gateway account. Each snapshot destination must be new. Keep the source data and verified snapshot available for recovery.
+
+```sh
+sudo python3 scripts/stage-codex.py /var/lib/d4c/migration/cutover-01 \
+  --openclaw /path/to/gateway-account/.openclaw --workspace /var/lib/d4c/workspace.sqlite
+sudo python3 scripts/activate-codex-home.py /var/lib/d4c/migration/cutover-01 \
+  --workspace /path/to/gateway-account/.openclaw/workspace
+```
+
+Before starting Codex, import the native thread aliases into the manager and register the scoped D4C tools in existing rollout metadata. Keep the app server stopped while rewriting rollout metadata.
+
+```sh
+sudo -u d4c /usr/local/bin/d4c-server --import-aliases /var/lib/d4c/codex/migration-manifest.json
+sudo -u d4c /usr/local/bin/d4c-server --migrate-codex-tools /var/lib/d4c/codex
+```
+
+The activation script verifies recorded native rollout hashes, copies the workspace, and rewrites thread paths to the new home. Its optional `--migrate-openai-profile` flag imports an unambiguous OpenAI profile from the private snapshot. When authentication is missing or expired, sign in as described below. Retain the original provider and schedule data until you have verified conversations and scheduled tasks on the new host.
+
+Import the archived jobs and run receipts before starting the timer. The final snapshot can contain credentials, so read it as its existing owner. Give the service account ownership of its new scheduler store. Jobs whose legacy target cannot run natively retain a migration error and stay disabled.
+
+```sh
+sudo /usr/local/libexec/d4c-scheduler import /var/lib/d4c/migration/cutover-01
+sudo chown -R d4c:d4c /var/lib/d4c/schedules
+```
+
+### Set up the working directory, Ponytail and authentication
+
+Install the bundled skill. On an existing installation, retain local skill changes and merge the default instruction into the existing `AGENTS.md`.
+
+```sh
+d4c_codex=/var/lib/d4c/codex
+sudo install -d -m 0700 -o d4c -g d4c "$d4c_codex/workspace" "$d4c_codex/skills" "$d4c_codex/skills/ponytail"
+sudo install -m 0600 -o d4c -g d4c vendor/ponytail/skills/ponytail/SKILL.md vendor/ponytail/LICENSE "$d4c_codex/skills/ponytail/"
+printf '%s\n' 'Use the bundled Ponytail skill in full mode by default for coding work. Honor requests to switch levels or turn Ponytail off.' \
+  | sudo -u d4c tee -a "$d4c_codex/AGENTS.md" >/dev/null
+sudo -u d4c env HOME="$d4c_codex" CODEX_HOME="$d4c_codex" /usr/bin/codex login status
+```
+
+If the account needs authentication, run the following on the host and complete the device sign-in in a browser. Credentials belong to this host's Codex account. D4C clients authenticate with their device keys.
+
+```sh
+sudo -u d4c env HOME=/var/lib/d4c/codex CODEX_HOME=/var/lib/d4c/codex /usr/bin/codex login --device-auth
+```
+
+Start the persistent units. The scheduler timer runs once per host and owns its local job store.
+
+```sh
+sudo systemctl enable --now d4c-certificate.timer d4c-manager.service d4c-codex.service d4c-scheduler.timer d4c-refresh.path
+sudo systemctl is-active d4c-manager.service d4c-codex.service d4c-scheduler.timer d4c-refresh.path
+sudo stat -Lc '%a %U %G %n' /run/d4c-codex/app.sock
+```
+
+The `d4c-refresh.path` unit watches the Codex MCP configuration and skills directory. It invokes the native MCP reload and refreshes skill discovery. To request a refresh explicitly, run `sudo systemctl start d4c-refresh.service` and check its journal.
+
+## Connect and pair devices
+
+Use `wss://gateway.example.ts.net:8443/codex` for direct chat. The same TLS listener serves the workspace API at `/control` and desktop viewers at `/vnc/<desktop-id>`. The root path also serves paired chat. Native clients answer a nonce challenge before receiving any app-server traffic.
+
+To keep a saved URL such as `wss://gateway.example.ts.net:8444/`, enable a socket relay for that port. For a saved HTTPS default port, use `443` in place of `8444`. Confirm that the port is free before enabling the relay. On a host with a legacy Tailscale Serve route, inspect `tailscale serve status` and retire only the chat handler on the chosen port. Keep unrelated HTTPS and VNC routes in place.
+
+```sh
+sudo systemctl enable --now d4c-chat@8444.socket
+systemctl show d4c-chat@8444.socket -p BindToDevice
+```
+
+The socket is bound to `tailscale0` and forwards the encrypted connection to the manager. The manager presents its certificate and enforces the same device approval on both ports.
+
+In D4C Settings, save and select the server URL. Attempt a connection, compare the client fingerprint with the pending device on the server, then approve that fingerprint and reconnect.
 
 ```sh
 sudo -u d4c /usr/local/bin/d4c-server --config /etc/d4c/manager.json --list-devices
 sudo -u d4c /usr/local/bin/d4c-server --config /etc/d4c/manager.json --approve DEVICE_ID
 ```
 
-The fingerprint comes from D4C's connection status. The approval command and the
-running manager must use the same configuration/database. Open the chat workspace
-panel to create or attach a desktop. `/vnc connect NAME` binds it to that chat.
-Tap the floating monitor bubble to open it, drag the bubble freely, and minimize
-with the viewer's minus button. Take over pauses agent input server-side; explicitly
-Return to agent when finished. Closing/minimizing a viewer keeps its desktop running.
+## Verify the deployment
 
-### Connect OpenClaw's desktop tools
+1. Send a short chat, confirm a response, then reopen its thread from a second paired client. For a migration, open an existing conversation and confirm its history.
+2. Open the workspace panel, create or attach a desktop, then open its viewer. Take over pauses agent input. Select **Return to agent** when finished. Closing the viewer leaves the desktop running.
+3. Create a disabled schedule in Tasks, check the prompt and timing, then run it manually. Open its run history.
+4. Check service logs with `journalctl -u d4c-manager -u d4c-codex -u d4c-scheduler`. If local history works but a turn fails at the model provider, check the Codex login for the service account.
 
-Allow the Gateway's Unix account to access the manager's private socket:
-
-```sh
-sudo usermod -aG d4c YOUR_GATEWAY_USER
-```
-
-A new login/service process must acquire the group membership. Do this during
-initial setup before starting the Gateway, or arrange a planned Gateway restart
-when no work is active. Do not make the socket world-writable. The manager's
-`observerUid` must be the Gateway account's actual UID; the renderer sets it.
-
-As the Gateway account, install the local plugin:
-
-```sh
-openclaw plugins install --force /absolute/path/to/D4C/server/openclaw-plugin
-openclaw plugins enable d4c-desktops
-```
-
-The plugin also keeps D4C schedules isolated from interactive conversations. Native
-`cron`/`automations` add and update calls from a D4C chat use an isolated session
-and no fallback delivery into the live transcript. Their originating owner is
-retained. Completed runs enter the manager as notifications without changing the
-owner chat's active run. Tasks history remains available in the chat workspace.
-
-After upgrading an existing deployment, run this once **on the Gateway server**
-from a copy of this repository:
-
-```sh
-python3 scripts/isolate-scheduled-chats.py
-```
-
-It uses supported Gateway RPCs with revision checks to migrate only schedules
-owned by D4C chats, keeping names, prompts, enabled state, schedule and owner.
-It does not restart the Gateway. Direct administrator CLI/RPC scheduling bypasses
-the agent tool policy; use `sessionTarget: isolated` and `delivery.mode: none`
-when deliberately managing D4C schedules through those interfaces.
-
-Use upstream's supported plugin activation/reload procedure, outside an active
-agent turn. If you changed the socket path, set `D4C_SOCKET` in the Gateway service
-environment before activating. `OPENCLAW_STATE_DIR` controls plugin screenshot/outbox
-storage. Agent tool policy must permit the `desktop_*` tools; D4C cannot override
-that policy. Bind a desktop before asking the assistant to inspect or control it.
-
-## 4. Connect MCP services
-
-Install and use the [idle MCP queue](mcp.md). It is separate from the desktop tools
-plugin: it configures OpenClaw's native MCP registry and requires no client plugin.
-Public/Bearer HTTPS Streamable HTTP and SSE are supported by its discovery step;
-OAuth stays in the native account flow. Do not restart the Gateway for each new
-MCP request, and do not claim a queued connection is applied.
-
-## 5. Check your deployment
-
-- Confirm a short chat streams and the expected model is available.
-- Send a message from phone and confirm it appears on another paired client.
-- Pair the manager, create a desktop and check screenshot delivery and takeover.
-- Ask for a paused schedule and inspect it in the chat's Tasks panel before enabling it.
-- In Settings, send a test notification and check Android's permission/channel settings.
-- Connect an MCP with minimal permissions, check its applied receipt, then request
-  an authorized read-only tool call.
-
-The queue and server state survive client closure. Android background delivery
-uses a visible foreground service and remains subject to battery policy, network
-availability and force-stop. A failed remote endpoint still needs operator action;
-see [MCP failure and recovery](mcp.md#failure-and-recovery).
-
-## Codex connection recovery
-
-The desktop plugin also handles Codex app-server request timeouts on Linux.
-It waits for tracked agent turns (including other agents and scheduled work) to
-finish, then sends SIGTERM only to direct children of its Gateway whose executable
-and CODEX_HOME match the affected agent's managed Codex runtime. Manual Codex
-clients, desktops and the Gateway remain running. New turns wait for an in-progress
-refresh. Connections are reopened by OpenClaw on the next request.
-
-Recovery is limited to one attempt every two minutes and three per hour per agent;
-failed attempts count. A healthy turn cancels a queued refresh for that agent.
-Results appear in the originating chat's notifications. Retry the message after
-recovery: prompts and tool actions are never replayed automatically. Model-not-found
-errors and ordinary tool timeouts do not trigger this recovery. A missing/changed
-managed runtime or insufficient permissions requires operator intervention.
-
-After updating Codex, an already-running Gateway may still hold the older runtime.
-Activate a new runtime only while conversations are idle. The model reconciliation
-helper is an explicit administrator operation; it refuses to guess a replacement
-default when an allow/deny policy restricts model selection.
+For connected tools and authentication, see the [MCP guide](mcp.md).

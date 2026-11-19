@@ -146,6 +146,11 @@ struct D4c {
     defaults_dirty: bool,
     model: String,
     models: Vec<String>,
+    model_efforts: std::collections::HashMap<String, (Vec<String>, String)>,
+    reload_request: Option<(String, String)>,
+    sent_requests: std::collections::HashMap<String, Value>,
+    pending_rekeys: std::collections::HashMap<String, String>,
+    last_rekey: Option<std::time::Instant>,
     thinking: String,
     running: bool,
     attachments: Vec<(String, String, Vec<u8>)>,
@@ -214,8 +219,7 @@ impl Default for D4c {
             gateway: None,
             status: "Not connected".into(),
             connected: false,
-            session: remembered
-                .unwrap_or_else(|| format!("agent:main:d4c-{}", uuid::Uuid::new_v4())),
+            session: remembered.unwrap_or_else(|| format!("draft:{}", uuid::Uuid::new_v4())),
             sessions: vec![],
             session_search: String::new(),
             deleted_sessions: Default::default(),
@@ -238,6 +242,11 @@ impl Default for D4c {
             defaults_dirty: false,
             model: default_model,
             models: vec![],
+            model_efforts: Default::default(),
+            reload_request: None,
+            sent_requests: Default::default(),
+            pending_rekeys: Default::default(),
+            last_rekey: None,
             thinking: default_thinking,
             running: false,
             attachments: Vec::new(),
@@ -272,6 +281,11 @@ impl D4c {
     fn reconnect(&mut self, ctx: &egui::Context) {
         self.workspace_hydrated = false;
         self.questions.disconnected();
+        for (_, params) in std::mem::take(&mut self.pending_sends) {
+            self.restore_unsent(&params);
+        }
+        self.sent_requests.clear();
+        self.reload_request = None;
         self.selection_pending.clear();
         self.selection_edited.clear();
         self.delete_chat = None;
@@ -279,7 +293,7 @@ impl D4c {
         (self.model, self.thinking) = self.preferences.defaults(&self.url);
         if !preferences::valid_url(&self.url) {
             self.settings_open = true;
-            self.status = "Add your OpenClaw server in Settings".into();
+            self.status = "Add your Codex server in Settings".into();
             return;
         }
         self.desktops.connect(&self.url, ctx);
@@ -356,8 +370,7 @@ impl D4c {
         let mut next = Self::default();
         next.server_views = views;
         next.servers = servers;
-        next.session =
-            remembered.unwrap_or_else(|| format!("agent:main:d4c-{}", uuid::Uuid::new_v4()));
+        next.session = remembered.unwrap_or_else(|| format!("draft:{}", uuid::Uuid::new_v4()));
         next.explicit_selection = true;
         next.url = preferences.current().url.clone();
         next.center = activity::Center::load(&next.url);
@@ -417,6 +430,8 @@ impl D4c {
         preferences::write(&server_draft_file(&self.url), &value)
     }
     fn restore_server_drafts(&mut self) {
+        let rekeys = preferences::read(&format!("rekeys-{}", server_draft_file(&self.url)));
+        self.pending_rekeys = serde_json::from_value(rekeys).unwrap_or_default();
         for item in preferences::read(&server_draft_file(&self.url))
             .as_array()
             .into_iter()
@@ -473,6 +488,12 @@ impl D4c {
     }
     fn switch_with_token(&mut self, index: usize, ctx: &egui::Context, token: String) {
         if index >= self.preferences.connections.len() {
+            return;
+        }
+        if !self.pending_sends.is_empty() || !self.sent_requests.is_empty() {
+            self.settings_error =
+                "Waiting for Codex to accept the message before switching servers".into();
+            self.composer_error = self.settings_error.clone();
             return;
         }
         if let Err(error) = self.save_server_drafts() {
@@ -548,11 +569,12 @@ impl D4c {
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui|{
                 if ui.button(if self.connected{"Reconnect"}else{"Connect"}).clicked(){self.reconnect(ui.ctx());}
+                if ui.add_enabled(self.can_reload(), egui::Button::new("Reload current session")).on_hover_text("Refresh Codex tools and skills while the chat is idle").clicked() { self.reload_session(); }
                 if self.gateway.is_some()&&ui.button("Disconnect").clicked(){self.gateway=None;self.connected=false;self.running=false;self.active_sessions.clear();self.live.clear();self.status="Disconnected".into();self.cron.disconnected();}
             });
-            ui.label(egui::RichText::new(&self.status).small().weak());
+            ui.add(egui::Label::new(egui::RichText::new(&self.status).small().weak()).wrap().selectable(true));
             ui.add_space(6.0);
-            ui.add(egui::TextEdit::singleline(&mut self.token).password(true).hint_text("Token, if required · never saved").desired_width(f32::INFINITY));
+            ui.label(egui::RichText::new("New devices need approval on the D4C server.").small().weak());
             ui.add_space(12.0);
             if preferences::valid_url(&self.url) {
                 egui::CollapsingHeader::new("Workspace server").show(ui, |ui| {
@@ -797,6 +819,132 @@ impl D4c {
         g.tx.send(request).ok()?;
         Some(id)
     }
+    fn dispatch_send(&mut self, params: Value) -> bool {
+        if let Some(id) = self.rpc("chat.send", params.clone()) {
+            self.sent_requests.insert(id, params);
+            true
+        } else {
+            self.restore_unsent(&params);
+            self.composer_error = "Disconnected before sending".into();
+            false
+        }
+    }
+
+    fn can_reload(&self) -> bool {
+        self.connected
+            && self.reload_request.is_none()
+            && !self.history_loading
+            && !self.running
+            && !self.active_sessions.contains(&self.session)
+            && !self
+                .selection_pending
+                .values()
+                .any(|key| key == &self.session)
+            && uuid::Uuid::parse_str(&self.session).is_ok()
+    }
+
+    fn reload_session(&mut self) {
+        if self.can_reload() {
+            self.composer_error.clear();
+            self.reload_request = self
+                .rpc("sessions.reload", json!({"key":self.session}))
+                .map(|id| (id, self.session.clone()));
+        }
+    }
+
+    fn normalize_effort(&mut self) {
+        if let Some((levels, default)) = self.model_efforts.get(&self.model)
+            && !levels.contains(&self.thinking)
+        {
+            self.thinking = if levels.contains(default) {
+                default.clone()
+            } else {
+                levels.first().cloned().unwrap_or_default()
+            };
+        }
+    }
+
+    fn persist_rekeys(&mut self) {
+        let name = format!("rekeys-{}", server_draft_file(&self.url));
+        if let Err(err) = preferences::write(&name, &json!(self.pending_rekeys)) {
+            self.settings_error = format!("Could not preserve chat mapping: {err}");
+        }
+    }
+
+    fn adopt_session(&mut self, old: &str, new: &str) {
+        if old == new || uuid::Uuid::parse_str(new).is_err() {
+            return;
+        }
+        if self.active_sessions.remove(old) {
+            self.active_sessions.insert(new.into());
+        }
+        if self.selection_edited.remove(old) {
+            self.selection_edited.insert(new.into());
+        }
+        if let Some(settings) = self.session_settings.remove(old) {
+            self.session_settings.insert(new.into(), settings);
+        }
+        if let Some(live) = self.live.remove(old) {
+            self.live.insert(new.into(), live);
+        }
+        if let Some(title) = self.fallback_titles.remove(old) {
+            self.fallback_titles.entry(new.into()).or_insert(title);
+        }
+        if let Some(draft) = self.drafts.remove(old) {
+            let target = self.drafts.entry(new.into()).or_default();
+            if target.input.is_empty() {
+                target.input = draft.input;
+            } else if !draft.input.is_empty() && target.input != draft.input {
+                target.input.push_str("\n\n");
+                target.input.push_str(&draft.input);
+            }
+            target.attachments.extend(draft.attachments);
+        }
+        self.draft_queue.rekey(old, new);
+        for key in self
+            .selection_pending
+            .values_mut()
+            .chain(self.title_requests.values_mut())
+        {
+            if key == old {
+                *key = new.into();
+            }
+        }
+        for params in self
+            .pending_sends
+            .values_mut()
+            .chain(self.sent_requests.values_mut())
+        {
+            if params["sessionKey"] == old {
+                params["sessionKey"] = json!(new);
+            }
+        }
+        if let Some((key, _)) = &mut self.upload
+            && key == old
+        {
+            *key = new.into();
+        }
+        for (key, _, _) in self.media_requests.values_mut() {
+            if key == old {
+                *key = new.into();
+            }
+        }
+        if self.sessions.iter().any(|(key, _)| key == new) {
+            self.sessions.retain(|(key, _)| key != old);
+        } else if let Some((key, _)) = self.sessions.iter_mut().find(|(key, _)| key == old) {
+            *key = new.into();
+        }
+        if self.session == old {
+            self.session = new.into();
+            self.servers.select(&self.url, new);
+            self.history_request = None;
+            self.older_request = None;
+            self.history_loading = false;
+            self.rpc("sessions.messages.subscribe", json!({"key":new}));
+            self.history_dirty = true;
+        }
+    }
+
     fn refresh_sessions(&mut self) {
         if self.list_pending {
             self.list_dirty = true;
@@ -901,6 +1049,12 @@ impl D4c {
         self.history_request = None;
         self.history_loading = false;
         (self.model, self.thinking) = self.preferences.defaults(&self.url);
+        self.model = self
+            .model
+            .strip_prefix("openai/")
+            .unwrap_or(&self.model)
+            .into();
+        self.normalize_effort();
         if let Some((model, thinking)) = self.session_settings.get(&self.session) {
             self.model = model.clone();
             self.thinking = thinking.clone();
@@ -960,6 +1114,9 @@ impl D4c {
         self.rpc("sessions.messages.subscribe", json!({"key":self.session}));
         self.refresh_commands();
         self.cron.refresh();
+        if self.session.starts_with("draft:") {
+            return;
+        }
         if let Some(id) = self.rpc(
             "chat.history",
             json!({"sessionKey":self.session,"limit":100,"toolResultMaxChars":2000}),
@@ -991,6 +1148,8 @@ impl D4c {
                         self.restore_unsent(&params);
                     }
                     self.connected = false;
+                    self.reload_request = None;
+                    self.sent_requests.clear();
                     self.questions.disconnected();
                     self.active_sessions.clear();
                     self.live.clear();
@@ -1005,6 +1164,38 @@ impl D4c {
                     self.cron.disconnected();
                 }
                 gateway::Event::Data(v) => {
+                    if v["event"] == "session.settings" {
+                        let settings = &v["payload"];
+                        if let (Some(key), Some(model)) =
+                            (settings["sessionKey"].as_str(), settings["model"].as_str())
+                            && !self.selection_edited.contains(key)
+                        {
+                            let effort = settings["thinkingLevel"]
+                                .as_str()
+                                .unwrap_or(&self.thinking)
+                                .to_owned();
+                            self.session_settings
+                                .insert(key.into(), (model.into(), effort.clone()));
+                            if key == self.session {
+                                self.model = model.into();
+                                self.thinking = effort;
+                                self.normalize_effort();
+                            }
+                        }
+                        continue;
+                    }
+                    if v["event"] == "session.created" {
+                        if let (Some(old), Some(new)) = (
+                            v["payload"]["previousKey"].as_str(),
+                            v["payload"]["sessionKey"].as_str(),
+                        ) {
+                            self.adopt_session(old, new);
+                            self.pending_rekeys.insert(old.into(), new.into());
+                            self.last_rekey = None;
+                            self.persist_rekeys();
+                        }
+                        continue;
+                    }
                     if v["event"] == "sessions.changed" && v["payload"]["reason"] == "delete" {
                         if let Some(key) = v["payload"]["sessionKey"].as_str() {
                             self.forget_deleted_session(key);
@@ -1022,6 +1213,30 @@ impl D4c {
                     self.questions.observe(&v);
                     let response_id = v["id"].as_str().unwrap_or("");
                     if v["type"] == "res" {
+                        if let Some(params) = self.sent_requests.remove(response_id) {
+                            if v["ok"] == false {
+                                self.restore_unsent(&params);
+                            }
+                        }
+                        if self
+                            .reload_request
+                            .as_ref()
+                            .is_some_and(|(id, _)| id == response_id)
+                        {
+                            let (_, key) = self.reload_request.take().unwrap();
+                            if key == self.session {
+                                if v["ok"] == true {
+                                    self.hydrate_chat();
+                                    self.status = "Codex session reloaded".into();
+                                } else {
+                                    self.composer_error = v["error"]["message"]
+                                        .as_str()
+                                        .unwrap_or("Reload failed")
+                                        .into();
+                                }
+                            }
+                            continue;
+                        }
                         if response_id.starts_with("sessions.patch:") {
                             eprintln!(
                                 "D4C model response id={response_id} ok={} waiting={}",
@@ -1035,9 +1250,7 @@ impl D4c {
                                     .as_str()
                                     .is_some_and(|key| self.deleted_sessions.contains(key))
                                 {
-                                    if self.rpc("chat.send", params.clone()).is_none() {
-                                        self.restore_unsent(&params);
-                                    }
+                                    self.dispatch_send(params);
                                 }
                             } else {
                                 self.restore_unsent(&params);
@@ -1189,7 +1402,7 @@ impl D4c {
                                 "Command discovery unavailable: {}",
                                 v["error"]["message"]
                                     .as_str()
-                                    .unwrap_or("Gateway request failed")
+                                    .unwrap_or("Codex request failed")
                             );
                         }
                         continue;
@@ -1241,15 +1454,12 @@ impl D4c {
                         }
                         self.status = v["error"]["message"]
                             .as_str()
-                            .unwrap_or("Gateway request failed")
+                            .unwrap_or("Codex request failed")
                             .to_owned();
                         if id.starts_with("sessions.patch:") || id.starts_with("chat.send:") {
                             self.composer_error = self.status.clone();
                         }
-                        if id.starts_with("chat.send:") {
-                            self.running = false;
-                            self.active_sessions.remove(&self.session);
-                        }
+
                         continue;
                     }
                     let id = v["id"].as_str().unwrap_or("");
@@ -1290,25 +1500,14 @@ impl D4c {
                         if let Some(items) = payload["sessions"].as_array() {
                             for row in items {
                                 if let Some(key) = row["key"].as_str() {
-                                    let model = row["model"].as_str().unwrap_or(&self.model);
-                                    let provider =
-                                        row["modelProvider"].as_str().unwrap_or("openai");
-                                    let model = if model.contains('/') {
-                                        model.to_owned()
-                                    } else {
-                                        format!("{provider}/{model}")
-                                    };
-                                    if !self.selection_edited.contains(key) {
-                                        self.session_settings.insert(
-                                            key.into(),
-                                            (
-                                                model,
-                                                row["thinkingLevel"]
-                                                    .as_str()
-                                                    .unwrap_or("medium")
-                                                    .into(),
-                                            ),
-                                        );
+                                    if let Some(model) =
+                                        row["model"].as_str().filter(|m| !m.is_empty())
+                                        && !self.selection_edited.contains(key)
+                                    {
+                                        let effort =
+                                            row["thinkingLevel"].as_str().unwrap_or(&self.thinking);
+                                        self.session_settings
+                                            .insert(key.into(), (model.into(), effort.into()));
                                     }
                                     if row["hasActiveRun"] == true {
                                         self.active_sessions.insert(key.into());
@@ -1432,8 +1631,13 @@ impl D4c {
                             if !known && (!text.is_empty() || !media.is_empty()) {
                                 // Attach the server identity to our optimistic local echo.
                                 if let Some(echo) = self.messages.iter_mut().rev().find(|m| {
+                                    let client_id = message["clientId"]
+                                        .as_str()
+                                        .map(|id| format!("local:{id}"));
                                     m.role == "user"
-                                        && m.text == text
+                                        && client_id.as_ref().map_or(m.text == text, |id| {
+                                            m.item_id.as_ref() == Some(id)
+                                        })
                                         && (m
                                             .item_id
                                             .as_deref()
@@ -1466,24 +1670,50 @@ impl D4c {
                     }
                     if id.starts_with("models.list:") {
                         if let Some(items) = payload["models"].as_array() {
-                            let models: Vec<_> = items
-                                .iter()
-                                .filter_map(|m| {
-                                    let id = m["id"].as_str()?;
-                                    let provider = m["provider"].as_str().unwrap_or("openai");
-                                    Some(if id.contains('/') {
-                                        id.to_string()
-                                    } else {
-                                        format!("{provider}/{id}")
+                            self.models.clear();
+                            self.model_efforts.clear();
+                            for item in items {
+                                let Some(id) =
+                                    item["model"].as_str().or_else(|| item["id"].as_str())
+                                else {
+                                    continue;
+                                };
+                                self.models.push(id.into());
+                                let efforts = item["supportedReasoningEfforts"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|v| {
+                                        v["reasoningEffort"].as_str().or_else(|| v.as_str())
                                     })
-                                })
-                                .collect();
-                            if !models.is_empty() {
-                                if self.model.is_empty() {
-                                    self.model = models[0].clone();
-                                }
-                                self.models = models;
+                                    .map(str::to_owned)
+                                    .collect();
+                                self.model_efforts.insert(
+                                    id.into(),
+                                    (
+                                        efforts,
+                                        item["defaultReasoningEffort"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .into(),
+                                    ),
+                                );
                             }
+                            self.model = self
+                                .model
+                                .strip_prefix("openai/")
+                                .unwrap_or(&self.model)
+                                .into();
+                            if self.model.is_empty() {
+                                self.model = items
+                                    .iter()
+                                    .find(|v| v["isDefault"] == true)
+                                    .and_then(|v| v["model"].as_str().or_else(|| v["id"].as_str()))
+                                    .or_else(|| self.models.first().map(String::as_str))
+                                    .unwrap_or("")
+                                    .into();
+                            }
+                            self.normalize_effort();
                         }
                     }
                     let older_page = self
@@ -1516,6 +1746,15 @@ impl D4c {
                                     self.cron.observe_tool(&self.session, m);
                                 }
                                 if let Some(row) = transcript_message(m) {
+                                    if let Some(client_id) = m["clientId"].as_str() {
+                                        let local = format!("local:{client_id}");
+                                        if let Some(echo) = previous
+                                            .iter_mut()
+                                            .find(|v| v.item_id.as_ref() == Some(&local))
+                                        {
+                                            echo.item_id = row.item_id.clone();
+                                        }
+                                    }
                                     self.messages.push(row);
                                 }
                             }
@@ -1630,6 +1869,7 @@ impl D4c {
                     {
                         let state = payload["state"].as_str().unwrap_or("");
                         if state == "delta" || state == "final" {
+                            self.running = state == "delta";
                             let snapshot_media = media::from_message(&payload["message"]);
                             let snapshot = message_text(&payload["message"]);
                             let delta = payload["deltaText"].as_str().unwrap_or("");
@@ -1639,15 +1879,28 @@ impl D4c {
                                 || replace
                                 || !snapshot_media.is_empty()
                             {
-                                if !self.messages.last().is_some_and(|m| m.role == "assistant") {
+                                let item_id =
+                                    payload["itemId"].as_str().map(|id| format!("message:{id}"));
+                                let existing = if let Some(id) = item_id.as_ref() {
+                                    self.messages
+                                        .iter()
+                                        .rposition(|m| m.item_id.as_ref() == Some(id))
+                                } else {
+                                    self.messages
+                                        .len()
+                                        .checked_sub(1)
+                                        .filter(|i| self.messages[*i].role == "assistant")
+                                };
+                                let index = existing.unwrap_or_else(|| {
                                     self.messages.push(ChatMessage {
-                                        media: Default::default(),
+                                        media: vec![],
                                         role: "assistant".into(),
                                         text: String::new(),
-                                        item_id: None,
+                                        item_id,
                                     });
-                                }
-                                if let Some(last) = self.messages.last_mut() {
+                                    self.messages.len() - 1
+                                });
+                                if let Some(last) = self.messages.get_mut(index) {
                                     if !snapshot_media.is_empty() {
                                         last.media = snapshot_media;
                                     }
@@ -1664,11 +1917,6 @@ impl D4c {
                                 self.history_dirty = true;
                                 self.running = false;
                                 self.status = "Connected".into();
-                                if let Some(last) = self.messages.last_mut() {
-                                    if last.role == "assistant" {
-                                        last.item_id = None;
-                                    }
-                                }
                                 self.refresh_sessions();
                                 self.cron.refresh();
                             }
@@ -1833,18 +2081,26 @@ impl D4c {
         if !self.desktops.workspace.ready {
             return;
         }
+        // The server moves draft revisions atomically. A write to a destination
+        // before migration would create a competing row.
+        let eligible = |key: &str| !self.pending_rekeys.values().any(|new| new == key);
         self.draft_queue
             .set_device(self.desktops.workspace.device.clone());
-        let remote = self
-            .desktops
-            .workspace
-            .get("draft", &self.session)
-            .cloned()
-            .unwrap_or(json!({"rev":0,"text":""}));
-        self.input = self
-            .draft_queue
-            .synchronize(&self.session, &self.input, &remote);
+        if eligible(&self.session) {
+            let remote = self
+                .desktops
+                .workspace
+                .get("draft", &self.session)
+                .cloned()
+                .unwrap_or(json!({"rev":0,"text":""}));
+            self.input = self
+                .draft_queue
+                .synchronize(&self.session, &self.input, &remote);
+        }
         for (key, draft) in self.drafts.iter_mut() {
+            if !eligible(key) {
+                continue;
+            }
             let remote = self
                 .desktops
                 .workspace
@@ -1854,7 +2110,7 @@ impl D4c {
             draft.input = self.draft_queue.synchronize(key, &draft.input, &remote);
         }
         if self.desktops.workspace.status == "Online" {
-            for request in self.draft_queue.requests() {
+            for request in self.draft_queue.requests(eligible) {
                 self.desktops.workspace.rpc("workspace.put", request);
             }
         }
@@ -1873,6 +2129,40 @@ impl D4c {
         if !self.desktops.workspace.ready {
             return;
         }
+        if let Some(new) = self
+            .desktops
+            .workspace
+            .get("sessionAlias", &self.session)
+            .and_then(|row| row["sessionKey"].as_str())
+            .map(str::to_owned)
+        {
+            self.adopt_session(&self.session.clone(), &new);
+        }
+        if !self.pending_rekeys.is_empty()
+            && self.last_rekey.is_none_or(|t| t.elapsed().as_secs() >= 5)
+        {
+            self.last_rekey = Some(std::time::Instant::now());
+            let pending = self.pending_rekeys.len();
+            for (old, new) in self.pending_rekeys.clone() {
+                self.adopt_session(&old, &new);
+                if self
+                    .desktops
+                    .workspace
+                    .get("sessionAlias", &old)
+                    .is_some_and(|v| v["sessionKey"] == new)
+                {
+                    self.pending_rekeys.remove(&old);
+                } else {
+                    self.desktops.workspace.rpc(
+                        "workspace.rekey",
+                        json!({"previousKey":old,"sessionKey":new}),
+                    );
+                }
+            }
+            if self.pending_rekeys.len() != pending {
+                self.persist_rekeys();
+            }
+        }
         if !self.workspace_hydrated {
             self.workspace_hydrated = true;
             if let Some(v) = self
@@ -1888,8 +2178,9 @@ impl D4c {
                         .insert(self.url.clone(), (model.into(), thinking.into()));
                     let _ = self.preferences.save();
                     if !self.session_settings.contains_key(&self.session) {
-                        self.model = model.into();
+                        self.model = model.strip_prefix("openai/").unwrap_or(model).into();
                         self.thinking = thinking.into();
+                        self.normalize_effort();
                     }
                 }
             }
@@ -2277,7 +2568,7 @@ impl D4c {
                             egui::Button::new(icon_text(lucide_icons::Icon::Plus, 18.0))
                                 .frame(false),
                         )
-                        .on_hover_text("Upload files · 6 MB per file, 12 MB total")
+                        .on_hover_text("Attach files · 6 MB per file, 12 MB total")
                         .clicked()
                     {
                         self.composer_error.clear();
@@ -2309,6 +2600,7 @@ impl D4c {
                         .response
                         .on_hover_text("Model");
                     if self.model != old {
+                        self.normalize_effort();
                         self.remember_selection();
                         self.patch_selection();
                     }
@@ -2317,8 +2609,17 @@ impl D4c {
                         .selected_text(&self.thinking)
                         .width(82.0)
                         .show_ui(ui, |ui| {
-                            for level in ["low", "medium", "high", "xhigh", "max"] {
-                                ui.selectable_value(&mut self.thinking, level.into(), level);
+                            for level in self
+                                .model_efforts
+                                .get(&self.model)
+                                .into_iter()
+                                .flat_map(|(levels, _)| levels)
+                            {
+                                ui.selectable_value(
+                                    &mut self.thinking,
+                                    level.clone(),
+                                    level.as_str(),
+                                );
                             }
                         })
                         .response
@@ -2342,6 +2643,10 @@ impl D4c {
                         } else if ui
                             .add_enabled(
                                 self.connected
+                                    && !self
+                                        .reload_request
+                                        .as_ref()
+                                        .is_some_and(|(_, key)| key == &self.session)
                                     && !self.history_loading
                                     && self.upload.is_none()
                                     && (!self.input.trim().is_empty()
@@ -2451,11 +2756,7 @@ impl D4c {
             if let Some((next, _)) = self.sessions.first().cloned() {
                 self.select_session_impl(next, true, false);
             } else {
-                self.select_session_impl(
-                    format!("agent:main:d4c-{}", uuid::Uuid::new_v4()),
-                    false,
-                    false,
-                );
+                self.select_session_impl(format!("draft:{}", uuid::Uuid::new_v4()), false, false);
             }
         }
     }
@@ -2495,6 +2796,10 @@ impl D4c {
     fn send(&mut self, ctx: &egui::Context) {
         if !self.connected
             || self.running
+            || self
+                .reload_request
+                .as_ref()
+                .is_some_and(|(_, key)| key == &self.session)
             || self.history_loading
             || self.upload.is_some()
             || (self.input.trim().is_empty() && self.attachments.is_empty())
@@ -2526,7 +2831,11 @@ impl D4c {
         if !self.sessions.iter().any(|(key, _)| key == &self.session) {
             self.patch_selection();
         }
-        let params = json!({"sessionKey":self.session,"message":text,"attachments":attachments,"idempotencyKey":send_identity});
+        let mut params = json!({"sessionKey":self.session,"message":text,"attachments":attachments,"idempotencyKey":send_identity});
+        if self.selection_edited.contains(&self.session) {
+            params["model"] = json!(self.model);
+            params["thinkingLevel"] = json!(self.thinking);
+        }
         if let Some(id) = self
             .selection_pending
             .iter()
@@ -2535,8 +2844,8 @@ impl D4c {
         {
             eprintln!("D4C waiting for model id={id}");
             self.pending_sends.insert(id, params);
-        } else {
-            self.rpc("chat.send", params);
+        } else if !self.dispatch_send(params) {
+            return;
         }
         self.running = true;
         self.active_sessions.insert(self.session.clone());
@@ -2746,10 +3055,25 @@ impl D4c {
                         &self.session,
                         self.connected,
                         &self.models,
+                        &self.model_efforts,
                         &self.model,
                         &self.thinking,
                     );
                 } else {
+                    if ui
+                        .add_enabled(
+                            self.can_reload(),
+                            egui::Button::new(if self.reload_request.is_some() {
+                                "Reloading session…"
+                            } else {
+                                "Reload session tools and skills"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.reload_session();
+                    }
+                    ui.add_space(8.0);
                     self.desktops.ui(ui, &self.url, &self.session);
                 }
             });
@@ -3095,9 +3419,8 @@ impl D4c {
                         }
                         if let Some((index, key)) = selected {
                             let load = key.is_some();
-                            let target = key.unwrap_or_else(|| {
-                                format!("agent:main:d4c-{}", uuid::Uuid::new_v4())
-                            });
+                            let target =
+                                key.unwrap_or_else(|| format!("draft:{}", uuid::Uuid::new_v4()));
                             if index == self.preferences.selected {
                                 self.select_session(target, load);
                             } else {
@@ -3262,7 +3585,7 @@ impl D4c {
                             self.rename_pending = Some(id);
                             self.rename_error.clear();
                         } else {
-                            self.rename_error = "Gateway disconnected".into();
+                            self.rename_error = "Codex disconnected".into();
                         }
                     } else {
                         self.rename_error = "Connect to rename chats".into();
@@ -3442,7 +3765,7 @@ impl D4c {
             let load = request.session.is_some();
             let key = request
                 .session
-                .unwrap_or_else(|| format!("agent:main:d4c-{}", uuid::Uuid::new_v4()));
+                .unwrap_or_else(|| format!("draft:{}", uuid::Uuid::new_v4()));
             self.select_session(key, load);
             if !request.draft.is_empty() {
                 if !self.input.is_empty() {
@@ -4329,6 +4652,47 @@ mod composer_tests {
         app.patch_selection();
         assert!(!requests.try_iter().any(|r| r["method"] == "sessions.patch"));
         assert!(app.session_settings.contains_key(&app.session));
+    }
+    #[test]
+    fn adopting_a_native_thread_moves_pending_sends_without_losing_the_composer() {
+        let mut app = D4c::default();
+        let old = app.session.clone();
+        let native = uuid::Uuid::new_v4().to_string();
+        app.input = "next message".into();
+        app.pending_sends
+            .insert("patch".into(), json!({"sessionKey":old,"message":"first"}));
+        app.selection_pending.insert("patch".into(), old.clone());
+        app.active_sessions.insert(old.clone());
+        app.adopt_session(&old, &native);
+        app.adopt_session(&old, &native);
+        assert_eq!(app.session, native);
+        assert_eq!(app.input, "next message");
+        assert_eq!(app.pending_sends["patch"]["sessionKey"], native);
+        assert_eq!(app.selection_pending["patch"], native);
+        assert!(app.active_sessions.contains(&native));
+        assert!(!app.active_sessions.contains(&old));
+    }
+    #[test]
+    fn live_native_reply_items_keep_their_own_text_and_identity() {
+        let mut app = D4c::default();
+        app.session = "thread".into();
+        for (id, text) in [("a", "one"), ("b", "two"), ("a", "!")] {
+            inject(
+                &mut app,
+                gateway::Event::Data(
+                    json!({"event":"chat","payload":{"sessionKey":"thread","state":"delta","itemId":id,"deltaText":text}}),
+                ),
+            );
+        }
+        inject(
+            &mut app,
+            gateway::Event::Data(
+                json!({"event":"chat","payload":{"sessionKey":"thread","state":"final"}}),
+            ),
+        );
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.messages[0].text, "one!");
+        assert_eq!(app.messages[1].item_id.as_deref(), Some("message:b"));
     }
     #[test]
     fn first_send_waits_for_model_save_and_failed_save_restores_draft() {

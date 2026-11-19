@@ -1,0 +1,12 @@
+[Unit]
+Description=Relay tailnet port %i to the D4C TLS listener
+Requires=d4c-manager.service
+After=d4c-manager.service
+
+[Service]
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd @D4C_LISTEN@

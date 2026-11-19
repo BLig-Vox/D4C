@@ -1,0 +1,16 @@
+[Unit]
+Description=Refresh D4C native Codex tools
+After=d4c-codex.service
+Requisite=d4c-codex.service
+
+[Service]
+Type=oneshot
+User=d4c
+Group=d4c
+Environment=CODEX_HOME=/var/lib/d4c/codex
+ExecStart=/usr/bin/python3 /usr/local/libexec/d4c-refresh-codex.py
+TimeoutStartSec=45
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX

@@ -2,57 +2,50 @@
 
 # D4C
 
-A native Rust client for your OpenClaw servers. Chat, stream replies and tool activity, schedule work, and control isolated desktops from Linux or Android.
+A native Rust client for Codex App Server. Chat, stream replies and tool activity, schedule work, and control isolated desktops from Linux or Android.
 
-**Alpha software.** Linux and Android arm64 are the current targets. A server runs your agents and keeps their state while the app is closed. iOS and Windows packages are not provided.
+**Alpha software.** Linux and Android arm64 are the current targets. Your server runs Codex and keeps their state while the app is closed. iOS and Windows packages are not provided.
 
 ## Get started
 
-1. [Set up OpenClaw](docs/setup.md#1-openclaw-and-codex-authentication) on your server.
-2. Download the Android APK or Linux x86_64 archive from [Releases](https://github.com/Blig-Vox/D4C/releases).
-3. Open **Settings → Add server**, enter a name and your `wss://` Gateway URL, save, and switch to it. Fresh installations contain no server address.
-4. Approve the new device on the server with `openclaw devices list` and `openclaw devices approve REQUEST_ID`. Supply a Gateway token in Settings if your deployment requires one; tokens are not saved by D4C.
-5. For shared drafts, desktop control and synchronized notification state, install the [workspace manager](docs/setup.md#3-persistent-workspace-and-desktops). It pairs devices separately.
-6. Install the [MCP queue](docs/mcp.md) once on each server to connect MCP services from chat.
+1. Install the D4C manager and Codex CLI on your host, then sign in to Codex under the service account. See [server setup](docs/setup.md).
+2. Download the Android arm64 APK or Linux x86_64 archive from [Releases](https://github.com/BLig-Vox/D4C/releases).
+3. In **Settings → Add server**, enter the server name and private WSS URL. Existing installations keep their saved server addresses.
+4. On a new device, compare its displayed fingerprint and approve the matching ID on the server using `d4c-server --approve DEVICE_ID`.
 
-Use **Settings → Workspace server** if the manager runs on another hostname or port. Without an override, D4C uses the Gateway hostname on port `8443`. Saved connections and model/reasoning choices are device-local; conversations and agent work belong to OpenClaw. Switching servers keeps a bounded recent-chat preview and each server’s floating desktop position. Live connections are reopened for the selected server; cached pixels never enable input. Install matching client and manager updates for lossless compressed desktop delivery; older versions use the raw transport.
+Select a chat under its server in the sidebar. Returning to a visited server reuses a healthy chat connection and fetches recent history. **Settings → Workspace server** sets an optional endpoint for desks and drafts. The default uses the same hostname on port 8443.
 
 ## Daily use
 
 - **Chats:** start, search, rename or delete conversations in the sidebar, grouped under their server. Enter sends; Shift+Enter adds a line. The down-arrow returns to the latest message.
-- **Models:** choose from the connected Gateway's catalog in the composer. Your choice and reasoning level are remembered per connection. Availability comes from the server and your provider account.
+- **Models:** choose from the Codex server's model catalog in the composer. Your choice and reasoning level are remembered per connection. Availability comes from the server and your provider account.
 - **Uploads:** use **+** or desktop drag-and-drop. Limits are 6 MB per file and 12 MB per draft. Sent images have previews; files have cards. Interpretation of audio, video and documents depends on the chosen runtime/model. Unsent attachments stay on their originating device.
-- **Activity:** replies stream as Gateway events arrive. Tool calls have expandable details; thinking is displayed only when emitted by the server. Older messages load when scrolling up.
+- **Activity:** replies stream as Codex emits events. Tool calls have expandable details; thinking is displayed only when emitted by the server. Older messages load when scrolling up.
 - **Commands:** type `/` to discover eligible server commands and skills. Select a suggestion, fill its arguments, then send. `/vnc connect NAME` attaches a desktop to the current conversation; `/vnc disconnect` detaches it without stopping the desktop.
 - **Tasks:** ask in chat, such as “Every weekday at 9 AM, summarize my project.” Open the chat workspace's **Tasks** tab for status, history, run now, pause/resume and deletion. D4C schedules run in isolated sessions; results appear in Tasks history and notifications linked to the originating chat. Scheduled cards do not interrupt the conversation. Closing D4C does not stop a schedule.
 - **Desktops:** open the chat workspace's **Desktop** tab, create or select an environment, and connect it. The floating monitor bubble is freely draggable. Tap to expand, minimize to return to the bubble, and resize/zoom the viewer. **Take over** pauses agent control; **Return to agent** explicitly hands it back. Minimized viewers do not stream video.
 - **Notifications:** the bell shows recent activity. Settings controls OS alerts and sound. Android uses a foreground messaging service; Android notification permissions, battery rules, force-stop and network connectivity affect delivery.
 
-## OpenClaw and MCP setup
+## Codex and MCP
 
-- [Complete server setup and pairing](docs/setup.md)
-- [MCP: install, connect, authenticate, check status and troubleshoot](docs/mcp.md)
-- [Workspace manager details](server/README.md)
-- [Android build and platform notes](android/README.md)
-
-D4C uses OpenClaw's native MCP registry. The included helper queues connection changes until chat turns are idle, checks authentication and tool discovery, and then publishes the targeted change. A queued receipt does **not** mean the service is connected. Subsequent messages can inspect its applied/failed status. OAuth uses OpenClaw's native sign-in. Failed checks preserve the existing registry; the queue does not guarantee that every third-party server or upstream runtime is compatible.
+Use **Settings → Reload current session** on an idle conversation after changing its MCP configuration or skills. D4C asks Codex to refresh the tools for that conversation and keeps its thread ID. See [MCP setup](docs/mcp.md), [server deployment](docs/setup.md), and [Android notes](android/README.md).
 
 ## Prebuilt Linux install
 
-Download `d4c-0.1.0-alpha.7-linux-x86_64.tar.gz` and `SHA256SUMS` from
-[Releases](https://github.com/Blig-Vox/D4C/releases/tag/v0.1.0-alpha.7), then:
+Download `d4c-0.1.0-alpha.8-linux-x86_64.tar.gz` and `SHA256SUMS` from
+[Releases](https://github.com/Blig-Vox/D4C/releases/tag/v0.1.0-alpha.8), then:
 
 ```sh
 sha256sum --ignore-missing -c SHA256SUMS
-tar -xzf d4c-0.1.0-alpha.7-linux-x86_64.tar.gz
-cd d4c-0.1.0-alpha.7-linux-x86_64
+tar -xzf d4c-0.1.0-alpha.8-linux-x86_64.tar.gz
+cd d4c-0.1.0-alpha.8-linux-x86_64
 python3 scripts/install-desktop.py bin/vox-d4c
 ~/.local/bin/vox-d4c
 ```
 
 Requires glibc 2.39+ and compatible X11/Wayland and Vulkan drivers. This is a
 native Linux build, not a static binary or AppImage. The separate workspace-server
-archive includes its binary, deployment templates, plugin, migration helper and
+archive includes its binary, deployment templates, scheduling tools, migration helpers and
 setup documentation; configure it for your server using the guide below.
 
 ## Build and install on Linux
@@ -93,14 +86,14 @@ Install SDK platform 35/build-tools 35.0.0, NDK 28.2.13676358 and a JDK first. `
 | Component | Responsibility |
 | --- | --- |
 | Rust egui/eframe client | Native UI, local device identity, rendering and input |
-| OpenClaw Gateway | Models, transcripts, active runs, tool permissions, MCP and schedules |
-| D4C manager | SQLite workspace state, drafts, desktop bindings, notification/read synchronization |
-| Rootless Podman desktops | Independent Arch/XFCE homes, workspaces, X11 and runtime directories |
-| MCP queue worker | Durable status receipts, bounded discovery and idle configuration updates |
+| Codex App Server | Native threads, model selection, turns, approvals, skills and MCP |
+| D4C manager | Device pairing, encrypted transport, desktop bindings, drafts and notifications |
+| D4C scheduler | Per-host job state, execution receipts and scheduled Codex work |
+| Rootless Podman desktops | Independent Arch/XFCE homes, X11 sessions and working directories |
 
-Each installation has its own device identity. Linux state is under the user's XDG config/data directories; Android state is app-private. Pairing is required on both services. WSS certificate checks remain enabled. The manager binds only to loopback or Tailscale addresses, and raw VNC stays server-local. Containers share the host kernel; this is not VM isolation. Immediate notifications need a connected client/service; durable server execution continues without it.
+The client speaks the Codex App Server protocol over a device-authenticated WSS connection. The manager forwards it to a private Unix socket. Device identities stay in local app storage. Phone notification delivery depends on connectivity and Android background-service permissions.
 
-Compatibility was exercised with OpenClaw **2026.11.5** and Codex CLI **0.169.0**. Upstream interfaces can change. The queue currently supports credential-free HTTPS URLs with Streamable HTTP or SSE, public access or privately provisioned bearer tokens; use native OpenClaw sign-in for OAuth. Local stdio MCP is configured through OpenClaw, outside this helper.
+Tested protocol version: Codex CLI 0.169.0. The legacy runtime is needed only to export data from an existing deployment. Preserve your migration snapshot until you have checked your conversations and scheduled jobs.
 
 ## License
 

@@ -1,4 +1,4 @@
-//! Native OpenClaw question lifecycle; ordinary message text never grants authority.
+//! Native Codex question lifecycle; ordinary message text never grants authority.
 use eframe::egui;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -23,7 +23,7 @@ impl Questions {
                     && r["status"] == "pending"
                     && r["expiresAtMs"]
                         .as_u64()
-                        .is_some_and(|t| t > crate::activity::now())
+                        .is_none_or(|t| t > crate::activity::now())
             })
             .count()
     }
@@ -84,9 +84,7 @@ impl Questions {
     fn upsert(&mut self, r: &Value) {
         if r["id"].as_str().is_none()
             || r["sessionKey"].as_str().is_none()
-            || r["questions"]
-                .as_array()
-                .is_none_or(|q| q.is_empty() || q.len() > 3)
+            || r["questions"].as_array().is_none_or(|q| q.is_empty())
         {
             return;
         }
@@ -133,7 +131,7 @@ impl Questions {
                         continue;
                     }
                     if q["isSecret"]==true || q.get("resource").is_some_and(|v|!v.is_null()) || q.get("secretStore").is_some_and(|v|!v.is_null()) {
-                        unsupported=true;ui.label(egui::RichText::new("Open this question in OpenClaw's web interface.").weak());continue;
+                        unsupported=true;ui.label(egui::RichText::new("Answer this protected question in Codex.").weak());continue;
                     }
                     let selected=self.answers.entry(id.clone()).or_default().entry(qid.clone()).or_default();
                     ui.add_enabled_ui(active && connected && self.hydrated && !waiting,|ui|{

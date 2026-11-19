@@ -26,11 +26,11 @@ def main():
         prefix = f'{kind}-{version}-linux-x86_64'
         names = ['LICENSE', 'README.md', 'docs/setup.md', 'docs/mcp.md', 'scripts/build-limited.py']
         if server:
-            names += ['server/README.md', 'scripts/configure-server.py', 'scripts/install-mcp-queue.py',
-                      'scripts/stage-codex.py', 'vendor/ponytail/LICENSE', 'vendor/ponytail/skills/ponytail/SKILL.md',
-                      'scripts/isolate-scheduled-chats.py', 'scripts/sync-codex-models.py']
-            for directory in ['server/deploy', 'server/openclaw-plugin', 'server/openclaw-skills',
-                              'server/systemd', 'server/scripts', 'server/codex-image-budget', 'server/desktop']:
+            names += ['ATTRIBUTION.md','server/README.md','scripts/configure-server.py',
+                      'scripts/stage-codex.py','scripts/activate-codex-home.py',
+                      'vendor/ponytail/LICENSE','vendor/ponytail/skills/ponytail/SKILL.md',
+                      'server/scripts/d4c-scheduler.py','server/scripts/d4c-refresh-codex.py']
+            for directory in ['server/deploy','server/desktop']:
                 names += [str(f.relative_to(ROOT)) for f in sorted((ROOT / directory).rglob('*'))
                           if f.is_file() and '__pycache__' not in f.parts and f.suffix != '.pyc']
         else:

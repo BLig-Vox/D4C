@@ -92,6 +92,7 @@ impl Store {
             "preference",
             "notification",
             "activity",
+            "sessionAlias",
         ] {
             v[kind] = json!(self.list(kind)?);
         }
@@ -172,6 +173,67 @@ impl Store {
         tx.commit().map_err(|e| e.to_string())?;
         value["rev"] = json!(revision);
         Ok(value)
+    }
+    /// Move per-chat objects and publish the alias in the same transaction.
+    pub fn rekey(&mut self, previous: &str, session: &str) -> Result<Value> {
+        uuid::Uuid::parse_str(session).map_err(|_| "Invalid Codex thread id")?;
+        if previous == session || previous.is_empty() || previous.len() > 512 {
+            return Err("Invalid previous session".into());
+        }
+        if let Ok(alias) = self.get("sessionAlias", previous) {
+            if alias["sessionKey"] == session {
+                return Ok(alias);
+            }
+            return Err("Session already mapped to another thread".into());
+        }
+        let tx = self.db.transaction().map_err(|e| e.to_string())?;
+        let rows: Vec<(String, String, String)> = {
+            let mut q = tx.prepare("SELECT kind,id,value FROM objects WHERE (id=?1 AND kind IN ('draft','binding','activity','preference')) OR json_extract(value,'$.session')=?1 OR json_extract(value,'$.sessionKey')=?1").map_err(|e| e.to_string())?;
+            q.query_map([previous], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(|e| e.to_string())?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(|e| e.to_string())?
+        };
+        let write = |kind: &str, id: &str, mut v: Value| -> Result<()> {
+            v["id"] = json!(id);
+            let data = v.to_string();
+            tx.execute(
+                "INSERT INTO events(kind,id,value,created) VALUES(?,?,?,?)",
+                params![kind, id, data, now() as i64],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT OR REPLACE INTO objects(kind,id,value,rev) VALUES(?,?,?,?)",
+                params![kind, id, data, tx.last_insert_rowid()],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        };
+        for (kind, id, data) in rows {
+            let mut value: Value = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+            if value["deleted"] == true {
+                continue;
+            }
+            for field in ["session", "sessionKey"] {
+                if value[field] == previous {
+                    value[field] = json!(session);
+                }
+            }
+            if id == previous {
+                let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM objects WHERE kind=? AND id=? AND COALESCE(json_extract(value,'$.deleted'),0)=0)",params![kind,session],|r|r.get(0)).map_err(|e|e.to_string())?;
+                if occupied {
+                    return Err(format!("Destination {kind} already exists"));
+                }
+                write(&kind, &id, json!({"deleted":true}))?;
+                write(&kind, session, value)?;
+            } else {
+                write(&kind, &id, value)?;
+            }
+        }
+        let alias = json!({"id":previous,"sessionKey":session});
+        write("sessionAlias", previous, alias.clone())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(alias)
     }
     pub fn delete(&mut self, kind: &str, id: &str, expected: u64) -> Result<Value> {
         let old = self.get(kind, id)?;
@@ -348,6 +410,43 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn thread_alias_moves_objects_once_and_rejects_collisions_atomically() {
+        let mut store = Store::memory();
+        let target = uuid::Uuid::new_v4().to_string();
+        store
+            .put("draft", "old", Some(0), json!({"text":"hello"}))
+            .unwrap();
+        store
+            .put(
+                "binding",
+                "old",
+                Some(0),
+                json!({"sessionKey":"old","desktopId":"desk"}),
+            )
+            .unwrap();
+        store
+            .put("notification", "notice", Some(0), json!({"session":"old"}))
+            .unwrap();
+        store
+            .put("draft", &target, Some(0), json!({"text":"other"}))
+            .unwrap();
+        assert!(store.rekey("old", &target).is_err());
+        assert_eq!(store.get("binding", "old").unwrap()["desktopId"], "desk");
+        assert!(store.get("sessionAlias", "old").is_err());
+        let fresh = uuid::Uuid::new_v4().to_string();
+        store.rekey("old", &fresh).unwrap();
+        let revision = store.revision().unwrap();
+        store.rekey("old", &fresh).unwrap();
+        assert_eq!(revision, store.revision().unwrap());
+        assert_eq!(store.get("binding", &fresh).unwrap()["desktopId"], "desk");
+        assert_eq!(store.get("draft", &fresh).unwrap()["text"], "hello");
+        assert_eq!(
+            store.get("notification", "notice").unwrap()["session"],
+            fresh
+        );
+        assert_eq!(store.get("draft", "old").unwrap()["deleted"], true);
+    }
     #[test]
     fn desktop_control_is_server_enforced_and_sticky() {
         let mut s = Store::memory();

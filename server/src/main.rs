@@ -10,7 +10,7 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h") {
         println!(
-            "D4C server\nUsage: d4c-server [--config PATH] [--list-devices | --approve DEVICE_ID]\n       d4c-server --mcp\n       d4c-server --help | --version"
+            "D4C server\nUsage: d4c-server [--config PATH] [--list-devices | --approve DEVICE_ID | --import-aliases MANIFEST | --migrate-codex-tools HOME]\n       d4c-server --mcp\n       d4c-server --help | --version"
         );
         return Ok(());
     }
@@ -22,7 +22,7 @@ fn run() -> Result<(), String> {
     while let Some(arg) = options.next() {
         match arg.as_str() {
             "--mcp" | "--list-devices" => {}
-            "--config" | "--approve" => {
+            "--config" | "--approve" | "--import-aliases" | "--migrate-codex-tools" => {
                 if options.next().is_none_or(|v| v.starts_with("--")) {
                     return Err(format!("{arg} requires a value"));
                 }
@@ -42,12 +42,32 @@ fn run() -> Result<(), String> {
             &std::env::var("D4C_SESSION").map_err(|_| "D4C_SESSION required")?,
         );
     }
+    if let Some(home) = option("--migrate-codex-tools") {
+        let count = vox_d4c_server::codex_tools::migrate_tools(std::path::Path::new(&home))?;
+        println!("Updated Codex tools on {count} threads");
+        return Ok(());
+    }
     let path = option("--config").unwrap_or_else(|| "/etc/d4c/manager.json".into());
     let config: serde_json::Value =
         serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
     let root = PathBuf::from(config["dataDirectory"].as_str().unwrap_or("/var/lib/d4c"));
     let mut db = Store::open(&root.join("workspace.sqlite"))?;
+    if let Some(path) = option("--import-aliases") {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        for (key, row) in manifest["sessions"]
+            .as_object()
+            .ok_or("Missing session map")?
+        {
+            if let Some(tid) = row["threadId"].as_str() {
+                db.rekey(key, tid)?;
+            }
+        }
+        println!("Session aliases imported");
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--list-devices") {
         println!(
             "{}",

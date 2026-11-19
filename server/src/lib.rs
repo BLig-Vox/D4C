@@ -15,3 +15,6 @@ pub mod wire;
 
 #[path = "../../src/desktop_wire.rs"]
 pub mod desktop_wire;
+
+pub mod codex_tools;
+pub mod schedules;

@@ -535,7 +535,7 @@ impl Tasks {
                     }
                     self.has_more = p["hasMore"].as_bool().unwrap_or(false);
                 } else {
-                    self.error = "Gateway returned an unexpected task list".into();
+                    self.error = "Server returned an unexpected task list".into();
                 }
             }
             Pending::ResultBody(mut run) => {
@@ -625,7 +625,7 @@ impl Tasks {
                         }
                         self.runs_more = p["hasMore"].as_bool().unwrap_or(false);
                     } else {
-                        self.error = "Gateway returned an unexpected run history".into();
+                        self.error = "Server returned an unexpected run history".into();
                     }
                 }
             }
@@ -644,6 +644,7 @@ impl Tasks {
         session: &str,
         connected: bool,
         models: &[String],
+        efforts: &std::collections::HashMap<String, (Vec<String>, String)>,
         model: &str,
         thinking: &str,
     ) {
@@ -672,7 +673,7 @@ impl Tasks {
         self.scope_session = Some(session.into());
         let more = self.has_more;
         self.has_more = false;
-        self.ui(ui, connected, models, model, thinking);
+        self.ui(ui, connected, models, efforts, model, thinking);
         self.jobs = all;
         self.has_more = more;
         self.scope_session = None;
@@ -687,6 +688,7 @@ impl Tasks {
         ui: &mut egui::Ui,
         connected: bool,
         models: &[String],
+        efforts: &std::collections::HashMap<String, (Vec<String>, String)>,
         model: &str,
         thinking: &str,
     ) {
@@ -748,7 +750,7 @@ impl Tasks {
             }
         });
         ui.add_space(4.0);
-        if self.scope_session.is_none() && ui.small_button("Advanced").clicked() {
+        if ui.small_button("Edit schedule manually").clicked() {
             self.editor = Some(Editor::new(model, thinking));
             self.form_error.clear();
         }
@@ -997,7 +999,7 @@ impl Tasks {
                     }
                 });
         }
-        self.editor_ui(ui, connected, models);
+        self.editor_ui(ui, connected, models, efforts);
         if let Some(job) = self.delete.clone() {
             egui::Window::new("Delete scheduled task?")
                 .max_width((ui.ctx().content_rect().width() - 48.0).max(180.0))
@@ -1125,7 +1127,13 @@ impl Tasks {
                 }
             });
     }
-    fn editor_ui(&mut self, ui: &mut egui::Ui, connected: bool, models: &[String]) {
+    fn editor_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        connected: bool,
+        models: &[String],
+        efforts: &std::collections::HashMap<String, (Vec<String>, String)>,
+    ) {
         let Some(mut editor) = self.editor.take() else {
             return;
         };
@@ -1151,8 +1159,8 @@ impl Tasks {
                     }
                     let agent_turn=editor.original.as_ref().is_none_or(|j|j["payload"]["kind"]=="agentTurn");
                     if agent_turn{ui.add_space(8.0);ui.horizontal_wrapped(|ui|{
-                        ui.label("Model");egui::ComboBox::from_id_salt("task_model").width(160.0).selected_text(if editor.model.is_empty(){"Gateway default"}else{&editor.model}).show_ui(ui,|ui|{if editor.model.is_empty(){ui.label("Gateway default");}for model in models{ui.selectable_value(&mut editor.model,model.clone(),model);}});
-                    });ui.horizontal_wrapped(|ui|{ui.label("Reasoning");egui::ComboBox::from_id_salt("task_thinking").selected_text(if editor.thinking.is_empty(){"Gateway default"}else{&editor.thinking}).show_ui(ui,|ui|{for value in ["low","medium","high","xhigh","max"]{ui.selectable_value(&mut editor.thinking,value.into(),value);}});});}
+                        ui.label("Model");egui::ComboBox::from_id_salt("task_model").width(160.0).selected_text(if editor.model.is_empty(){"Server default"}else{&editor.model}).show_ui(ui,|ui|{if editor.model.is_empty(){ui.label("Server default");}for model in models{if ui.selectable_value(&mut editor.model,model.clone(),model).changed() {if let Some((levels,default))=efforts.get(model) && !levels.contains(&editor.thinking){editor.thinking=default.clone();}}}});
+                    });ui.horizontal_wrapped(|ui|{ui.label("Reasoning");egui::ComboBox::from_id_salt("task_thinking").selected_text(if editor.thinking.is_empty(){"Server default"}else{&editor.thinking}).show_ui(ui,|ui|{for value in efforts.get(&editor.model).into_iter().flat_map(|(levels,_)|levels){ui.selectable_value(&mut editor.thinking,value.clone(),value.as_str());}});});}
                     ui.add_space(8.0);ui.checkbox(&mut editor.enabled,"Enable this schedule");
                     ui.label(egui::RichText::new(if editor.original.is_none(){"Runs independently on the server. Results are saved in run history; no external delivery."}else{"Existing task routing and delivery settings are preserved."}).small().weak());
                     if !self.form_error.is_empty(){ui.colored_label(egui::Color32::LIGHT_RED,&self.form_error);}
@@ -1166,7 +1174,12 @@ impl Tasks {
         if !cancel {
             if submit {
                 match editor.request() {
-                    Ok((method, params)) => {
+                    Ok((method, mut params)) => {
+                        if method == "cron.add" {
+                            if let Some(session) = &self.scope_session {
+                                params["sessionKey"] = json!(session);
+                            }
+                        }
                         self.form_error.clear();
                         self.error.clear();
                         self.queue(method, params, Pending::Save);
@@ -1262,7 +1275,7 @@ fn schedule_label(schedule: &Value) -> String {
             let fields: Vec<_> = expr.split_whitespace().collect();
             if fields.len() == 5 && fields[2] == "*" && fields[3] == "*" {
                 if let (Ok(minute), Ok(hour)) = (fields[0].parse::<u8>(), fields[1].parse::<u8>()) {
-                    let tz = schedule["tz"].as_str().unwrap_or("Gateway timezone");
+                    let tz = schedule["tz"].as_str().unwrap_or("Server timezone");
                     if minute < 60 && hour < 24 {
                         if fields[4] == "*" {
                             return format!("Daily at {hour:02}:{minute:02} · {tz}");
@@ -1289,10 +1302,10 @@ fn schedule_label(schedule: &Value) -> String {
             format!(
                 "{} · {}",
                 expr,
-                schedule["tz"].as_str().unwrap_or("Gateway timezone")
+                schedule["tz"].as_str().unwrap_or("Server timezone")
             )
         }
-        Some(kind) => format!("Gateway schedule · {kind}"),
+        Some(kind) => format!("Server schedule · {kind}"),
         None => "Schedule unavailable".into(),
     }
 }

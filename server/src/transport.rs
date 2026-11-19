@@ -189,7 +189,9 @@ fn connection_task(
             });
             let valid_origin = req.headers().get("origin").is_none_or(|v| {
                 v.to_str().is_ok_and(|o| {
-                    o == format!("https://{host}") || o == format!("https://{host}:8443")
+                    o == format!("https://{host}")
+                        || o == format!("https://{host}:8443")
+                        || o == format!("https://{host}:8444")
                 })
             });
             if !valid_origin {
@@ -238,10 +240,11 @@ fn connection_task(
         .map_err(|e| e.to_string())?;
     if path == "/control" {
         control(socket, manager, id)
-    } else if path == "/codex" {
+    } else if path == "/codex" || path == "/" {
         codex(
             socket,
             codex_socket.ok_or("Direct Codex is not configured")?,
+            &manager,
         )
     } else if let Some(desktop) = path.strip_prefix("/vnc/") {
         uuid::Uuid::parse_str(desktop).map_err(|_| "Invalid desktop ID")?;
@@ -275,7 +278,7 @@ impl Heartbeat {
 }
 /// One upstream WebSocket per paired client. The Codex service owns the threads
 /// and turns, so leaving the app only closes this subscription.
-fn codex(mut client: Socket, path: &Path) -> Result<()> {
+fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
     use std::os::unix::net::UnixStream;
     let stream = UnixStream::connect(path).map_err(|e| format!("Codex socket: {e}"))?;
     let timeout = |e: io::Error| e.to_string();
@@ -306,6 +309,42 @@ fn codex(mut client: Socket, path: &Path) -> Result<()> {
             Some(message) => {
                 heartbeat.received = Instant::now();
                 if message.is_text() {
+                    if let Ok(mut request) =
+                        serde_json::from_str::<Value>(message.to_text().unwrap_or(""))
+                    {
+                        if let Some(action) = request["method"]
+                            .as_str()
+                            .and_then(|s| s.strip_prefix("d4c/cron/"))
+                        {
+                            let result = crate::schedules::rpc(action, &request["params"]);
+                            let response = match result {
+                                Ok(v) => json!({"id":request["id"],"result":v}),
+                                Err(e) => {
+                                    json!({"id":request["id"],"error":{"code":-32602,"message":e}})
+                                }
+                            };
+                            send(&mut client, response)?;
+                            continue;
+                        }
+                        if request["method"] == "thread/start" {
+                            crate::codex_tools::augment_thread_start(&mut request);
+                            send_native(&mut upstream, request)?;
+                            continue;
+                        }
+                        if request["method"] == "d4c/attachment/store" {
+                            let response = match store_attachment(
+                                &manager.runtime.root.join("uploads"),
+                                &request["params"],
+                            ) {
+                                Ok(value) => json!({"id":request["id"],"result":value}),
+                                Err(error) => {
+                                    json!({"id":request["id"],"error":{"code":-32602,"message":error}})
+                                }
+                            };
+                            send(&mut client, response)?;
+                            continue;
+                        }
+                    }
                     crate::wire::send(&mut upstream, message).map_err(|e| e.to_string())?;
                 }
             }
@@ -314,11 +353,61 @@ fn codex(mut client: Socket, path: &Path) -> Result<()> {
         match receive_codex(&mut upstream)? {
             Some(Message::Close(_)) => return Ok(()),
             Some(message) if message.is_text() => {
+                if let Ok(req) = serde_json::from_str::<Value>(message.to_text().unwrap_or("")) {
+                    if let Some(reply) = crate::codex_tools::answer(manager, &req) {
+                        send_native(&mut upstream, reply)?;
+                        continue;
+                    }
+                }
                 crate::wire::send(&mut client, message).map_err(|e| e.to_string())?;
             }
             _ => {}
         }
     }
+}
+
+fn send_native<S: Read + Write>(ws: &mut WebSocket<S>, value: Value) -> Result<()> {
+    crate::wire::send(ws, Message::Text(value.to_string().into())).map_err(|e| e.to_string())
+}
+
+fn store_attachment(root: &Path, p: &Value) -> Result<Value> {
+    use base64::Engine as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let name = p["name"]
+        .as_str()
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 240
+                && !s.chars().any(|c| c.is_control() || c == '/' || c == '\\')
+                && *s != "."
+                && *s != ".."
+        })
+        .ok_or("Invalid attachment filename")?;
+    let encoded = p["data"]
+        .as_str()
+        .filter(|s| s.len() <= 8_000_000)
+        .ok_or("File exceeds 6 MB")?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| "Invalid file encoding")?;
+    let dir = root.join(uuid::Uuid::new_v4().to_string());
+    fs::create_dir(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(name);
+    let result = (|| -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(dir);
+        return Err(error.to_string());
+    }
+    Ok(json!({"path":path}))
 }
 
 fn receive_codex<S: Read + Write>(socket: &mut WebSocket<S>) -> Result<Option<Message>> {

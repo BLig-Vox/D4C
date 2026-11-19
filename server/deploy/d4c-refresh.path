@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch D4C's native Codex MCP configuration and skill directory
+
+[Path]
+PathChanged=/var/lib/d4c/codex/config.toml
+PathChanged=/var/lib/d4c/codex/skills
+Unit=d4c-refresh.service
+
+[Install]
+WantedBy=multi-user.target

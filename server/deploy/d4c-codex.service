@@ -1,0 +1,36 @@
+[Unit]
+Description=D4C private Codex app server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=d4c
+Group=d4c
+UMask=0077
+WorkingDirectory=/var/lib/d4c/codex/workspace
+Environment=HOME=/var/lib/d4c/codex
+Environment=CODEX_HOME=/var/lib/d4c/codex
+RuntimeDirectory=d4c-codex
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/codex app-server -c approval_policy="on-request" -c sandbox_mode="workspace-write" --listen unix:///run/d4c-codex/app.sock
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Codex redirects its private listener into this per-user directory.
+BindPaths=/tmp/codex-daemon-@D4C_UID@
+PrivateDevices=yes
+PrivatePIDs=yes
+TemporaryFileSystem=/var/lib/d4c:ro /run:ro
+BindPaths=/run/d4c-codex
+BindPaths=/var/lib/d4c/codex
+BindReadOnlyPaths=/var/lib/d4c/uploads
+InaccessiblePaths=-/etc/d4c
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target

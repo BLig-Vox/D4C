@@ -6,5 +6,6 @@
   "certificate": "/etc/d4c/tls/cert.pem",
   "privateKey": "/etc/d4c/tls/key.pem",
   "dataDirectory": "/var/lib/d4c",
+  "codexSocket": "/run/d4c-codex/app.sock",
   "socket": "/run/d4c/manager.sock"
 }

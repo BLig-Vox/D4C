@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.0-alpha.8
+
+- Run chats on native Codex App Server over the saved WSS endpoint. D4C uses its paired device identity for chat and workspace access.
+- Resume native threads and map migrated selections, desktop bindings, and drafts back to their conversations.
+- Discover native models and skills, stream replies and tool activity, and answer approval requests in chat. Refresh MCP connections from an idle session.
+- Include the standalone D4C scheduler, migration tools, and Linux service definitions in the server archive.
+- Android arm64 version code 13. Use a matching direct-Codex server for this client.
+
 ## 0.1.0-alpha.7
 
 - Reuse the authenticated chat connection when returning to a previously visited server and refresh its conversation history.

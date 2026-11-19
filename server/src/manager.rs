@@ -69,6 +69,11 @@ impl Manager {
                 .lock()
                 .map_err(|_| "Database unavailable")?
                 .changes(p["after"].as_u64().unwrap_or(0)),
+            "workspace.rekey" => self
+                .db
+                .lock()
+                .map_err(|_| "Database unavailable")?
+                .rekey(field(p, "previousKey", 512)?, field(p, "sessionKey", 64)?),
             "workspace.put" => {
                 let kind = field(p, "kind", 32)?;
                 if !["draft", "preference"].contains(&kind) {

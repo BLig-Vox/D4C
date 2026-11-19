@@ -1,6 +1,6 @@
 # Android
 
-Native Rust/egui arm64 client for the same OpenClaw and D4C workspace services used
+Native Rust/egui arm64 client for the same Codex and D4C workspace services used
 by the desktop client. OpenGL ES rendering uses eframe NativeActivity. Device
 identity and settings are app-private; backups and cleartext network traffic are
 disabled. No server address or paired identity is bundled.

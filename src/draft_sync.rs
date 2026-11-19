@@ -28,6 +28,12 @@ impl Queue {
             },
         );
     }
+    pub fn rekey(&mut self, old: &str, new: &str) {
+        if let Some(mut row) = self.rows.remove(old) {
+            row.pending = None;
+            self.rows.entry(new.into()).or_insert(row);
+        }
+    }
     pub fn forget(&mut self, id: &str) {
         self.rows.remove(id);
     }
@@ -73,9 +79,12 @@ impl Queue {
         row.revision = revision;
         row.local.clone()
     }
-    pub fn requests(&mut self) -> Vec<Value> {
+    pub fn requests(&mut self, eligible: impl Fn(&str) -> bool) -> Vec<Value> {
         let mut out = vec![];
         for (id, row) in self.rows.iter_mut() {
+            if !eligible(id) {
+                continue;
+            }
             if row
                 .pending
                 .as_ref()
@@ -111,18 +120,18 @@ mod tests {
         let mut q = Queue::default();
         q.synchronize("gone", "sensitive draft", &json!({"rev":0,"text":""}));
         q.forget("gone");
-        assert!(q.requests().is_empty());
+        assert!(q.requests(|_| true).is_empty());
         assert!(!q.pending());
     }
     #[test]
     fn outgoing_chat_remains_in_queue_until_latest_edit_is_acknowledged() {
         let mut q = Queue::default();
         q.synchronize("a", "first", &json!({"rev":0,"text":""}));
-        assert_eq!(q.requests().len(), 1);
+        assert_eq!(q.requests(|_| true).len(), 1);
         q.synchronize("a", "latest", &json!({"rev":0,"text":""}));
         q.synchronize("b", "", &json!({"rev":0,"text":""}));
         q.synchronize("a", "latest", &json!({"rev":1,"text":"first"}));
-        let request = q.requests();
+        let request = q.requests(|_| true);
         assert_eq!(request[0]["id"], "a");
         assert_eq!(request[0]["value"]["text"], "latest");
         assert_eq!(request[0]["expectedRevision"], 1);
@@ -138,6 +147,6 @@ mod tests {
             "mine"
         );
         assert!(q.conflicted("a"));
-        assert!(q.requests().is_empty());
+        assert!(q.requests(|_| true).is_empty());
     }
 }
