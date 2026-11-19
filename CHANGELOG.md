@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.9
+
+- Switch Codex permissions per chat, including full access with `/permissions yolo on` and default permissions with `/permissions yolo off`.
+- Share host CPU capacity across desktops and pass accessible Linux GPU render devices into new desktop containers.
+- Add space between the reply indicator and the composer. Android arm64 version code 14.
 
 - Reuse a per-desktop VNC connection for fresh screenshots. Recover a lost capture connection once and back off failed VNC handshakes across viewer, screenshot, and input requests.
 

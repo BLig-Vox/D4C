@@ -1,6 +1,6 @@
 [package]
 name = "vox-d4c-server"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Blig-Vox/D4C"
