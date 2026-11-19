@@ -111,6 +111,8 @@ sudo systemctl is-active d4c-manager.service d4c-codex.service d4c-scheduler.tim
 sudo stat -Lc '%a %U %G %n' /run/d4c-codex/app.sock
 ```
 
+At Codex service startup, `ExecStartPre` refreshes saved D4C tool registrations, including compaction checkpoints, before any thread opens. This lets existing chats use new manager tools such as `share_media`. On an existing installation, install the matching manager binary and updated Codex unit, run `sudo systemctl daemon-reload`, then restart `d4c-codex` between turns. Check `journalctl -u d4c-codex` for the refreshed thread count.
+
 The `d4c-refresh.path` unit watches the Codex MCP configuration and skills directory. It invokes the native MCP reload and refreshes skill discovery. To request a refresh explicitly, run `sudo systemctl start d4c-refresh.service` and check its journal.
 
 ## Connect and pair devices

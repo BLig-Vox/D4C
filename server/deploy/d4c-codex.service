@@ -12,6 +12,9 @@ Environment=HOME=/var/lib/d4c/codex
 Environment=CODEX_HOME=/var/lib/d4c/codex
 RuntimeDirectory=d4c-codex
 RuntimeDirectoryMode=0700
+# Large saved transcripts can take several minutes on the first catalog upgrade.
+TimeoutStartSec=10min
+ExecStartPre=/usr/local/bin/d4c-server --refresh-codex-tools /var/lib/d4c/codex
 ExecStart=/usr/bin/codex app-server -c approval_policy="on-request" -c sandbox_mode="workspace-write" --listen unix:///run/d4c-codex/app.sock
 Restart=on-failure
 RestartSec=3

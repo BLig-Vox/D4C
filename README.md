@@ -168,6 +168,8 @@ The last command checks the **running process**. For this release it should prin
 
 After the alpha.14 server rollout, the Linux client on Tusk recovered an earlier desktop screenshot after reconnecting and opened a newly generated apple image. Doom’s manager version and service health were also checked. The visual test covered Tusk on Linux. For attachments above the manager’s 6 MB per-file limit, retry with a smaller image.
 
+**Existing chats missing `share_media`.** Codex saves a tool list with each conversation. If a new chat can send a PNG but an older one only displays its server path, check whether the installed Codex unit has the tool refresh hook with `systemctl cat d4c-codex`. In builds with `--refresh-codex-tools`, the hook updates older conversations before Codex opens their transcripts. Install the matching unit and manager together, then restart Codex between turns. The original alpha.14 release archive predates this hook. [Service setup](docs/setup.md#set-up-the-working-directory-ponytail-and-authentication)
+
 ### Connection troubleshooting
 
 | Symptom | First check |

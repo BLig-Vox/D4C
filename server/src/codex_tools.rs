@@ -247,6 +247,46 @@ pub fn migrate_tools(home: &Path) -> Result<usize, String> {
         }
     }
     invalidate_migrated_history(home, &targets)?;
+    visit_rollouts(home, |path, id| {
+        if targets.remove(id) {
+            migrate_rollout(path, id, None)
+        } else {
+            Ok(false)
+        }
+    })
+    .and_then(|count| {
+        if targets.is_empty() {
+            Ok(count)
+        } else {
+            Err(format!(
+                "Missing {} rollout(s) referenced by migration manifest",
+                targets.len()
+            ))
+        }
+    })
+}
+
+/// ExecStartPre runs before Codex opens any rollout file descriptors.
+pub fn refresh_tools(home: &Path) -> Result<usize, String> {
+    let marker = home.join(".d4c-verified-tool-catalog");
+    let catalog = namespace_spec().to_string();
+    let verify_checkpoints = fs::read_to_string(&marker).ok().as_ref() != Some(&catalog);
+    let count = visit_rollouts(home, |path, id| {
+        migrate_rollout(path, id, Some((home, verify_checkpoints)))
+    })?;
+    if verify_checkpoints {
+        let temp = marker.with_extension(uuid::Uuid::new_v4().to_string());
+        fs::write(&temp, catalog)
+            .and_then(|_| fs::rename(&temp, marker))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(count)
+}
+
+fn visit_rollouts(
+    home: &Path,
+    mut visit: impl FnMut(&Path, &str) -> Result<bool, String>,
+) -> Result<usize, String> {
     let mut dirs = vec![home.join("sessions"), home.join("archived_sessions")];
     let mut changed = 0;
     while let Some(dir) = dirs.pop() {
@@ -274,21 +314,15 @@ pub fn migrate_tools(home: &Path) -> Result<usize, String> {
             let Some(id) = stem.len().checked_sub(36).and_then(|i| stem.get(i..)) else {
                 continue;
             };
-            if targets.remove(id) && migrate_rollout(&entry.path(), id)? {
+            if visit(&entry.path(), id)? {
                 changed += 1;
             }
         }
     }
-    if !targets.is_empty() {
-        return Err(format!(
-            "Missing {} rollout(s) referenced by migration manifest",
-            targets.len()
-        ));
-    }
     Ok(changed)
 }
 
-fn migrate_rollout(path: &Path, id: &str) -> Result<bool, String> {
+fn migrate_rollout(path: &Path, id: &str, refresh: Option<(&Path, bool)>) -> Result<bool, String> {
     let mut reader = BufReader::new(fs::File::open(path).map_err(|e| e.to_string())?);
     let mut line = Vec::new();
     reader
@@ -302,7 +336,19 @@ fn migrate_rollout(path: &Path, id: &str) -> Result<bool, String> {
     if !existing.is_null() && !existing.is_array() {
         return Err(format!("Invalid dynamic tool metadata for thread {id}"));
     }
+    if refresh.is_some()
+        && !existing.as_array().is_some_and(|specs| {
+            specs
+                .iter()
+                .any(|s| s["type"] == "namespace" && s["name"] == "d4c")
+        })
+    {
+        return Ok(false);
+    }
     let updated = combine_specs(existing);
+    if matches!(refresh, Some((_, false))) && existing == &updated {
+        return Ok(false);
+    }
     let mut changed = *existing != updated;
     first["payload"]["dynamic_tools"] = updated;
     let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
@@ -344,6 +390,10 @@ fn migrate_rollout(path: &Path, id: &str) -> Result<bool, String> {
             return fs::remove_file(&temp);
         }
         writer.sync_all()?;
+        if let Some((home, _)) = refresh {
+            invalidate_migrated_history(home, &HashSet::from([id.to_owned()]))
+                .map_err(io::Error::other)?;
+        }
         fs::rename(&temp, path)?;
         if let Some(parent) = path.parent() {
             fs::File::open(parent)?.sync_all()?;
@@ -410,6 +460,28 @@ mod tests {
         assert_eq!(combine_specs(&specs), specs);
     }
     #[test]
+    fn startup_repairs_old_checkpoints_and_skips_unmanaged_chats() {
+        let home = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let dir = home.join("sessions");
+        fs::create_dir_all(&dir).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = dir.join(format!("rollout-{id}.jsonl"));
+        let header =
+            json!({"type":"session_meta","payload":{"id":id,"dynamic_tools":[namespace_spec()]}});
+        let checkpoint = json!({"type":"compacted","payload":{"resume_metadata":{"dynamic_tools":{"tools":[{"type":"namespace","name":"d4c","tools":[]}]}}}});
+        fs::write(&path, format!("{header}\n{checkpoint}\n")).unwrap();
+        let other_id = uuid::Uuid::new_v4().to_string();
+        let other = dir.join(format!("rollout-{other_id}.jsonl"));
+        let unmanaged = json!({"type":"session_meta","payload":{"id":other_id}}).to_string();
+        fs::write(&other, &unmanaged).unwrap();
+        assert_eq!(refresh_tools(&home).unwrap(), 1);
+        assert_eq!(fs::read_to_string(other).unwrap(), unmanaged);
+        let data = fs::read_to_string(&path).unwrap();
+        assert!(data.lines().nth(1).unwrap().contains("share_media"));
+        assert_eq!(refresh_tools(&home).unwrap(), 0);
+        fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
     fn migration_changes_only_metadata_and_preserves_transcript_bytes() {
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         fs::create_dir(&dir).unwrap();
@@ -423,7 +495,7 @@ mod tests {
         data.push(b'\n');
         data.extend_from_slice(tail);
         fs::write(&path, data).unwrap();
-        assert!(migrate_rollout(&path, "test").unwrap());
+        assert!(migrate_rollout(&path, "test", None).unwrap());
         let updated = fs::read(&path).unwrap();
         assert!(updated.ends_with(tail));
         let checkpoint: Value =
@@ -432,7 +504,7 @@ mod tests {
             checkpoint["payload"]["resume_metadata"]["dynamic_tools"]["tools"][0]["name"],
             "d4c"
         );
-        assert!(!migrate_rollout(&path, "test").unwrap());
+        assert!(!migrate_rollout(&path, "test", None).unwrap());
         fs::remove_dir_all(dir).unwrap();
     }
 }
