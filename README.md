@@ -4,11 +4,11 @@
 
 A native Rust client for Codex App Server. Chat, stream replies and tool activity, schedule work, and control isolated desktops from Linux or Android.
 
-**Alpha software.** Linux and Android arm64 are the current targets. Your server runs Codex and keeps their state while the app is closed. iOS and Windows packages are not provided.
+**Alpha software.** Linux and Android arm64 are the current targets. Your server runs Codex and keeps their state while the app is closed. If you're on Windows, see [how to set up a Linux host from Windows](INSTALL.md#if-you-use-windows).
 
 ## Get started
 
-1. Install the D4C manager and Codex CLI on your host, then sign in to Codex under the service account. Follow the [host setup below](#host-setup-from-codex-to-tailscale).
+1. Install the D4C manager and Codex CLI on your host, then sign in to Codex under the service account. Follow the [server installation guide](INSTALL.md).
 2. Download the Android arm64 APK or Linux x86_64 archive from [Releases](https://github.com/BLig-Vox/D4C/releases).
 3. In **Settings → Add server**, enter the server name and private WSS URL. Existing installations keep their saved server addresses.
 4. On a new device, compare its displayed fingerprint and approve the matching ID on the server using `d4c-server --approve DEVICE_ID`.

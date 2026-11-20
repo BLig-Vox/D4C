@@ -24,7 +24,7 @@ def main():
     for server in (False, True):
         kind = 'd4c-server' if server else 'd4c'
         prefix = f'{kind}-{version}-linux-x86_64'
-        names = ['LICENSE', 'README.md', 'docs/setup.md', 'docs/mcp.md', 'scripts/build-limited.py']
+        names = ['LICENSE', 'README.md', 'INSTALL.md', 'docs/setup.md', 'docs/mcp.md', 'scripts/build-limited.py']
         if server:
             names += ['ATTRIBUTION.md','server/README.md','scripts/configure-server.py',
                       'scripts/stage-codex.py','scripts/activate-codex-home.py',
