@@ -2,9 +2,11 @@
 
 # D4C
 
-A native Rust client for Codex App Server. Chat, stream replies and tool activity, schedule work, and control isolated desktops from Linux or Android.
+**Give Codex a desktop on your own server.** Chat from Linux or Android, watch it work live, and take over from your phone.
 
-**Alpha software.** Linux and Android arm64 are the current targets. Your server runs Codex and keeps their state while the app is closed. iOS and Windows packages are not provided.
+D4C is a native Rust client for Codex App Server. Follow tool calls as they happen, schedule recurring tasks, and switch between servers from one sidebar. Your sessions stay on the server, so you can start a task on your laptop, close the app, and pick it up on Android.
+
+**Alpha software.** Downloads are available for Linux x86_64 and Android arm64.
 
 ## Get started
 
