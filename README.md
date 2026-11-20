@@ -8,6 +8,14 @@ D4C is a native Rust client for Codex App Server. Follow tool calls as they happ
 
 **Alpha software.** Downloads are available for Linux x86_64 and Android arm64.
 
+## Inside a bot’s desktop
+
+Each D4C desktop has its own Linux home directory and graphical session. Codex can open a terminal, work on files and use graphical apps there. Open the desktop from chat to watch live or take over the mouse and keyboard.
+
+![An isolated D4C desktop showing the same three demo folders in the XFCE file manager and terminal.](docs/images/codex-desktop.png)
+
+*Staged on a fresh D4C desktop with a fictional photo-album workspace.*
+
 ## Get started
 
 1. Install the D4C manager and Codex CLI on your host, then sign in to Codex under the service account. Follow the [host setup below](#host-setup-from-codex-to-tailscale).
@@ -21,7 +29,7 @@ Select a chat under its server in the sidebar. Returning to a visited server reu
 
 One Linux host runs one D4C manager and one persistent Codex app server. A phone or Linux client opens a private WebSocket to the manager over Tailscale. The manager authenticates the device and forwards chat to Codex over a local Unix socket. The host keeps the threads, scheduled jobs and desktop environments when a client closes. Repeat the setup on each host you want in the sidebar.
 
-**Choose the right starting point.** The steps below assume a fresh host. For an existing native Codex installation with missing chat images, skip to [upgrading the manager](#upgrade-the-manager-and-verify-chat-images). When moving existing OpenClaw conversations, follow the snapshot and import sequence **before** creating the Codex workspace. Fresh installations use Codex directly. [OpenClaw migration guide](docs/setup.md#migrate-an-existing-openclaw-host)
+**Choose the right starting point.** The steps below assume a fresh host. For an existing native Codex installation with missing chat images, skip to [upgrading the manager](#upgrade-the-manager-and-verify-chat-images). To import conversations from an older installation, follow the snapshot and import steps in the [migration guide](docs/setup.md) **before** creating the Codex workspace.
 
 ### 1. Join the private network
 
