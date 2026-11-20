@@ -48,7 +48,7 @@ final class D4cUpdates {
 
     void menu() {
         boolean alpha = prefs.getBoolean("alpha", installed().contains("-alpha."));
-        new AlertDialog.Builder(activity).setTitle("System update")
+        new AlertDialog.Builder(activity).setTitle("System update · "+installed())
             .setSingleChoiceItems(new String[]{"Stable","Stable and alpha"},alpha?1:0,(d,i)->
                 prefs.edit().putBoolean("alpha",i==1).apply())
             .setNegativeButton("Cancel",null).setPositiveButton("Check for updates",(d,i)->check(true)).show();
@@ -119,13 +119,13 @@ final class D4cUpdates {
         new Thread(()->{
             JSONObject release=null; String failure=null;
             try { release=find(alpha,current); prefs.edit().putLong("last",System.currentTimeMillis()).apply(); }
-            catch(Exception e) { failure=e.getMessage(); }
+            catch(Exception e) { failure=e.toString(); }
             final JSONObject result=release; final String error=failure;
             activity.runOnUiThread(()->{
                 checking=false;
                 if(activity.isFinishing() || activity.isDestroyed() || !activity.hasWindowFocus() && !manual) return;
                 if(error!=null) { if(manual) tell("Update check failed: "+error); return; }
-                if(result==null) { if(manual) tell("No newer APK in this channel"); return; }
+                if(result==null) { if(manual) tell("D4C "+current+" is up to date in this channel"); return; }
                 new AlertDialog.Builder(activity).setTitle("D4C "+result.optString("tag"))
                     .setMessage("Installed version: "+current).setNegativeButton("Later",null)
                     .setPositiveButton("Download and install",(d,i)->download(result)).show();
