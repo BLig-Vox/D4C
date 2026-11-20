@@ -8,13 +8,13 @@ D4C is a native Rust client for Codex App Server. Follow tool calls as they happ
 
 **Alpha software.** Downloads are available for Linux x86_64 and Android arm64.
 
-## Inside a bot’s desktop
+## Watch Codex use its desktop
 
 Each D4C desktop has its own Linux home directory and graphical session. Codex can open a terminal, work on files and use graphical apps there. Open the desktop from chat to watch live or take over the mouse and keyboard.
 
-![An isolated D4C desktop showing the same three demo folders in the XFCE file manager and terminal.](docs/images/codex-desktop.png)
+![D4C chat beside a floating desktop in Agent mode. The file manager shows the three requested album folders, with Take over in the upper right.](docs/images/d4c-workspace.png)
 
-*Staged on a fresh D4C desktop with a fictional photo-album workspace.*
+*Illustrated D4C session with a fictional chat and a real desktop capture from an isolated photo-album demo.*
 
 ## Get started
 
