@@ -9,8 +9,22 @@ use std::{
 pub const MAX_WIDTH: u16 = 2560;
 pub const MAX_HEIGHT: u16 = 1600;
 const MAX_BUFFER: usize = 32 * 1024 * 1024;
+pub trait RfbStream: Read + Write + Send {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+}
+impl RfbStream for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+}
+#[cfg(unix)]
+impl RfbStream for std::os::unix::net::UnixStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        std::os::unix::net::UnixStream::set_read_timeout(self, timeout)
+    }
+}
 pub struct Session {
-    pub socket: TcpStream,
+    pub socket: Box<dyn RfbStream>,
     pub width: u16,
     pub height: u16,
     pub name: String,
@@ -32,13 +46,23 @@ fn dimensions(w: u16, h: u16) -> io::Result<usize> {
 }
 impl Session {
     pub fn connect(port: u16) -> io::Result<Self> {
-        let mut s = TcpStream::connect_timeout(
+        let s = TcpStream::connect_timeout(
             &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             Duration::from_secs(4),
         )?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
         s.set_write_timeout(Some(Duration::from_secs(5)))?;
         s.set_nodelay(true)?;
+        Self::handshake(Box::new(s))
+    }
+    #[cfg(unix)]
+    pub fn connect_local(path: &std::path::Path) -> io::Result<Self> {
+        let s = std::os::unix::net::UnixStream::connect(path)?;
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        s.set_write_timeout(Some(Duration::from_secs(5)))?;
+        Self::handshake(Box::new(s))
+    }
+    fn handshake(mut s: Box<dyn RfbStream>) -> io::Result<Self> {
         let mut version = [0; 12];
         s.read_exact(&mut version)?;
         if &version[..8] != b"RFB 003." {

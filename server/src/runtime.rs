@@ -135,6 +135,9 @@ fn safe_id(id: &str) -> Result<()> {
         .map_err(|_| "Invalid desktop ID".to_string())
         .map(|_| ())
 }
+fn host_desktop(id: &str) -> bool {
+    std::env::var("D4C_HOST_DESKTOP_ID").as_deref() == Ok(id)
+}
 impl Runtime {
     pub fn new(root: PathBuf) -> Result<Self> {
         let home = std::env::var_os("HOME").ok_or("HOME missing")?;
@@ -152,6 +155,9 @@ impl Runtime {
     /// Remove legacy desktop CPU and RAM limits without restarting its container.
     pub fn remove_resource_limits(&self, d: &Value) -> Result<()> {
         let id = d["id"].as_str().ok_or("Missing desktop ID")?;
+        if host_desktop(id) {
+            return Ok(());
+        }
         self.prepare(d)?;
         let exists = Command::new("podman")
             .args(["container", "exists", &format!("d4c-{id}")])
@@ -242,6 +248,9 @@ impl Runtime {
     pub fn prepare(&self, d: &Value) -> Result<()> {
         let id = d["id"].as_str().ok_or("Missing desktop ID")?;
         safe_id(id)?;
+        if host_desktop(id) {
+            return Ok(());
+        }
         command("podman", &["image", "exists", "localhost/d4c-arch-xfce:1"])?;
         let base = self.root.join("desktops").join(id);
         for name in ["home", "work"] {
@@ -349,6 +358,9 @@ impl Runtime {
     }
     pub fn remove(&self, id: &str) -> Result<()> {
         safe_id(id)?;
+        if host_desktop(id) {
+            return self.stop(id);
+        }
         let unit = self.units.join(format!("d4c-{id}.container"));
         if unit.exists() {
             self.stop(id)?;
@@ -368,6 +380,10 @@ impl Runtime {
         let gate = slot(&self.connections, id)?;
         let mut gate = gate.lock().map_err(|_| "VNC connection gate unavailable")?;
         gate.connect(|| {
+            if host_desktop(id) {
+                return rfb::Session::connect_local(&self.root.join("host-screen.sock"))
+                    .map_err(|e| format!("Host screen: {e}"));
+            }
             rfb::Session::connect(self.port(id)?).map_err(|e| {
                 if matches!(
                     e.kind(),
@@ -389,6 +405,14 @@ impl Runtime {
     }
     pub fn status(&self, id: &str) -> Result<String> {
         safe_id(id)?;
+        if host_desktop(id) {
+            let running = command(
+                "systemctl",
+                &["--user", "is-active", &format!("d4c-{id}.service")],
+            )
+            .is_ok();
+            return Ok(if running { "running" } else { "stopped" }.into());
+        }
         let result = command(
             "podman",
             &[
@@ -527,7 +551,7 @@ mod tests {
         });
         let mut capture = Capture {
             session: rfb::Session {
-                socket: client,
+                socket: Box::new(client),
                 width: 1,
                 height: 1,
                 name: String::new(),
