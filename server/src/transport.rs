@@ -6,6 +6,7 @@ use crate::{
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     fs,
     io::{self, BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
@@ -304,6 +305,7 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
         cfg.max_message_size = Some(16 << 20);
     });
     let mut heartbeat = Heartbeat::new();
+    let mut history_requests = HashMap::new();
     loop {
         heartbeat.poll(&mut client)?;
         match receive_codex(&mut client)? {
@@ -334,6 +336,13 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
                             // A single desktop-heavy turn can contain megabytes of screenshots.
                             // Codex returns a cursor for the remaining turns.
                             request["params"]["limit"] = json!(1);
+                            if history_requests.len() < 256
+                                && !request["id"].is_null()
+                                && let Some(thread) = request["params"]["threadId"].as_str()
+                            {
+                                history_requests
+                                    .insert(request["id"].to_string(), thread.to_owned());
+                            }
                             send_native(&mut upstream, request)?;
                             continue;
                         }
@@ -380,7 +389,12 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
             Some(message) if message.is_text() => {
                 if let Ok(mut req) = serde_json::from_str::<Value>(message.to_text().unwrap_or(""))
                 {
-                    if compact_history_images(&manager.runtime.root, &mut req) {
+                    let thread = if req["method"].is_null() && !req["id"].is_null() {
+                        history_requests.remove(&req["id"].to_string())
+                    } else {
+                        None
+                    };
+                    if project_chat_media(&manager.runtime.root, &mut req, thread.as_deref()) {
                         send(&mut client, req)?;
                         continue;
                     }
@@ -396,13 +410,18 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
     }
 }
 
-// The transcript displays tool results as text. Avoid transferring base64 screenshots
-// as JSON text while retaining the original result in Codex and all user attachments.
-fn compact_history_images(root: &Path, response: &mut Value) -> bool {
+// Put attachment metadata on the wire while retaining the original Codex transcript.
+fn project_chat_media(root: &Path, response: &mut Value, thread: Option<&str>) -> bool {
     if response["method"] == "item/completed"
-        && let Some(item) = response.pointer_mut("/params/item")
+        && let Some(params) = response.get_mut("params").and_then(Value::as_object_mut)
     {
-        return crate::chat_media::project_item(root, item);
+        let thread = params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        return params
+            .get_mut("item")
+            .is_some_and(|item| crate::chat_media::project_item(root, item, thread.as_deref()));
     }
     let mut changed = false;
     for turn in response
@@ -417,7 +436,7 @@ fn compact_history_images(root: &Path, response: &mut Value) -> bool {
             .into_iter()
             .flatten()
         {
-            changed |= crate::chat_media::project_item(root, item);
+            changed |= crate::chat_media::project_item(root, item, thread);
         }
     }
     changed
@@ -738,6 +757,58 @@ fn peer_is_owner(stream: &std::os::unix::net::UnixStream, owner_uid: u32) -> Res
 mod ipc_tests {
     use super::*;
     #[test]
+    fn live_codex_reply_delivers_a_video_without_a_tool_call() {
+        let root = std::env::temp_dir().join(format!("d4c-history-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let thread = uuid::Uuid::new_v4().to_string();
+        let export = crate::chat_media::share(&root, &thread, None).unwrap();
+        let file = Path::new(export["directory"].as_str().unwrap()).join("Demo video.mp4");
+        fs::write(&file, b"demo video").unwrap();
+        let mut event = json!({"method":"item/completed","params":{"threadId":thread,
+            "item":{"id":"item","type":"agentMessage","text":"Here is the demo.\n\nMEDIA: Demo video.mp4"}}});
+        assert!(project_chat_media(&root, &mut event, None));
+        let item = &event["params"]["item"];
+        assert_eq!(item["text"], "Here is the demo.\n\nMEDIA: Demo video.mp4");
+        assert_eq!(item["d4cText"], "Here is the demo.");
+        let attachment = &item["d4cAttachments"][0];
+        assert_eq!(attachment["mimeType"], "video/mp4");
+        let download =
+            crate::chat_media::download(&root, attachment["artifactId"].as_str().unwrap()).unwrap();
+        assert_eq!(download["data"], "ZGVtbyB2aWRlbw==");
+        let other_thread = uuid::Uuid::new_v4().to_string();
+        crate::chat_media::share(&root, &other_thread, None).unwrap();
+        let link = format!(
+            "[Demo](sandbox:{})",
+            file.display().to_string().replace(' ', "%20")
+        );
+        let mut history = json!({"result":{"data":[{"items":[
+            {"id":"item","type":"agentMessage","text":link}
+        ]}],"nextCursor":"older"}});
+        let untouched = history.clone();
+        assert!(!project_chat_media(&root, &mut history, None));
+        assert!(!project_chat_media(
+            &root,
+            &mut history,
+            Some(&other_thread)
+        ));
+        assert_eq!(history, untouched);
+        assert!(project_chat_media(&root, &mut history, Some(&thread)));
+        assert_eq!(history["result"]["nextCursor"], "older");
+        let item = &history["result"]["data"][0]["items"][0];
+        assert_eq!(item["id"], "item");
+        assert_eq!(item["d4cText"], "");
+        assert_eq!(item["d4cAttachments"][0], *attachment);
+
+        std::os::unix::fs::symlink(&file, file.with_file_name("symlink.mp4")).unwrap();
+        for text in ["MEDIA: symlink.mp4", "```text\nMEDIA: Demo video.mp4\n```"] {
+            let mut event = json!({"method":"item/completed","params":{"threadId":thread,
+                "item":{"type":"agentMessage","text":text}}});
+            assert!(!project_chat_media(&root, &mut event, None));
+            assert_eq!(event["params"]["item"]["text"], text);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn history_compacts_only_embedded_tool_images() {
         let root = std::env::temp_dir().join(format!("d4c-history-{}", uuid::Uuid::new_v4()));
         let image = json!({"type":"inputImage","imageUrl":"data:image/png;base64,test"});
@@ -745,13 +816,13 @@ mod ipc_tests {
         let mut response = json!({"result":{"data":[{"items":[user.clone(),
             {"type":"dynamicToolCall","contentItems":[image,{"type":"inputText","text":"ok"}]}
         ]}],"nextCursor":"older"}});
-        assert!(compact_history_images(&root, &mut response));
+        assert!(project_chat_media(&root, &mut response, None));
         assert_eq!(response["result"]["nextCursor"], "older");
         let items = &response["result"]["data"][0]["items"];
         assert_eq!(items[0], user);
         assert_eq!(items[1]["contentItems"][0]["type"], "inputText");
         assert_eq!(items[1]["contentItems"][1]["text"], "ok");
-        assert!(!compact_history_images(&root, &mut response));
+        assert!(!project_chat_media(&root, &mut response, None));
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

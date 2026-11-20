@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2-alpha.2
+
+- Play videos and view images exported by Codex from the live conversation and chat history. Update both the app and its server to use this feature.
+- Add an installation guide for Linux servers and for connecting from Windows.
+
 ## 0.1.2-alpha.1
 
 - Open composer image previews and keep fullscreen images visible on narrow and wide screens. Paste images directly on Linux.

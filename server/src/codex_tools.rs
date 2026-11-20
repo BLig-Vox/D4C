@@ -24,7 +24,7 @@ fn namespace_spec() -> Value {
             "limit":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0}
         },"required":["action"],"additionalProperties":false}
     }));
-    tools.push(json!({"name":"share_media","description":"Send an image or video in this chat. First call without arguments to get this chat’s export directory. Save or copy a PNG, JPEG, GIF, WebP, MP4, MKV, MOV or WebM there (up to 6 MB), then call with its filename.","inputSchema":{"type":"object","properties":{"filename":{"type":"string"}},"additionalProperties":false}}));
+    tools.push(json!({"name":"share_media","description":"Send an image or video in this chat. First call without arguments to get this chat’s export directory. Save or copy a PNG, JPEG, GIF, WebP, MP4, MKV, MOV or WebM there (up to 6 MB), then call with its filename. If sending fails after the file is saved, put MEDIA: followed by the filename in a separate paragraph of your reply.","inputSchema":{"type":"object","properties":{"filename":{"type":"string"}},"additionalProperties":false}}));
     for tool in &mut tools {
         tool["type"] = json!("function");
     }

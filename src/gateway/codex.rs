@@ -440,7 +440,11 @@ impl Adapter {
                 let done=method=="item/completed";
                 match string(&item["type"]){
                     "userMessage"=>if let Some(message)=transcript(item){self.event("session.message",json!({"sessionKey":k,"messageId":item["id"],"message":message}));},
-                    "agentMessage" if done=>self.event("chat",json!({"sessionKey":k,"state":"delta","runId":p["turnId"],"itemId":item["id"],"message":{"content":item["text"]}})),
+                    "agentMessage" if done=>{
+                        if let Some(message)=transcript(item){
+                            self.event("chat",json!({"sessionKey":k,"state":"delta","runId":p["turnId"],"itemId":item["id"],"replace":message["content"].is_array(),"message":message}));
+                        }
+                    }
                     "reasoning" if done=>{
                         let summary=lines(&item["summary"]);
                         if !summary.is_empty(){self.event("agent",json!({"sessionKey":k,"stream":"reasoning","data":{"itemId":item["id"],"text":summary}}));}
@@ -706,7 +710,7 @@ fn upload_part(text: &str) -> Option<Value> {
         json!({"type":"file","fileName":name,"mimeType":mime,"artifactId":format!("upload/{key}/{name}")}),
     )
 }
-fn tool_media(item: &Value) -> Vec<Value> {
+fn item_media(item: &Value) -> Vec<Value> {
     let mut media = Vec::new();
     let mut add = |v: &Value| {
         if v["artifactId"].is_string()
@@ -722,6 +726,9 @@ fn tool_media(item: &Value) -> Vec<Value> {
         }
     };
     add(&item["d4cAttachment"]);
+    for part in rows(&item["d4cAttachments"]) {
+        add(part);
+    }
     for p in rows(&item["contentItems"]) {
         add(&p["d4cAttachment"]);
         if item["tool"] == "share_media"
@@ -733,6 +740,16 @@ fn tool_media(item: &Value) -> Vec<Value> {
     }
     media
 }
+fn with_media(text: Value, mut attachments: Vec<Value>) -> Value {
+    if attachments.is_empty() {
+        return text;
+    }
+    if !string(&text).is_empty() {
+        attachments.insert(0, json!({"type":"text","text":text}));
+    }
+    Value::Array(attachments)
+}
+
 fn transcript(item: &Value) -> Option<Value> {
     let kind = string(&item["type"]);
     let id = &item["id"];
@@ -748,7 +765,13 @@ fn transcript(item: &Value) -> Option<Value> {
             }).collect();
             Some(json!({"role":"user","id":id,"clientId":item["clientId"],"content":content}))
         }
-        "agentMessage" => Some(json!({"role":"assistant","id":id,"content":item["text"]})),
+        "agentMessage" => {
+            let text = item["d4cText"]
+                .as_str()
+                .map_or_else(|| item["text"].clone(), |text| json!(text));
+            let content = with_media(text, item_media(item));
+            Some(json!({"role":"assistant","id":id,"content":content}))
+        }
         "reasoning" => {
             let summary = lines(&item["summary"]);
             (!summary.is_empty())
@@ -769,7 +792,7 @@ fn transcript(item: &Value) -> Option<Value> {
                 "collabAgentToolCall" => &["prompt", "agentsStates"],
                 _ => return None,
             };
-            let mut attachments = tool_media(item);
+            let attachments = item_media(item);
             let text = fields
                 .iter()
                 .filter(|key| {
@@ -784,14 +807,7 @@ fn transcript(item: &Value) -> Option<Value> {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            let content = if attachments.is_empty() {
-                json!(text)
-            } else {
-                if !text.is_empty() {
-                    attachments.insert(0, json!({"type":"text","text":text}));
-                }
-                Value::Array(attachments)
-            };
+            let content = with_media(json!(text), attachments);
             Some(
                 json!({"role":"tool","id":id,"toolCallId":id,"toolName":item["tool"].as_str().or_else(||item["name"].as_str()).unwrap_or(kind),"isError":item["status"]=="failed" || item["success"]==false,"content":content}),
             )
@@ -907,6 +923,23 @@ mod tests {
             json!({"sessionKey":THREAD,"artifactId":file["artifactId"]}),
         ));
         assert_eq!(frames(&mut adapter)[0]["method"], "d4c/attachment/download");
+    }
+
+    #[test]
+    fn completed_reply_video_is_available_in_live_chat_and_history() {
+        let file = json!({"type":"file","artifactId":"blob/id/demo.mp4","fileName":"Demo.mp4","mimeType":"video/mp4"});
+        let item = json!({"type":"agentMessage","id":"demo","text":"MEDIA: Demo.mp4","d4cText":"","d4cAttachments":[file]});
+        let history = transcript(&item).unwrap();
+        assert_eq!(history["content"], json!([file]));
+        assert_eq!(crate::media::from_message(&history).len(), 1);
+
+        let mut adapter = Adapter::default();
+        adapter
+            .incoming(json!({"method":"item/completed","params":{"item":item,"threadId":THREAD}}));
+        let live = &frames(&mut adapter)[0]["payload"];
+        assert_eq!(live["itemId"], "demo");
+        assert_eq!(live["replace"], true);
+        assert_eq!(live["message"], history);
     }
 
     #[test]

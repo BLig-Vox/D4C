@@ -138,23 +138,32 @@ pub fn download(root: &Path, id: &str) -> Result<Value, String> {
     .map_err(|e| e.to_string())?;
     Ok(json!({"data":STANDARD.encode(bounded(file)?),"artifact":{"mimeType":media_type}}))
 }
-pub fn share(root: &Path, thread: &str, name: Option<&str>) -> Result<Value, String> {
+fn export_dir(root: &Path, thread: &str, create: bool) -> Result<fs::File, String> {
     if !valid_id(thread) {
         return Err("Invalid conversation".into());
     }
-    let base = root.join("codex/workspace");
-    let mut dir = fs::File::open(&base).map_err(|e| e.to_string())?;
-    for part in ["d4c-media", thread] {
+    let mut dir = fs::File::open(root).map_err(|e| e.to_string())?;
+    for part in ["codex", "workspace", "d4c-media", thread] {
         let path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(part);
-        if let Err(e) = fs::create_dir(&path)
+        if create
+            && let Err(e) = fs::create_dir(&path)
             && e.kind() != io::ErrorKind::AlreadyExists
         {
             return Err(e.to_string());
         }
         dir = open_at(&dir, part, true).map_err(|e| e.to_string())?;
     }
+    Ok(dir)
+}
+
+fn export_path(root: &Path, thread: &str) -> PathBuf {
+    root.join("codex/workspace/d4c-media").join(thread)
+}
+
+pub fn share(root: &Path, thread: &str, name: Option<&str>) -> Result<Value, String> {
+    let dir = export_dir(root, thread, true)?;
     let Some(name) = name else {
-        return Ok(json!({"directory":base.join("d4c-media").join(thread)}));
+        return Ok(json!({"directory":export_path(root, thread)}));
     };
     let media_type = mime(name).ok_or("Unsupported media format")?;
     let bytes = bounded(open_at(&dir, name, false).map_err(|e| e.to_string())?)?;
@@ -170,7 +179,91 @@ pub fn share(root: &Path, thread: &str, name: Option<&str>) -> Result<Value, Str
         .ok_or("Missing upload identifier")?;
     Ok(json!({"d4cAttachment":metadata(format!("upload/{key}/{name}"),name,media_type)}))
 }
-pub fn project_item(root: &Path, item: &mut Value) -> bool {
+fn project_reply(root: &Path, thread: &str, item: &mut Value) -> bool {
+    use pulldown_cmark::{Event, Parser, Tag};
+
+    let Some(text) = item["text"].as_str() else {
+        return false;
+    };
+    if !text.contains("MEDIA:") && !text.contains("sandbox:") {
+        return false;
+    }
+    let Ok(dir) = export_dir(root, thread, false) else {
+        return false;
+    };
+    let base = export_path(root, thread);
+    let mut attachments = Vec::new();
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let references = Parser::new(text)
+        .into_offset_iter()
+        .filter_map(|(event, range)| {
+            let (name, replacement) = match event {
+                Event::Start(Tag::Paragraph) => {
+                    let line = text[range.clone()].trim();
+                    let name = line.strip_prefix("MEDIA:")?.trim().to_owned();
+                    (name, String::new())
+                }
+                Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) => {
+                    let path =
+                        percent_encoding::percent_decode_str(dest_url.strip_prefix("sandbox:")?)
+                            .decode_utf8()
+                            .ok()?;
+                    let name = Path::new(path.as_ref())
+                        .strip_prefix(&base)
+                        .ok()?
+                        .to_str()?
+                        .to_owned();
+                    let start = text[..range.start].rfind('\n').map_or(0, |index| index + 1);
+                    let end = text[range.end..]
+                        .find('\n')
+                        .map_or(text.len(), |index| range.end + index);
+                    let standalone = text[start..range.start].trim().is_empty()
+                        && text[range.end..end].trim().is_empty();
+                    let replacement = if standalone {
+                        String::new()
+                    } else {
+                        name.clone()
+                    };
+                    (name, replacement)
+                }
+                _ => return None,
+            };
+            (filename(&name) && mime(&name).is_some()).then_some((range, name, replacement))
+        });
+    for (range, name, replacement) in references.take(8) {
+        if edits
+            .last()
+            .is_some_and(|(previous, _)| previous.end > range.start)
+        {
+            continue;
+        }
+        let media = (|| {
+            let bytes = bounded(open_at(&dir, &name, false).map_err(|e| e.to_string())?)?;
+            blob(root, &bytes, &name)
+        })();
+        if let Ok(media) = media {
+            if !attachments.contains(&media) {
+                attachments.push(media);
+            }
+            edits.push((range, replacement));
+        }
+    }
+    if edits.is_empty() {
+        return false;
+    }
+    let mut projected = text.to_owned();
+    for (range, replacement) in edits.into_iter().rev() {
+        projected.replace_range(range, &replacement);
+    }
+    item["d4cText"] = json!(projected.trim());
+    item["d4cAttachments"] = json!(attachments);
+    true
+}
+
+pub fn project_item(root: &Path, item: &mut Value, thread: Option<&str>) -> bool {
+    if item["type"] == "agentMessage" {
+        return thread.is_some_and(|thread| project_reply(root, thread, item));
+    }
     let mut changed = false;
     if item["type"] == "imageGeneration"
         && let Some(path) = item["savedPath"].as_str()
@@ -257,7 +350,7 @@ mod tests {
     #[test]
     fn media_refs_round_trip_without_allowing_path_traversal_or_symlinks() {
         let root = std::env::temp_dir().join(format!("d4c-media-{}", Uuid::new_v4()));
-        fs::create_dir_all(root.join("codex/workspace")).unwrap();
+        fs::create_dir(&root).unwrap();
         fs::create_dir(root.join("uploads")).unwrap();
         let thread = Uuid::new_v4().to_string();
         let directory = share(&root, &thread, None).unwrap();
@@ -272,7 +365,7 @@ mod tests {
         assert!(share(&root, &thread, Some("fake.mp4")).is_err());
         assert!(download(&root, "upload/../../etc/passwd").is_err());
         let mut item = json!({"type":"dynamicToolCall","contentItems":[{"type":"inputImage","imageUrl":"data:image/png;base64,YQ=="}]});
-        assert!(project_item(&root, &mut item));
+        assert!(project_item(&root, &mut item, None));
         assert_eq!(
             download(
                 &root,
