@@ -6,7 +6,7 @@ license = "MIT"
 repository = "https://github.com/Blig-Vox/D4C"
 
 [dependencies]
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 tungstenite = "0.30"
