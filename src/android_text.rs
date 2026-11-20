@@ -40,6 +40,7 @@ pub fn detach() {
     *DESIRED.lock().unwrap() = None;
     *LAST.lock().unwrap() = None;
     *EDIT.lock().unwrap() = None;
+    SERVER_FORM.lock().unwrap().take();
     VISIBLE_BOTTOM.store(0, Ordering::Release);
     set_modal_visible(false);
     take_modal_back();
@@ -327,4 +328,56 @@ pub extern "system" fn Java_site_blig_d4c_D4cActivity_dismissChatOverlay(
         wake();
     }
     consume.into()
+}
+
+static SERVER_FORM: Mutex<Option<(String, String)>> = Mutex::new(None);
+pub fn take_server_form() -> Option<(String, String)> {
+    SERVER_FORM.lock().ok()?.take()
+}
+pub fn open_settings_action(form: Option<(String, String)>) {
+    let Some(app) = crate::platform::android_app() else {
+        return;
+    };
+    let activity_app = app.clone();
+    app.run_on_java_main_thread(Box::new(move || {
+        let vm = unsafe { jni::JavaVM::from_raw(activity_app.vm_as_ptr().cast()) };
+        if let Err(e) = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+            let raw = activity_app.activity_as_ptr() as jni::sys::jobject;
+            let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw)? };
+            let Some((name, url)) = form else {
+                env.call_method(
+                    activity.as_ref(),
+                    jni_str!("openSystemUpdate"),
+                    jni_sig!("()V"),
+                    &[],
+                )?;
+                return Ok(());
+            };
+            let name = env.new_string(name)?;
+            let url = env.new_string(url)?;
+            env.call_method(
+                activity.as_ref(),
+                jni_str!("openServerForm"),
+                jni_sig!("(Ljava/lang/String;Ljava/lang/String;)V"),
+                &[JValue::Object(&name), JValue::Object(&url)],
+            )?;
+            Ok(())
+        }) {
+            eprintln!("Android server form: {e}");
+        }
+    }));
+}
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_site_blig_d4c_D4cActivity_saveServerForm<'a>(
+    mut env: jni::EnvUnowned<'a>,
+    _this: JObject<'a>,
+    name: JString<'a>,
+    url: JString<'a>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        *SERVER_FORM.lock().unwrap() = Some((name.try_to_string(env)?, url.try_to_string(env)?));
+        wake();
+        Ok(())
+    })
+    .resolve::<jni::errors::ThrowRuntimeExAndDefault>();
 }

@@ -49,8 +49,13 @@ Wireless debugging page's separate connection port for
 ## Mobile behavior
 
 - Native Android composer supports keyboard suggestions, selection, composition,
-  emoji input and system clipboard copying. Other egui text fields are not native
-  EditText controls. Keyboard settings still govern autocorrection/suggestions.
+  emoji input and system clipboard copying. Settings → Add server uses native
+  name and URL fields with selection handles and long-press Paste. Keyboard settings still govern autocorrection/suggestions.
+- Settings → System update checks GitHub for a newer arm64 APK. Choose Stable
+  or Stable and alpha. The app also checks on resume after six hours. Confirm the
+  download, allow Android to install from D4C if prompted, then confirm installation.
+  The updater verifies package name, version, signing certificate and size, and
+  verifies the SHA-256 digest when GitHub supplies it.
 - The visible-window bounds keep the composer above the keyboard.
 - The system document picker uploads files up to 6 MB each. Tap chat images to
   open the viewer. Pinch, double-tap or use the zoom controls to inspect details.

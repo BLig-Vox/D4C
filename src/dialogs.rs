@@ -205,6 +205,21 @@ impl D4c {
                         }
                     });
                 }
+                #[cfg(target_os = "android")]
+                {
+                    if let Some((name, url)) = super::android_text::take_server_form() {
+                        self.connection_name = name;
+                        self.connection_url = url;
+                        self.save_connection();
+                    }
+                    if ui.add(neutral("Add server")).clicked() {
+                        super::android_text::open_settings_action(Some((
+                            self.connection_name.clone(),
+                            self.connection_url.clone(),
+                        )));
+                    }
+                }
+                #[cfg(not(target_os = "android"))]
                 egui::CollapsingHeader::new("Add server")
                     .id_salt("add_server")
                     .show(ui, |ui| {
@@ -225,6 +240,10 @@ impl D4c {
 
                 ui.add_space(8.0);
                 ui.separator();
+                #[cfg(target_os = "android")]
+                if ui.add(neutral("System update")).clicked() {
+                    super::android_text::open_settings_action(None);
+                }
                 ui.strong("Notifications");
                 let desktop_changed = toggle(ui, &mut self.preferences.desktop, "Desktop alerts");
                 let sound_changed = toggle(ui, &mut self.preferences.sound, "Sound");

@@ -15,6 +15,8 @@ public final class D4cActivity extends NativeActivity {
     // NativeActivity's own dlopen doesn't register the library with this Java
     // class loader, which is required to resolve our JNI result callback.
     static { System.loadLibrary("vox_d4c"); }
+    private D4cUpdates updates;
+    public void openSystemUpdate(){updates.menu();}
     private D4cVideo video;
     public void openVideo(long id,String path){
         if(video!=null) video.close();
@@ -49,7 +51,7 @@ public final class D4cActivity extends NativeActivity {
         }
     }
     private native void composerWindowHidden();
-    @Override protected void onResume(){super.onResume();composerActive=true;if(video!=null)video.resume();composerWindowHidden();}
+    @Override protected void onResume(){super.onResume();if(updates==null)updates=new D4cUpdates(this);updates.resume();composerActive=true;if(video!=null)video.resume();composerWindowHidden();}
     private native void finishNativeUi();
     @Override protected void onPause(){
         composerActive=false;hideComposer();if(video!=null)video.suspend();
@@ -106,6 +108,41 @@ public final class D4cActivity extends NativeActivity {
         if(focus){composer.requestFocus();composer.post(()->((android.view.inputmethod.InputMethodManager)getSystemService(INPUT_METHOD_SERVICE)).showSoftInput(composer,android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT));}
     }
     public void hideComposer(){if(composer!=null&&composerWindow.isShowing()){composer.clearFocus();((android.view.inputmethod.InputMethodManager)getSystemService(INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(composer.getWindowToken(),0);composerWindow.dismiss();}}
+
+    private native void saveServerForm(String name, String url);
+    public void openServerForm(String initialName, String initialUrl) {
+        android.widget.LinearLayout fields = new android.widget.LinearLayout(this);
+        fields.setOrientation(android.widget.LinearLayout.VERTICAL);
+        int inset = Math.round(20 * getResources().getDisplayMetrics().density);
+        fields.setPadding(inset, inset / 2, inset, 0);
+        android.widget.EditText name = new android.widget.EditText(this);
+        android.widget.EditText url = new android.widget.EditText(this);
+        name.setSingleLine(true);
+        name.setHint("Server name");
+        name.setText(initialName);
+        name.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_NEXT);
+        url.setSingleLine(true);
+        url.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_URI);
+        url.setHint("wss://your-server");
+        url.setText(initialUrl);
+        fields.addView(name);
+        fields.addView(url);
+        android.widget.ScrollView scroll = new android.widget.ScrollView(this);
+        scroll.addView(fields);
+        android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(this)
+            .setTitle("Add server").setView(scroll)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton("Save", (d, which) ->
+                saveServerForm(name.getText().toString(), url.getText().toString())).create();
+        url.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_DONE);
+        url.setOnEditorActionListener((v, action, event) -> {
+            if (action != android.view.inputmethod.EditorInfo.IME_ACTION_DONE) return false;
+            dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).performClick();
+            return true;
+        });
+        dialog.show();
+        dialog.getWindow().setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+    }
 
     public void copyText(String text){
         android.content.ClipboardManager clipboard=(android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
