@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2-alpha.1
+
+- Open composer image previews and keep fullscreen images visible on narrow and wide screens. Paste images directly on Linux.
+- Queue follow-up messages and attachments during a reply. Queues send in order when their chat is open and are cleared when the app exits.
+- Retry interrupted gateway connections sooner.
+- Count running virtual desktops separately from the host screen and report missing container images.
+
 ## 0.1.0-alpha.14
 
 - Align Markdown bullets with the first line of wrapped list items.

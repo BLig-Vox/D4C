@@ -102,6 +102,7 @@ struct D4c {
     explicit_selection: bool,
     jump_latest: bool,
     workspace_hydrated: bool,
+    queued_messages: std::collections::HashMap<(String, String), std::collections::VecDeque<Draft>>,
     draft_queue: draft_sync::Queue,
     imported_notifications: std::collections::HashSet<String>,
     remote_notifications: std::collections::HashSet<String>,
@@ -159,6 +160,7 @@ struct D4c {
     thinking: String,
     running: bool,
     attachments: Vec<(String, String, Vec<u8>)>,
+    composer_previews: std::collections::HashMap<[u8; 32], Option<egui::TextureHandle>>,
     markdown_cache: egui_commonmark::CommonMarkCache,
     commands: Vec<commands::Command>,
     command_request: Option<String>,
@@ -201,6 +203,7 @@ impl Default for D4c {
             explicit_selection: remembered.is_some(),
             jump_latest: false,
             workspace_hydrated: false,
+            queued_messages: Default::default(),
             draft_queue: Default::default(),
             imported_notifications: Default::default(),
             remote_notifications: Default::default(),
@@ -258,6 +261,7 @@ impl Default for D4c {
             thinking: default_thinking,
             running: false,
             attachments: Vec::new(),
+            composer_previews: Default::default(),
             markdown_cache: egui_commonmark::CommonMarkCache::default(),
             commands: vec![],
             command_request: None,
@@ -384,6 +388,7 @@ impl D4c {
         }
         let mut next = Self::default();
         next.server_views = views;
+        next.queued_messages = std::mem::take(&mut self.queued_messages);
         next.servers = servers;
         next.session = remembered.unwrap_or_else(|| format!("draft:{}", uuid::Uuid::new_v4()));
         next.explicit_selection = true;
@@ -847,6 +852,15 @@ impl D4c {
                 target.input.push_str(&draft.input);
             }
             target.attachments.extend(draft.attachments);
+        }
+        if let Some(queue) = self
+            .queued_messages
+            .remove(&(self.url.clone(), old.to_owned()))
+        {
+            self.queued_messages
+                .entry((self.url.clone(), new.to_owned()))
+                .or_default()
+                .extend(queue);
         }
         self.draft_queue.rekey(old, new);
         for key in self
@@ -2324,8 +2338,28 @@ impl D4c {
         };
         let theme = Theme::current(ui.ctx());
         let palette = theme.palette();
+        self.flush_queued_message();
+        let queue_key = (self.url.clone(), self.session.clone());
+        if let Some(queue) = self.queued_messages.get(&queue_key) {
+            ui.small(format!("{} queued", queue.len()));
+        }
         let composer_id = egui::Id::unique("message_input");
         let focused = !self.dialog_open() && ui.memory(|m| m.has_focus(composer_id));
+        #[cfg(not(target_os = "android"))]
+        if focused && self.upload.is_none() {
+            let pasted = ui.input(|input| {
+                input.events.iter().find_map(|event| match event {
+                    egui::Event::PasteImage(image) => Some(image.clone()),
+                    _ => None,
+                })
+            });
+            if let Some(image) = pasted {
+                self.upload = Some((
+                    self.session.clone(),
+                    uploads::paste_image(image, ui.ctx().clone()),
+                ));
+            }
+        }
         let mut candidates = if self.slash_dismissed {
             vec![]
         } else {
@@ -2473,15 +2507,51 @@ impl D4c {
                 }
                 if !self.attachments.is_empty() {
                     let mut remove = None;
+                    let mut visible_previews = std::collections::HashSet::new();
                     ui.horizontal_wrapped(|ui| {
-                        for (index, (name, _, bytes)) in self.attachments.iter().enumerate() {
+                        for (index, (name, mime, bytes)) in self.attachments.iter().enumerate() {
+                            let preview = if mime.starts_with("image/") {
+                                use sha2::Digest;
+                                let key: [u8; 32] = sha2::Sha256::digest(bytes).into();
+                                visible_previews.insert(key);
+                                self.composer_previews
+                                    .entry(key)
+                                    .or_insert_with(|| {
+                                        media::decode_image(bytes, 160).ok().map(|(image, _)| {
+                                            ui.ctx().load_texture(
+                                                format!("composer-{key:x?}"),
+                                                image,
+                                                egui::TextureOptions::LINEAR,
+                                            )
+                                        })
+                                    })
+                                    .as_ref()
+                            } else {
+                                None
+                            };
                             egui::Frame::new()
                                 .fill(egui::Color32::from_gray(48))
                                 .corner_radius(6)
                                 .inner_margin(6)
                                 .show(ui, |ui| {
+                                    ui.set_max_width(120.0);
+                                    if let Some(texture) = preview {
+                                        let thumbnail = egui::Image::new(texture)
+                                            .fit_to_exact_size(egui::vec2(88.0, 64.0))
+                                            .maintain_aspect_ratio(true)
+                                            .sense(egui::Sense::click());
+                                        if ui.add(thumbnail).on_hover_text("Open image").clicked() {
+                                            media::open_image(
+                                                name.clone(),
+                                                texture.clone(),
+                                                Some(std::sync::Arc::new(bytes.clone())),
+                                            );
+                                        }
+                                    }
                                     ui.horizontal(|ui| {
-                                        ui.label(icon_text(lucide_icons::Icon::File, 14.0));
+                                        if preview.is_none() {
+                                            ui.label(icon_text(lucide_icons::Icon::File, 14.0));
+                                        }
                                         ui.add(
                                             egui::Label::new(egui::RichText::new(name).small())
                                                 .truncate(),
@@ -2506,10 +2576,14 @@ impl D4c {
                                 });
                         }
                     });
+                    self.composer_previews
+                        .retain(|key, _| visible_previews.contains(key));
                     if let Some(index) = remove {
                         self.attachments.remove(index);
                     }
                     ui.add_space(5.0);
+                } else {
+                    self.composer_previews.clear();
                 }
                 let draft_scroll = egui::ScrollArea::vertical()
                     .id_salt("draft_scroll")
@@ -2560,7 +2634,17 @@ impl D4c {
                 }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let tools_width = (ui.available_width() - 42.0).max(1.0);
+                    // Reserve the send button *and* the spacing between both
+                    // groups. Otherwise the right group widens the frame and
+                    // clips its border against the edge of the window.
+                    let trailing_width = 40.0
+                        + ui.spacing().item_spacing.x
+                        + if self.upload.is_some() {
+                            24.0 + ui.spacing().item_spacing.x
+                        } else {
+                            0.0
+                        };
+                    let tools_width = (ui.available_width() - trailing_width).max(1.0);
                     ui.allocate_ui_with_layout(
                         egui::vec2(tools_width, 0.0),
                         egui::Layout::left_to_right(egui::Align::Center),
@@ -2587,7 +2671,10 @@ impl D4c {
                         },
                     );
                     ui.horizontal(|ui| {
-                        if self.running {
+                        if self.running
+                            && self.input.trim().is_empty()
+                            && self.attachments.is_empty()
+                        {
                             if ui
                                 .add(
                                     Button::new("Stop response")
@@ -2610,11 +2697,15 @@ impl D4c {
                                     && self.upload.is_none()
                                     && (!self.input.trim().is_empty()
                                         || !self.attachments.is_empty()),
-                                Button::new("Send")
+                                Button::new(if self.running { "Queue" } else { "Send" })
                                     .icon(lucide::ARROW_UP)
                                     .size(ButtonSize::Icon),
                             )
-                            .on_hover_text("Send · Enter")
+                            .on_hover_text(if self.running {
+                                "Queue message · Enter"
+                            } else {
+                                "Send · Enter"
+                            })
                             .clicked()
                         {
                             send = true;
@@ -2700,6 +2791,8 @@ impl D4c {
         if self.delete_chat.as_ref().is_some_and(|(k, _)| k == key) {
             self.delete_chat = None;
         }
+        self.queued_messages
+            .remove(&(self.url.clone(), key.to_owned()));
         self.draft_queue.forget(key);
         let rev = self
             .desktops
@@ -2776,7 +2869,6 @@ impl D4c {
 
     fn send(&mut self, ctx: &egui::Context) {
         if !self.connected
-            || self.running
             || self
                 .reload_request
                 .as_ref()
@@ -2809,13 +2901,58 @@ impl D4c {
         if self.desktops.slash(&text, &self.session, &self.url, ctx) {
             return;
         }
+        let draft = Draft {
+            input: text,
+            attachments: std::mem::take(&mut self.attachments),
+        };
+        let key = (self.url.clone(), self.session.clone());
+        if self.running
+            || self.active_sessions.contains(&self.session)
+            || self.queued_messages.contains_key(&key)
+        {
+            self.queued_messages
+                .entry(key)
+                .or_default()
+                .push_back(draft);
+            return;
+        }
+        self.send_message(draft);
+    }
+
+    fn flush_queued_message(&mut self) {
+        if self.queued_messages.is_empty()
+            || self.running
+            || !self.connected
+            || self.history_loading
+            || self.active_sessions.contains(&self.session)
+            || self.reload_request.is_some()
+            || self.permission_request.is_some()
+        {
+            return;
+        }
+        let key = (self.url.clone(), self.session.clone());
+        if let Some(queue) = self.queued_messages.get_mut(&key) {
+            let draft = queue.pop_front();
+            if queue.is_empty() {
+                self.queued_messages.remove(&key);
+            }
+            if let Some(draft) = draft {
+                self.send_message(draft);
+            }
+        }
+    }
+
+    fn send_message(&mut self, draft: Draft) {
+        let Draft {
+            input: text,
+            attachments,
+        } = draft;
         // Ignore any background tail snapshot requested before this send.
         self.history_request = None;
         self.history_dirty = true;
         let send_identity = uuid::Uuid::new_v4().to_string();
         self.messages.push(ChatMessage {
-            media: self
-                .attachments
+            media: attachments
                 .iter()
                 .map(|(n, m, b)| media::Attachment::new(n.clone(), m.clone(), b.clone()))
                 .collect(),
@@ -2823,7 +2960,7 @@ impl D4c {
             text: text.clone(),
             item_id: Some(format!("local:{send_identity}")),
         });
-        let attachments: Vec<_> = self.attachments.drain(..).map(|(name, mime, bytes)| {
+        let attachments: Vec<_> = attachments.into_iter().map(|(name, mime, bytes)| {
             let kind = if mime.starts_with("image/") { "image" } else { "file" };
             json!({"type":kind,"fileName":name,"mimeType":mime,"content":base64::engine::general_purpose::STANDARD.encode(bytes)})
         }).collect();
@@ -4782,6 +4919,7 @@ mod composer_tests {
     #[test]
     fn server_reset_discards_previous_server_content() {
         let mut app = D4c::default();
+        app.preferences = preferences::Settings::default();
         app.preferences.connections.push(preferences::Connection {
             name: "Other".into(),
             url: "wss://other.example".into(),
@@ -4805,6 +4943,30 @@ mod composer_tests {
         assert_ne!(app.session, old);
         assert_eq!(app.url, "wss://other.example");
         assert_eq!(app.token, "explicit-token-for-new-server");
+    }
+    #[test]
+    fn busy_chat_queues_followups_in_order() {
+        let mut app = D4c::default();
+        app.connected = true;
+        app.history_loading = false;
+        app.running = true;
+        app.sessions.push((app.session.clone(), "Test".into()));
+        let (_, rx) = std::sync::mpsc::channel();
+        let (out, requests) = std::sync::mpsc::channel();
+        app.gateway = Some(gateway::test_gateway(out, rx));
+        for message in ["first", "second"] {
+            app.input = message.into();
+            app.send(&egui::Context::default());
+        }
+        assert!(requests.try_recv().is_err());
+        for message in ["first", "second"] {
+            app.running = false;
+            app.active_sessions.clear();
+            app.flush_queued_message();
+            assert_eq!(requests.try_recv().unwrap()["params"]["message"], message);
+            app.flush_queued_message();
+            assert!(requests.try_recv().is_err());
+        }
     }
     #[test]
     fn hidden_compact_chat_is_not_visible() {

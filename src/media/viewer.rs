@@ -53,7 +53,7 @@ pub fn close_fullscreen() -> bool {
             .is_some_and(|m| std::mem::take(&mut m.fullscreen))
     })
 }
-pub(super) fn open_image(
+pub(crate) fn open_image(
     name: String,
     texture: egui::TextureHandle,
     original: Option<Arc<Vec<u8>>>,
@@ -216,13 +216,31 @@ fn image_ui(ui: &mut egui::Ui, picture: &mut Picture) {
     }
     let mut factor = 1.;
     ui.horizontal(|ui| {
-        if ui.button("−").on_hover_text("Zoom out").clicked() {
+        if ui
+            .add(
+                egui::Button::new(crate::icon_text(lucide_icons::Icon::Minus, 16.))
+                    .min_size(egui::vec2(36., 36.)),
+            )
+            .on_hover_text("Zoom out")
+            .clicked()
+        {
             factor = 0.8;
         }
-        if ui.button("+").on_hover_text("Zoom in").clicked() {
+        if ui
+            .add(
+                egui::Button::new(crate::icon_text(lucide_icons::Icon::Plus, 16.))
+                    .min_size(egui::vec2(36., 36.)),
+            )
+            .on_hover_text("Zoom in")
+            .clicked()
+        {
             factor = 1.25;
         }
-        if ui.button("Fit").clicked() {
+        if ui
+            .add(egui::Button::new("Fit").min_size(egui::vec2(36., 36.)))
+            .on_hover_text("Fit image")
+            .clicked()
+        {
             picture.zoom = 1.;
             picture.pan = egui::Vec2::ZERO;
         }
@@ -301,16 +319,33 @@ pub fn finish_frame(ctx: &egui::Context) {
                     let size = (bounds.size() - egui::Vec2::splat(16.)).max(egui::Vec2::splat(1.));
                     ui.set_min_size(size);
                     ui.set_max_size(size);
-                    ui.horizontal(|ui| {
-                        close = ui.button("Close").clicked();
-                        let name = v
-                            .picture
-                            .as_ref()
-                            .map(|p| p.name.as_str())
-                            .or_else(|| v.movie.as_ref().map(|m| m.name.as_str()))
-                            .unwrap_or("");
-                        ui.add(egui::Label::new(name).truncate());
-                    });
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 40.),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let name = v
+                                .picture
+                                .as_ref()
+                                .map(|p| p.name.as_str())
+                                .or_else(|| v.movie.as_ref().map(|m| m.name.as_str()))
+                                .unwrap_or("");
+
+                            close = ui
+                                .add(
+                                    egui::Button::new(crate::icon_text(lucide_icons::Icon::X, 18.))
+                                        .frame(false)
+                                        .min_size(egui::vec2(40., 40.)),
+                                )
+                                .on_hover_text("Close viewer")
+                                .clicked();
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.add(egui::Label::new(name).truncate());
+                                },
+                            );
+                        },
+                    );
                     if let Some(p) = v.picture.as_mut() {
                         image_ui(ui, p);
                     } else if let Some(movie) = v.movie.as_mut() {
@@ -335,4 +370,39 @@ pub fn finish_frame(ctx: &egui::Context) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fullscreen_image_paints_inside_viewport() {
+        for size in [egui::vec2(390., 800.), egui::vec2(1920., 1080.)] {
+            let ctx = egui::Context::default();
+            let texture = ctx.load_texture(
+                "fixture",
+                egui::ColorImage::filled([120, 80], egui::Color32::WHITE),
+                Default::default(),
+            );
+            let id = texture.id();
+            open_image("fixture.png".into(), texture, None);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let mut visible = false;
+            for _ in 0..3 {
+                let mut out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ui| finish_frame(ui.ctx()),
+                );
+                out.textures_delta.clear();
+                visible = ctx.tessellate(out.shapes, out.pixels_per_point).iter().any(|p| {
+                    matches!(&p.primitive, egui::epaint::Primitive::Mesh(m) if m.texture_id == id && m.calc_bounds().intersect(p.clip_rect).intersect(screen).height() > 50.)
+                });
+            }
+            reset();
+            assert!(visible, "Image outside viewport {size:?}");
+        }
+    }
 }

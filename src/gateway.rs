@@ -71,12 +71,16 @@ pub(crate) fn key() -> io::Result<SigningKey> {
 fn request(method: &str, params: Value) -> Value {
     json!({"type":"req","id":format!("{method}:{}",uuid::Uuid::new_v4()),"method":method,"params":params})
 }
+fn reconnect_delay(failures: u32) -> Duration {
+    Duration::from_millis(500 * (1u64 << failures.min(4)))
+}
 pub fn connect(url: String, _token: String, ctx: eframe::egui::Context) -> Gateway {
     let (out_tx, out_rx) = mpsc::channel::<Value>();
     let (event_tx, event_rx) = mpsc::channel::<Event>();
     let cancelled = Arc::new(AtomicBool::new(false));
     let stop = cancelled.clone();
     thread::spawn(move || {
+        let was_ready = std::cell::Cell::new(false);
         let emit = |event| {
             let _ = event_tx.send(event);
             ctx.request_repaint();
@@ -144,6 +148,7 @@ pub fn connect(url: String, _token: String, ctx: eframe::egui::Context) -> Gatew
                                     }
                                     send(&mut socket, json!({"method":"initialized"}))?;
                                     ready = true;
+                                    was_ready.set(true);
                                     emit(Event::Status("Connected".into()));
                                 } else {
                                     adapter.incoming(v);
@@ -164,11 +169,18 @@ pub fn connect(url: String, _token: String, ctx: eframe::egui::Context) -> Gatew
                 }
             }
         };
+        let mut failures = 0u32;
         while !stop.load(Ordering::Relaxed) {
+            was_ready.set(false);
             if let Err(e) = run() {
                 emit(Event::Error(e.to_string()));
             }
-            for _ in 0..30 {
+            if was_ready.get() {
+                failures = 0;
+            }
+            let delay = reconnect_delay(failures);
+            failures = failures.saturating_add(1);
+            for _ in 0..delay.as_millis() / 100 {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
@@ -189,6 +201,13 @@ pub fn rpc(method: &str, params: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reconnect_delay_starts_quickly_and_is_bounded() {
+        assert_eq!(reconnect_delay(0), Duration::from_millis(500));
+        assert_eq!(reconnect_delay(1), Duration::from_secs(1));
+        assert_eq!(reconnect_delay(4), Duration::from_secs(8));
+        assert_eq!(reconnect_delay(u32::MAX), Duration::from_secs(8));
+    }
     #[test]
     fn dropping_gateway_cancels_its_worker() {
         let (tx, _) = mpsc::channel();

@@ -15,6 +15,7 @@ mod backend;
 mod viewer;
 use std::io::{Read, Write};
 use tempfile::NamedTempFile;
+pub(crate) use viewer::open_image;
 pub use viewer::{close_fullscreen, finish_frame, is_fullscreen, reset};
 
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
@@ -120,7 +121,7 @@ fn decode(payload: Payload, video: bool) -> Result<Decoded, String> {
     Ok(Decoded::Image(image, reduced.then(|| Arc::new(bytes))))
 }
 
-fn decode_image(bytes: &[u8], max_side: u32) -> Result<(egui::ColorImage, bool), String> {
+pub(crate) fn decode_image(bytes: &[u8], max_side: u32) -> Result<(egui::ColorImage, bool), String> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|_| "Unknown image format")?;

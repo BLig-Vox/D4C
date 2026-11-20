@@ -135,7 +135,7 @@ fn safe_id(id: &str) -> Result<()> {
         .map_err(|_| "Invalid desktop ID".to_string())
         .map(|_| ())
 }
-fn host_desktop(id: &str) -> bool {
+pub(crate) fn host_desktop(id: &str) -> bool {
     std::env::var("D4C_HOST_DESKTOP_ID").as_deref() == Ok(id)
 }
 impl Runtime {
@@ -251,7 +251,14 @@ impl Runtime {
         if host_desktop(id) {
             return Ok(());
         }
-        command("podman", &["image", "exists", "localhost/d4c-arch-xfce:1"])?;
+        let image = "localhost/d4c-arch-xfce:1";
+        let result = Command::new("podman").args(["image", "exists", image]).output().map_err(|e| e.to_string())?;
+        if result.status.code() == Some(1) {
+            return Err(format!("Desktop image {image} is missing on this host"));
+        }
+        if !result.status.success() {
+            return Err(format!("Podman image lookup failed ({}): {}", result.status, String::from_utf8_lossy(&result.stderr).trim()));
+        }
         let base = self.root.join("desktops").join(id);
         for name in ["home", "work"] {
             let path = base.join(name);
