@@ -206,6 +206,18 @@ pub fn project_item(root: &Path, item: &mut Value) -> bool {
         .into_iter()
         .flatten()
     {
+        if part["type"] == "inputText"
+            && let Some(text) = part["text"].as_str().filter(|s| s.len() < 4096)
+            && let Ok(record) = serde_json::from_str::<Value>(text)
+            && let Some(key) = record["d4cScreenshot"]["artifactId"]
+                .as_str()
+                .and_then(|id| id.strip_prefix("upload/")?.strip_suffix("/Screenshot.png"))
+                .filter(|key| valid_id(key))
+        {
+            *part = json!({"type":"inputText","text":"Screenshot captured","d4cAttachment":metadata(format!("upload/{key}/Screenshot.png"),"Screenshot.png","image/png")});
+            changed = true;
+            continue;
+        }
         if part["type"] == "inputImage"
             && let Some(url) = part["imageUrl"]
                 .as_str()
