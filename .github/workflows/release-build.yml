@@ -34,23 +34,23 @@ jobs:
       - run: rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
       - uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           install: >-
             zip
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-gstreamer
-            mingw-w64-x86_64-gst-plugins-base
-            mingw-w64-x86_64-gst-plugins-good
-            mingw-w64-x86_64-gst-libav
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gstreamer
+            mingw-w64-ucrt-x86_64-gst-plugins-base
+            mingw-w64-ucrt-x86_64-gst-plugins-good
+            mingw-w64-ucrt-x86_64-gst-libav
       - name: Test and package Windows client
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          export PATH="/mingw64/bin:$(cygpath -u "$USERPROFILE")/.cargo/bin:$PATH"
-          export PKG_CONFIG="$(cygpath -w /mingw64/bin/pkg-config.exe)"
-          export PKG_CONFIG_PATH="$(cygpath -w /mingw64/lib/pkgconfig)"
-          export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="$(cygpath -w /mingw64/bin/gcc.exe)"
+          export PATH="/ucrt64/bin:$(cygpath -u "$USERPROFILE")/.cargo/bin:$PATH"
+          export PKG_CONFIG="$(cygpath -w /ucrt64/bin/pkg-config.exe)"
+          export PKG_CONFIG_PATH="$(cygpath -w /ucrt64/lib/pkgconfig)"
+          export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="$(cygpath -w /ucrt64/bin/gcc.exe)"
           cargo +stable-x86_64-pc-windows-gnu test --locked --bin vox-d4c updates::tests
           cargo +stable-x86_64-pc-windows-gnu build --locked --release --bin vox-d4c
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
@@ -58,10 +58,10 @@ jobs:
           mkdir -p "dist/$package/bin" "dist/$package/lib" "dist/$package/libexec"
           cp target/release/vox-d4c.exe "dist/$package/bin/"
           cp LICENSE README.md INSTALL.md "dist/$package/"
-          cp /mingw64/bin/*.dll "dist/$package/bin/"
-          cp -r /mingw64/lib/gstreamer-1.0 "dist/$package/lib/"
-          cp -r /mingw64/libexec/gstreamer-1.0 "dist/$package/libexec/"
-          cp -r /mingw64/share/licenses "dist/$package/third-party-licenses"
+          cp /ucrt64/bin/*.dll "dist/$package/bin/"
+          cp -r /ucrt64/lib/gstreamer-1.0 "dist/$package/lib/"
+          cp -r /ucrt64/libexec/gstreamer-1.0 "dist/$package/libexec/"
+          cp -r /ucrt64/share/licenses "dist/$package/third-party-licenses"
           cd dist
           zip -q -r "$package.zip" "$package"
       - name: Verify packaged GStreamer on Windows
