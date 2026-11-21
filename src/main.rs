@@ -317,9 +317,7 @@ impl D4c {
         self.workspace_hydrated = false;
         self.permission_request = None;
         self.questions.disconnected();
-        for (_, params) in std::mem::take(&mut self.pending_sends) {
-            self.restore_unsent(&params);
-        }
+        self.restore_pending_sends();
         self.sent_requests.clear();
         self.reload_request = None;
         self.selection_pending.clear();
@@ -441,10 +439,12 @@ impl D4c {
         next.restore_server_drafts();
         *self = next;
     }
-    fn save_server_drafts(&mut self) -> std::io::Result<()> {
+    fn restore_pending_sends(&mut self) {
         for (_, params) in std::mem::take(&mut self.pending_sends) {
             self.restore_unsent(&params);
         }
+    }
+    fn save_server_drafts(&mut self) -> std::io::Result<()> {
         self.sync_drafts();
         let mut rows = Vec::new();
         let mut add = |key: &str, text: &str, attachments: &Vec<uploads::Attachment>| {
@@ -531,10 +531,13 @@ impl D4c {
         if index >= self.preferences.connections.len() {
             return;
         }
-        if !self.pending_sends.is_empty() || !self.sent_requests.is_empty() {
-            self.settings_error =
-                "Waiting for Codex to accept the message before switching servers".into();
-            self.composer_error = self.settings_error.clone();
+        if self.preferences.connections[index].url == self.url {
+            if let Some(key) = target
+                && key != self.session
+            {
+                let load = !key.starts_with("draft:");
+                self.select_session(key, load);
+            }
             return;
         }
         if let Err(error) = self.save_server_drafts() {
@@ -564,6 +567,9 @@ impl D4c {
                     &self.status,
                 );
             }
+            let row = self.servers.rows.entry(self.url.clone()).or_default();
+            row.sends.pending = std::mem::take(&mut self.pending_sends);
+            row.sends.sent = std::mem::take(&mut self.sent_requests);
         }
         if self.desktops.workspace.link.is_some() {
             self.servers
@@ -573,12 +579,38 @@ impl D4c {
                 .workspace = Some(std::mem::take(&mut self.desktops.workspace));
         }
         self.reset_connection(index, String::new());
+        let sends = self
+            .servers
+            .rows
+            .get_mut(&self.url)
+            .map(|row| std::mem::take(&mut row.sends))
+            .unwrap_or_default();
+        self.pending_sends = sends.pending;
+        self.sent_requests = sends.sent;
+        let target = target.map(|key| sends.rekeys.get(&key).cloned().unwrap_or(key));
+        if !sends.rekeys.is_empty() {
+            for (old, new) in sends.rekeys {
+                self.adopt_session(&old, &new);
+                self.pending_rekeys.insert(old, new);
+            }
+            self.persist_rekeys();
+        }
         if let Some(key) = target
             && key != self.session
         {
             let load = !key.starts_with("draft:");
             self.select_session(key, load);
         }
+        for params in sends.failed {
+            self.restore_unsent(&params);
+        }
+        self.active_sessions.extend(
+            self.pending_sends
+                .values()
+                .chain(self.sent_requests.values())
+                .filter_map(|params| params["sessionKey"].as_str().map(str::to_owned)),
+        );
+        self.running |= self.active_sessions.contains(&self.session);
         if let Some((link, media_token, online, status)) = self.servers.take_warm(&self.url) {
             self.gateway = Some(link);
             self.media_auth = media_token;
@@ -1132,9 +1164,7 @@ impl D4c {
                     }
                 }
                 gateway::Event::Error(s) => {
-                    for (_, params) in std::mem::take(&mut self.pending_sends) {
-                        self.restore_unsent(&params);
-                    }
+                    self.restore_pending_sends();
                     self.connected = false;
                     self.list_pending = false;
                     self.list_dirty = false;
@@ -3116,6 +3146,7 @@ impl eframe::App for D4c {
     #[cfg(target_os = "android")]
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         media::reset();
+        self.restore_pending_sends();
         let _ = self.save_server_drafts();
         self.servers.select(&self.url, &self.session);
         self.servers.save();
@@ -3123,6 +3154,7 @@ impl eframe::App for D4c {
     #[cfg(not(target_os = "android"))]
     fn on_exit(&mut self) {
         media::reset();
+        self.restore_pending_sends();
         let _ = self.save_server_drafts();
         self.servers.select(&self.url, &self.session);
         self.servers.save();
