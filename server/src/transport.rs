@@ -352,9 +352,10 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
                             continue;
                         }
                         if request["method"] == "d4c/attachment/download" {
-                            let result = crate::chat_media::download(
+                            let result = crate::chat_media::download_range(
                                 &manager.runtime.root,
                                 request["params"]["artifactId"].as_str().unwrap_or(""),
+                                request["params"]["offset"].as_u64(),
                             );
                             let response = match result {
                                 Ok(value) => json!({"id":request["id"],"result":value}),

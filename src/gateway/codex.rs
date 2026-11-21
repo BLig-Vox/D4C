@@ -160,11 +160,13 @@ impl Adapter {
             "sessions.delete" => self.call("thread/delete", json!({"threadId":k}), req),
             "sessions.archive" => self.call("thread/archive", json!({"threadId":k}), req),
             "chat.send" => self.send_turn(req),
-            "artifacts.download" => self.call(
-                "d4c/attachment/download",
-                json!({"artifactId":p["artifactId"]}),
-                req,
-            ),
+            "artifacts.download" => {
+                let mut params = json!({"artifactId":p["artifactId"]});
+                if let Some(offset) = p["offset"].as_u64() {
+                    params["offset"] = json!(offset);
+                }
+                self.call("d4c/attachment/download", params, req)
+            }
             "chat.abort" => {
                 if let Some(turn) = self.active.get(&k) {
                     self.call("turn/interrupt", json!({"threadId":k,"turnId":turn}), req);

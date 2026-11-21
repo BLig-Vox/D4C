@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     os::unix::{fs::OpenOptionsExt, io::AsRawFd},
     path::{Path, PathBuf},
 };
@@ -113,7 +113,12 @@ fn blob(root: &Path, bytes: &[u8], name: &str) -> Result<Value, String> {
     }
     Ok(metadata(format!("blob/{hash}/{name}"), name, mime))
 }
+#[cfg(test)]
 pub fn download(root: &Path, id: &str) -> Result<Value, String> {
+    download_range(root, id, None)
+}
+
+pub fn download_range(root: &Path, id: &str, offset: Option<u64>) -> Result<Value, String> {
     let mut parts = id.splitn(3, '/');
     let kind = parts.next().unwrap_or("");
     let key = parts.next().ok_or("Missing media identifier")?;
@@ -122,7 +127,7 @@ pub fn download(root: &Path, id: &str) -> Result<Value, String> {
         .filter(|n| filename(n))
         .ok_or("Invalid attachment name")?;
     let media_type = mime(name).ok_or("Unsupported media format")?;
-    let file = (|| -> io::Result<_> {
+    let mut file = (|| -> io::Result<_> {
         match kind {
             "blob" if key.len() == 64 && key.bytes().all(|c| c.is_ascii_hexdigit()) => {
                 open_at(&fs::File::open(root.join("chat-media-cache"))?, key, false)
@@ -136,6 +141,21 @@ pub fn download(root: &Path, id: &str) -> Result<Value, String> {
         }
     })()
     .map_err(|e| e.to_string())?;
+    if let Some(offset) = offset.filter(|_| media_type.starts_with("video/")) {
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        let total = metadata.len();
+        if !metadata.is_file() || total > LIMIT as u64 || offset >= total {
+            return Err("Invalid video size or offset".into());
+        }
+        let mut chunk = vec![0; (total - offset).min(512 * 1024) as usize];
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.read_exact(&mut chunk))
+            .map_err(|e| e.to_string())?;
+        return Ok(
+            json!({"data":STANDARD.encode(chunk),"offset":offset,"total":total,
+            "artifact":{"mimeType":media_type}}),
+        );
+    }
     Ok(json!({"data":STANDARD.encode(bounded(file)?),"artifact":{"mimeType":media_type}}))
 }
 fn export_dir(root: &Path, thread: &str, create: bool) -> Result<fs::File, String> {
@@ -355,12 +375,22 @@ mod tests {
         let thread = Uuid::new_v4().to_string();
         let directory = share(&root, &thread, None).unwrap();
         let dir = Path::new(directory["directory"].as_str().unwrap());
-        fs::write(dir.join("clip.mp4"), b"video-bytes").unwrap();
+        let video = [vec![42; 512 * 1024], b"tail".to_vec()].concat();
+        fs::write(dir.join("clip.mp4"), &video).unwrap();
         let r = share(&root, &thread, Some("clip.mp4")).unwrap();
+        let id = r["d4cAttachment"]["artifactId"].as_str().unwrap();
         assert_eq!(
-            download(&root, r["d4cAttachment"]["artifactId"].as_str().unwrap()).unwrap()["data"],
-            STANDARD.encode(b"video-bytes")
+            download(&root, id).unwrap()["data"],
+            STANDARD.encode(&video)
         );
+        let first = download_range(&root, id, Some(0)).unwrap();
+        let last = download_range(&root, id, Some(512 * 1024)).unwrap();
+        assert_eq!(first["total"], video.len());
+        assert_eq!(first["offset"], 0);
+        assert_eq!(last["offset"], 512 * 1024);
+        assert_eq!(first["data"], STANDARD.encode(&video[..512 * 1024]));
+        assert_eq!(last["data"], STANDARD.encode(b"tail"));
+        assert!(download_range(&root, id, Some(video.len() as u64)).is_err());
         std::os::unix::fs::symlink("/etc/passwd", dir.join("fake.mp4")).unwrap();
         assert!(share(&root, &thread, Some("fake.mp4")).is_err());
         assert!(download(&root, "upload/../../etc/passwd").is_err());

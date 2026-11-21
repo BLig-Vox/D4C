@@ -51,6 +51,11 @@ enum State {
     Pending(Payload),
     Loading(Arc<Mutex<Option<Result<Decoded, String>>>>),
     Image(egui::TextureHandle, Option<Arc<Vec<u8>>>),
+    Downloading {
+        file: NamedTempFile,
+        received: u64,
+        total: u64,
+    },
     Video(Arc<NamedTempFile>),
     Error(String),
     DownloadFailed(String),
@@ -58,6 +63,18 @@ enum State {
 enum Decoded {
     Image(egui::ColorImage, Option<Arc<Vec<u8>>>),
     Video(NamedTempFile),
+}
+
+const VIDEO_LIMIT: u64 = 128 * 1024 * 1024;
+
+fn video_temp() -> Result<NamedTempFile, String> {
+    #[cfg(target_os = "android")]
+    let directory = crate::platform::attachment_cache().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "android")]
+    std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    #[cfg(not(target_os = "android"))]
+    let directory = std::env::temp_dir();
+    NamedTempFile::new_in(directory).map_err(|e| e.to_string())
 }
 
 fn decode(payload: Payload, video: bool) -> Result<Decoded, String> {
@@ -92,14 +109,7 @@ fn decode(payload: Payload, video: bool) -> Result<Decoded, String> {
         }
     };
     if video {
-        #[cfg(target_os = "android")]
-        let directory = crate::platform::attachment_cache().map_err(|e| e.to_string())?;
-        #[cfg(target_os = "android")]
-        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-        #[cfg(not(target_os = "android"))]
-        let directory = std::env::temp_dir();
-        let mut file = NamedTempFile::new_in(directory).map_err(|e| e.to_string())?;
-        const VIDEO_LIMIT: u64 = 128 * 1024 * 1024;
+        let mut file = video_temp()?;
         let count = std::io::copy(&mut input.take(VIDEO_LIMIT + 1), &mut file)
             .map_err(|e| e.to_string())?;
         if count == 0 || count > VIDEO_LIMIT {
@@ -121,7 +131,10 @@ fn decode(payload: Payload, video: bool) -> Result<Decoded, String> {
     Ok(Decoded::Image(image, reduced.then(|| Arc::new(bytes))))
 }
 
-pub(crate) fn decode_image(bytes: &[u8], max_side: u32) -> Result<(egui::ColorImage, bool), String> {
+pub(crate) fn decode_image(
+    bytes: &[u8],
+    max_side: u32,
+) -> Result<(egui::ColorImage, bool), String> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|_| "Unknown image format")?;
@@ -149,14 +162,64 @@ pub(crate) fn decode_image(bytes: &[u8], max_side: u32) -> Result<(egui::ColorIm
     ))
 }
 impl Attachment {
-    pub fn wants_download(&self) -> bool {
-        self.visible.load(Ordering::Relaxed)
-            && (!self.mime.starts_with("video/") || self.play_requested.load(Ordering::Relaxed))
-            && self
-                .state
-                .lock()
-                .is_ok_and(|s| matches!(&*s,State::Pending(Payload::Bytes(b)) if b.is_empty()))
+    pub fn pending_offset(&self) -> Option<u64> {
+        match &*self.state.lock().ok()? {
+            State::Pending(Payload::Bytes(bytes)) if bytes.is_empty() => Some(0),
+            State::Downloading { received, .. } => Some(*received),
+            _ => None,
+        }
     }
+
+    pub fn download_offset(&self) -> Option<u64> {
+        let offset = self.pending_offset()?;
+        (offset > 0
+            || (self.visible.load(Ordering::Relaxed)
+                && (!self.mime.starts_with("video/")
+                    || self.play_requested.load(Ordering::Relaxed))))
+        .then_some(offset)
+    }
+
+    pub fn receive_video_chunk(&mut self, offset: u64, total: u64, bytes: &[u8]) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let result = (|| -> Result<State, String> {
+            let end = offset
+                .checked_add(bytes.len() as u64)
+                .ok_or("Invalid video chunk")?;
+            if !self.mime.starts_with("video/")
+                || total > VIDEO_LIMIT
+                || bytes.is_empty()
+                || end > total
+            {
+                return Err("Invalid video chunk".into());
+            }
+            let mut file = match std::mem::replace(&mut *state, State::Error(String::new())) {
+                State::Pending(Payload::Bytes(data)) if data.is_empty() && offset == 0 => {
+                    video_temp()?
+                }
+                State::Downloading {
+                    file,
+                    received,
+                    total: expected,
+                } if received == offset && expected == total => file,
+                _ => return Err("Unexpected video chunk".into()),
+            };
+            file.write_all(bytes).map_err(|e| e.to_string())?;
+            if end == total {
+                file.flush().map_err(|e| e.to_string())?;
+                Ok(State::Video(Arc::new(file)))
+            } else {
+                Ok(State::Downloading {
+                    file,
+                    received: end,
+                    total,
+                })
+            }
+        })();
+        *state = result.unwrap_or_else(State::DownloadFailed);
+    }
+
     pub fn cache_bytes(&self) -> usize {
         let payload = self
             .state
@@ -177,7 +240,7 @@ impl Attachment {
                     .product::<usize>()
                     .saturating_mul(8)
                     .saturating_add(original.as_ref().map_or(0, |b| b.len())),
-                State::Video(_) => 256,
+                State::Video(_) | State::Downloading { .. } => 256,
                 State::Error(e) | State::DownloadFailed(e) => e.len(),
             })
             .unwrap_or(usize::MAX / 2);
@@ -337,7 +400,11 @@ impl Attachment {
                     ui.ctx()
                         .request_repaint_after(std::time::Duration::from_millis(200));
                 }
-                ui.weak("Waiting for attachment…");
+                ui.weak(if video {
+                    "Starting download…"
+                } else {
+                    "Waiting for attachment…"
+                });
             } else {
                 ui.weak("Attachment unavailable");
             }
@@ -378,13 +445,7 @@ impl Attachment {
                             .load_texture(&self.name, image, egui::TextureOptions::LINEAR),
                         original,
                     ),
-                    Ok(Decoded::Video(file)) => {
-                        let file = Arc::new(file);
-                        if visible {
-                            viewer::play(file.clone(), self.name.clone());
-                        }
-                        State::Video(file)
-                    }
+                    Ok(Decoded::Video(file)) => State::Video(Arc::new(file)),
                     Err(error) => State::Error(error),
                 }
             }
@@ -405,7 +466,24 @@ impl Attachment {
                     viewer::open_image(self.name.clone(), texture.clone(), original.clone());
                 }
             }
-            State::Video(file) => viewer::inline(ui, &self.name, file),
+            State::Downloading {
+                received, total, ..
+            } => {
+                ui.add(
+                    egui::ProgressBar::new(*received as f32 / *total as f32)
+                        .desired_width(width)
+                        .text(format!(
+                            "Downloading video · {}%",
+                            *received * 100 / *total
+                        )),
+                );
+            }
+            State::Video(file) => {
+                if visible && self.play_requested.swap(false, Ordering::Relaxed) {
+                    viewer::play(file.clone(), self.name.clone());
+                }
+                viewer::inline(ui, &self.name, file);
+            }
             State::DownloadFailed(error) => {
                 ui.weak(error);
                 if ui.button("Retry download").clicked() {

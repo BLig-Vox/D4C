@@ -157,7 +157,7 @@ struct D4c {
     fallback_titles: std::collections::HashMap<String, String>,
     title_requests: std::collections::HashMap<String, String>,
     media_auth: Option<String>,
-    media_requests: std::collections::HashMap<String, (String, String)>,
+    media_requests: std::collections::HashMap<String, (String, String, u64, std::time::Instant)>,
     messages: Vec<ChatMessage>,
     input: String,
     questions: questions::Questions,
@@ -906,7 +906,7 @@ impl D4c {
         {
             *key = new.into();
         }
-        for (key, _) in self.media_requests.values_mut() {
+        for (key, ..) in self.media_requests.values_mut() {
             if key == old {
                 *key = new.into();
             }
@@ -1368,7 +1368,7 @@ impl D4c {
                         continue;
                     }
                     let id = v["id"].as_str().unwrap_or("");
-                    if let Some((session, artifact)) = self.media_requests.remove(id) {
+                    if let Some((session, artifact, offset, _)) = self.media_requests.remove(id) {
                         if session == self.session {
                             let p = &v["payload"];
                             let bytes = p["data"]
@@ -1383,11 +1383,26 @@ impl D4c {
                                 .messages
                                 .iter_mut()
                                 .flat_map(|m| &mut m.media)
-                                .filter(|a| a.artifact.as_deref() == Some(&artifact))
+                                .filter(|a| {
+                                    a.artifact.as_deref() == Some(&artifact)
+                                        && a.pending_offset() == Some(offset)
+                                })
                             {
                                 if v["ok"] == true
                                     && let Some(bytes) = bytes.as_ref()
                                 {
+                                    if let Some(total) = p["total"].as_u64() {
+                                        if p["offset"].as_u64() == Some(offset) {
+                                            attachment.receive_video_chunk(offset, total, bytes);
+                                        } else {
+                                            attachment.download_failed("Unexpected video chunk");
+                                        }
+                                        continue;
+                                    }
+                                    if offset != 0 {
+                                        attachment.download_failed("Interrupted video download");
+                                        continue;
+                                    }
                                     let mime = p["artifact"]["mimeType"]
                                         .as_str()
                                         .unwrap_or(&attachment.mime)
@@ -3149,6 +3164,22 @@ impl eframe::App for D4c {
 }
 impl D4c {
     fn load_media(&mut self) {
+        self.media_requests
+            .retain(|_, (session, artifact, offset, started)| {
+                if started.elapsed() < std::time::Duration::from_secs(45) {
+                    return true;
+                }
+                if session == &self.session {
+                    for media in self.messages.iter_mut().flat_map(|m| &mut m.media) {
+                        if media.artifact.as_ref() == Some(artifact)
+                            && media.pending_offset() == Some(*offset)
+                        {
+                            media.download_failed("Attachment download timed out");
+                        }
+                    }
+                }
+                false
+            });
         if !self.connected {
             return;
         }
@@ -3159,23 +3190,30 @@ impl D4c {
             }
             if let Some(id) = media.artifact.as_ref()
                 && self.media_requests.len() + requests.len() < 4
-                && media.wants_download()
+                && let Some(offset) = media.download_offset()
                 && !self
                     .media_requests
                     .values()
-                    .any(|(s, a)| s == &self.session && a == id)
-                && !requests.contains(id)
+                    .any(|(s, a, ..)| s == &self.session && a == id)
+                && !requests.iter().any(|(artifact, _)| artifact == id)
             {
-                requests.push(id.clone());
+                requests.push((id.clone(), offset));
             }
         }
-        for artifact in requests {
+        for (artifact, offset) in requests {
             if let Some(id) = self.rpc(
                 "artifacts.download",
-                json!({"sessionKey":self.session,"artifactId":artifact}),
+                json!({"sessionKey":self.session,"artifactId":artifact,"offset":offset}),
             ) {
-                self.media_requests
-                    .insert(id, (self.session.clone(), artifact));
+                self.media_requests.insert(
+                    id,
+                    (
+                        self.session.clone(),
+                        artifact,
+                        offset,
+                        std::time::Instant::now(),
+                    ),
+                );
             }
         }
     }
@@ -3287,6 +3325,9 @@ impl D4c {
         }
         self.poll_upload();
         self.load_media();
+        if !self.media_requests.is_empty() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
         #[cfg(target_os = "android")]
         if let Some(session) = android_notifications::take_session() {
             self.select_session(session, true);
@@ -4005,6 +4046,15 @@ fn message_bubble(
                                 };
                                 ui.label(icon_text(icon, 12.0).color(color));
                                 ui.label(egui::RichText::new(title).size(11.0).color(color));
+                                #[cfg(target_os = "android")]
+                                if !display_text.is_empty()
+                                    && ui
+                                        .small_button("Select")
+                                        .on_hover_text("Select or copy message")
+                                        .clicked()
+                                {
+                                    android_text::select_message(display_text.to_string());
+                                }
                             });
                             ui.add_space(3.0);
                             for media in &message.media {

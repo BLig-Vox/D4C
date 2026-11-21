@@ -151,6 +151,23 @@ public final class D4cActivity extends NativeActivity {
         if(android.os.Build.VERSION.SDK_INT<33)android.widget.Toast.makeText(this,"Copied",android.widget.Toast.LENGTH_SHORT).show();
     }
 
+    public void selectMessage(String text) {
+        android.widget.TextView message = new android.widget.TextView(this);
+        message.setText(text);
+        message.setTextSize(16);
+        message.setTextIsSelectable(true);
+        int padding = Math.round(20 * getResources().getDisplayMetrics().density);
+        message.setPadding(padding, padding, padding, padding);
+        android.widget.ScrollView scroll = new android.widget.ScrollView(this);
+        scroll.addView(message);
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Select message")
+                .setView(scroll)
+                .setPositiveButton("Copy all", (dialog, which) -> copyText(text))
+                .setNegativeButton("Done", null)
+                .show();
+    }
+
     // Draw complete grapheme clusters with Android's font fallback/emoji shaper.
     private android.graphics.Typeface bundledEmoji;
     public int[] rasterizeEmoji(String cluster,float size,boolean color){

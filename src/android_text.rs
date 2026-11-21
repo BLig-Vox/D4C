@@ -260,10 +260,10 @@ pub fn flush_platform_commands(ctx: &egui::Context) {
         let mut texts = Vec::new();
         output.commands.retain(|command| {
             if let egui::OutputCommand::CopyText(text) = command {
-                texts.push((false, text.clone()));
+                texts.push((TextAction::Copy, text.clone()));
                 false
             } else if let egui::OutputCommand::OpenUrl(link) = command {
-                texts.push((true, link.url.clone()));
+                texts.push((TextAction::Link, link.url.clone()));
                 false
             } else {
                 true
@@ -271,34 +271,48 @@ pub fn flush_platform_commands(ctx: &egui::Context) {
         });
         texts
     });
+    for (action, text) in texts {
+        run_text_action(action, text);
+    }
+}
+
+enum TextAction {
+    Copy,
+    Link,
+    Select,
+}
+
+pub fn select_message(text: String) {
+    run_text_action(TextAction::Select, text);
+}
+
+fn run_text_action(action: TextAction, text: String) {
     let Some(app) = crate::platform::android_app() else {
         return;
     };
-    for (is_link, text) in texts {
-        let activity_app = app.clone();
-        app.run_on_java_main_thread(Box::new(move || {
-            let vm = unsafe { jni::JavaVM::from_raw(activity_app.vm_as_ptr().cast()) };
-            let result = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
-                let raw = activity_app.activity_as_ptr() as jni::sys::jobject;
-                let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw)? };
-                let text = env.new_string(&text)?;
-                env.call_method(
-                    activity.as_ref(),
-                    if is_link {
-                        jni_str!("openChatLink")
-                    } else {
-                        jni_str!("copyText")
-                    },
-                    jni_sig!("(Ljava/lang/String;)V"),
-                    &[JValue::Object(&text)],
-                )?;
-                Ok(())
-            });
-            if let Err(error) = result {
-                eprintln!("D4C Android platform action: {error}");
-            }
-        }));
-    }
+    let activity_app = app.clone();
+    app.run_on_java_main_thread(Box::new(move || {
+        let vm = unsafe { jni::JavaVM::from_raw(activity_app.vm_as_ptr().cast()) };
+        let result = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+            let raw = activity_app.activity_as_ptr() as jni::sys::jobject;
+            let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw)? };
+            let text = env.new_string(&text)?;
+            env.call_method(
+                activity.as_ref(),
+                match action {
+                    TextAction::Link => jni_str!("openChatLink"),
+                    TextAction::Copy => jni_str!("copyText"),
+                    TextAction::Select => jni_str!("selectMessage"),
+                },
+                jni_sig!("(Ljava/lang/String;)V"),
+                &[JValue::Object(&text)],
+            )?;
+            Ok(())
+        });
+        if let Err(error) = result {
+            eprintln!("D4C Android platform action: {error}");
+        }
+    }));
 }
 
 #[unsafe(no_mangle)]
