@@ -21,6 +21,8 @@ mod preferences;
 mod questions;
 mod rfb;
 mod servers;
+#[cfg(not(target_os = "android"))]
+mod updates;
 mod uploads;
 mod wire;
 mod workspace;
@@ -29,6 +31,20 @@ use eframe::egui;
 use serde_json::{Value, json};
 
 fn main() -> eframe::Result {
+    #[cfg(target_os = "windows")]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--check-media")) {
+        if let Err(error) = gstreamer::init() {
+            eprintln!("GStreamer initialization failed: {error}");
+            std::process::exit(1);
+        }
+        for name in ["playbin", "appsink", "qtdemux", "avdec_h264"] {
+            if gstreamer::ElementFactory::find(name).is_none() {
+                eprintln!("Missing GStreamer element: {name}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     let _ = rustls::crypto::ring::default_provider().install_default();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -40,7 +56,7 @@ fn main() -> eframe::Result {
                 ))
                 .expect("packaged D4C icon"),
             )
-            .with_fullscreen(true),
+            .with_fullscreen(!cfg!(target_os = "windows")),
         ..Default::default()
     };
     run(options)
@@ -117,6 +133,8 @@ struct D4c {
     connection_name: String,
     connection_url: String,
     settings_error: String,
+    #[cfg(not(target_os = "android"))]
+    updates: updates::Check,
     switch_pending: Option<usize>,
     composer_picker: Option<(ComposerPicker, egui::Response)>,
     compact_previous: bool,
@@ -217,6 +235,8 @@ impl Default for D4c {
             connection_name: String::new(),
             connection_url: String::new(),
             settings_error: String::new(),
+            #[cfg(not(target_os = "android"))]
+            updates: updates::Check::default(),
             switch_pending: None,
             composer_picker: None,
             compact_previous: false,

@@ -1,12 +1,12 @@
 # Install a D4C server
 
-Set up a fresh Linux host for Codex chats from D4C on Android or Linux. Each host runs its own Codex app server and keeps its chat history when you close the client. Repeat the server setup for each host you want to use. For an existing installation, follow the [deployment and migration guide](docs/setup.md).
+Set up a fresh Linux host for Codex chats from D4C on Android, Linux, or Windows. Each host runs its own Codex app server and keeps its chat history when you close the client. Repeat the server setup for each host you want to use. For an existing installation, follow the [deployment and migration guide](docs/setup.md).
 
 ## If you use Windows
 
 - **Use an existing Linux PC or VPS.** Open PowerShell in Windows Terminal and run `ssh your-user@your-server`, substituting your Linux username and the server's address. If `ssh` is missing, install the Windows OpenSSH Client. You can complete the Codex browser sign-in on Windows while the SSH session stays open. [Microsoft's Windows Terminal SSH guide](https://learn.microsoft.com/en-us/windows/terminal/tutorials/ssh)
 - **Run the server on your Windows PC.** Set up an x86_64 Linux VM that meets the requirements below. Open a terminal inside the VM and install Tailscale there so the VM has its own tailnet address. Keep the PC awake and the VM running whenever you want D4C to be available.
-- **Open D4C.** Use the Android APK or the desktop client in a Linux graphical session, including one inside a VM. The project currently ships Android and Linux clients.
+- **Open D4C.** Download the Windows x86_64 ZIP, extract the entire archive, and run `bin\vox-d4c.exe`. Connect Windows to the same tailnet as the Linux host, then add the host’s private WSS URL in D4C.
 
 Before running the numbered setup steps, run these checks in the SSH session or VM terminal. Expect `Linux` and `x86_64`.
 
@@ -23,7 +23,7 @@ uname -m
 | Runtime | Node.js and npm compatible with the Codex version below, plus system Python 3 with `croniter` and `websocket-client` for scheduled jobs |
 | Network | Tailscale on the host and each client, access to the same tailnet, and a tailnet admin who can enable MagicDNS and HTTPS certificates |
 | Sign-in | A ChatGPT account with Codex access and a browser to complete device authorization |
-| Downloads | The prebuilt Linux x86_64 **server** archive and its `SHA256SUMS`, plus the Android arm64 APK or Linux desktop client |
+| Downloads | The prebuilt Linux x86_64 **server** archive and its `SHA256SUMS`, plus the Android arm64 APK or the desktop package for Linux or Windows |
 | Optional desktops | Rootless Podman with Quadlet, pasta, subordinate UID/GID ranges, and a user D-Bus session |
 
 The release archive contains the D4C server executable. The steps below use it directly. [D4C releases](https://github.com/BLig-Vox/D4C/releases)

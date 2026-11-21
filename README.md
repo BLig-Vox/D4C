@@ -2,22 +2,24 @@
 
 # D4C
 
-A native Rust client for Codex App Server. Chat, stream replies and tool activity, schedule work, and control isolated desktops from Linux or Android.
+A native Rust client for Codex App Server. Chat, stream replies and tool activity, schedule work, and control isolated desktops from Linux, Windows, or Android.
 
-**Alpha software.** Linux and Android arm64 are the current targets. Your server runs Codex and keeps their state while the app is closed. If you're on Windows, see [how to set up a Linux host from Windows](INSTALL.md#if-you-use-windows).
+**Alpha software.** The Linux host runs Codex and keeps your sessions active while the app is closed. See [Windows setup](INSTALL.md#if-you-use-windows) to connect the Windows client to a Linux host.
 
 ## Get started
 
 1. Install the D4C manager and Codex CLI on your host, then sign in to Codex under the service account. Follow the [server installation guide](INSTALL.md).
-2. Download the Android arm64 APK or Linux x86_64 archive from [Releases](https://github.com/BLig-Vox/D4C/releases).
+2. Download the Android arm64 APK, Linux x86_64 archive, or Windows x86_64 ZIP from [Releases](https://github.com/BLig-Vox/D4C/releases).
 3. In **Settings → Add server**, enter the server name and private WSS URL. Existing installations keep their saved server addresses.
 4. On a new device, compare its displayed fingerprint and approve the matching ID on the server using `d4c-server --approve DEVICE_ID`.
 
 Select a chat under its server in the sidebar. Returning to a visited server reuses a healthy chat connection and fetches recent history. **Settings → Workspace server** sets an optional endpoint for desks and drafts. The default uses the same hostname on port 8443.
 
+On Windows, extract the entire ZIP and run `bin\vox-d4c.exe`. On desktop, open **Settings → System update** to check Stable or Alpha releases for your platform. **Download** opens the matching archive in your browser. Close D4C and extract the new package to upgrade.
+
 ## Host setup from Codex to Tailscale
 
-One Linux host runs one D4C manager and one persistent Codex app server. A phone or Linux client opens a private WebSocket to the manager over Tailscale. The manager authenticates the device and forwards chat to Codex over a local Unix socket. The host keeps the threads, scheduled jobs and desktop environments when a client closes. Repeat the setup on each host you want in the sidebar.
+One Linux host runs one D4C manager and one persistent Codex app server. A phone or desktop client opens a private WebSocket to the manager over Tailscale. The manager authenticates the device and forwards chat to Codex over a local Unix socket. The host keeps the threads, scheduled jobs and desktop environments when a client closes. Repeat the setup on each host you want in the sidebar.
 
 **Choose the right starting point.** The steps below assume a fresh host. For an existing native Codex installation with missing chat images, skip to [upgrading the manager](#upgrade-the-manager-and-verify-chat-images). When moving existing OpenClaw conversations, follow the snapshot and import sequence **before** creating the Codex workspace. Fresh installations use Codex directly. [OpenClaw migration guide](docs/setup.md#migrate-an-existing-openclaw-host)
 
@@ -124,7 +126,7 @@ sudo -u d4c /usr/local/bin/d4c-server --config /etc/d4c/manager.json --list-devi
 sudo -u d4c /usr/local/bin/d4c-server --config /etc/d4c/manager.json --approve DEVICE_ID
 ```
 
-**Tailnet membership provides connectivity. D4C pairing grants access to a specific host.** Pair the phone and Linux app individually on every server they use. Switching between already-paired servers reuses the saved identities. Clearing client storage can create a new device fingerprint.
+**Tailnet membership provides connectivity. D4C pairing grants access to a specific host.** Pair the phone and desktop app individually on every server they use. Switching between already-paired servers reuses the saved identities. Clearing client storage can create a new device fingerprint.
 
 | Endpoint on the manager | Purpose |
 | --- | --- |

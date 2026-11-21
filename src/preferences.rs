@@ -15,6 +15,7 @@ pub struct Settings {
     pub selected: usize,
     pub desktop: bool,
     pub sound: bool,
+    pub alpha_updates: bool,
     pub workspace_urls: std::collections::BTreeMap<String, String>,
     pub model_defaults: std::collections::BTreeMap<String, (String, String)>,
 }
@@ -28,6 +29,7 @@ impl Default for Settings {
             selected: 0,
             desktop: true,
             sound: true,
+            alpha_updates: false,
             workspace_urls: Default::default(),
             model_defaults: Default::default(),
         }
@@ -59,6 +61,7 @@ impl Settings {
         s.selected = (v["selected"].as_u64().unwrap_or(0) as usize).min(s.connections.len() - 1);
         s.desktop = v["desktop"].as_bool().unwrap_or(true);
         s.sound = v["sound"].as_bool().unwrap_or(true);
+        s.alpha_updates = v["alphaUpdates"].as_bool().unwrap_or(false);
         if let Some(urls) = v["workspaceUrls"].as_object() {
             for (gateway, url) in urls.iter().take(12) {
                 if valid_url(gateway) {
@@ -94,7 +97,7 @@ impl Settings {
             .unwrap_or((String::new(), "medium".into()))
     }
     pub fn value(&self) -> Value {
-        json!({"workspaceUrls":self.workspace_urls,"connections":self.connections.iter().map(|c|json!({"name":c.name,"url":c.url})).collect::<Vec<_>>(),"selected":self.selected,"desktop":self.desktop,"sound":self.sound,"modelDefaults":self.model_defaults.iter().map(|(u,(m,t))|(u.clone(),json!({"model":m,"thinking":t}))).collect::<serde_json::Map<_,_>>()})
+        json!({"workspaceUrls":self.workspace_urls,"connections":self.connections.iter().map(|c|json!({"name":c.name,"url":c.url})).collect::<Vec<_>>(),"selected":self.selected,"desktop":self.desktop,"sound":self.sound,"alphaUpdates":self.alpha_updates,"modelDefaults":self.model_defaults.iter().map(|(u,(m,t))|(u.clone(),json!({"model":m,"thinking":t}))).collect::<serde_json::Map<_,_>>()})
     }
     pub fn save(&self) -> io::Result<()> {
         write("settings.json", &self.value())

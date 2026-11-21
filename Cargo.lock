@@ -3780,7 +3780,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vox-d4c"
-version = "0.1.2-alpha.2"
+version = "0.1.2-alpha.3"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -3797,6 +3797,7 @@ dependencies = [
  "pulldown-cmark",
  "rand 0.8.8",
  "rustls",
+ "semver",
  "serde_json",
  "sha2",
  "shadcn-egui",

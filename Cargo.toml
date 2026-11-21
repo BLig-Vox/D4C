@@ -1,6 +1,6 @@
 [package]
 name = "vox-d4c"
-version = "0.1.2-alpha.2"
+version = "0.1.2-alpha.3"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Blig-Vox/D4C"
@@ -32,6 +32,7 @@ tempfile = "3"
 image = {version="0.25",default-features=false,features=["png","jpeg","gif","webp"]}
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
+semver = "1"
 gstreamer = "0.24"
 gstreamer-app = "0.24"
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "system_fonts", "links", "clipboard", "wayland", "wgpu", "x11"] }

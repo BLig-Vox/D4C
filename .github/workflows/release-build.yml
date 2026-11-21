@@ -1,0 +1,96 @@
+name: Build release packages
+on:
+  push:
+    branches: [feat/direct-codex]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable
+      - run: sudo apt-get update && sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+      - name: Test and package
+        run: |
+          export XDG_CONFIG_HOME="$(mktemp -d)"
+          cargo +stable test --locked --bin vox-d4c
+          cargo +stable build --locked --release --bin vox-d4c
+          cargo +stable build --locked --release --manifest-path server/Cargo.toml --target-dir target
+          python3 scripts/package-release.py --binaries target/release --output dist --epoch "$(git log -1 --format=%ct)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: >-
+            zip
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-gstreamer
+            mingw-w64-x86_64-gst-plugins-base
+            mingw-w64-x86_64-gst-plugins-good
+            mingw-w64-x86_64-gst-libav
+      - name: Test and package Windows client
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export PATH="/mingw64/bin:$(cygpath -u "$USERPROFILE")/.cargo/bin:$PATH"
+          export PKG_CONFIG="$(cygpath -w /mingw64/bin/pkg-config.exe)"
+          export PKG_CONFIG_PATH="$(cygpath -w /mingw64/lib/pkgconfig)"
+          export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="$(cygpath -w /mingw64/bin/gcc.exe)"
+          cargo +stable-x86_64-pc-windows-gnu test --locked --bin vox-d4c updates::tests
+          cargo +stable-x86_64-pc-windows-gnu build --locked --release --bin vox-d4c
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          package="d4c-$version-windows-x86_64"
+          mkdir -p "dist/$package/bin" "dist/$package/lib" "dist/$package/libexec"
+          cp target/release/vox-d4c.exe "dist/$package/bin/"
+          cp LICENSE README.md INSTALL.md "dist/$package/"
+          cp /mingw64/bin/*.dll "dist/$package/bin/"
+          cp -r /mingw64/lib/gstreamer-1.0 "dist/$package/lib/"
+          cp -r /mingw64/libexec/gstreamer-1.0 "dist/$package/libexec/"
+          cp -r /mingw64/share/licenses "dist/$package/third-party-licenses"
+          cd dist
+          zip -q -r "$package.zip" "$package"
+      - name: Verify packaged GStreamer on Windows
+        shell: pwsh
+        run: |
+          $package = Get-ChildItem dist -Directory | Select-Object -First 1
+          $env:GST_REGISTRY_1_0 = Join-Path $env:RUNNER_TEMP 'd4c-gstreamer-registry.bin'
+          $app = Start-Process (Join-Path $package.FullName 'bin\vox-d4c.exe') -ArgumentList '--check-media' -Wait -PassThru
+          if ($app.ExitCode -ne 0) { throw "Windows media smoke test failed with exit code $($app.ExitCode)" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-package
+          path: dist/*.zip
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup target add --toolchain stable aarch64-linux-android
+      - name: Build Android APK for signing
+        run: |
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358'
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+          export RUSTUP_TOOLCHAIN=stable
+          export CARGO_PROFILE_DEV_DEBUG=0
+          python3 scripts/build-android.py --worker
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-unsigned
+          path: target/android/d4c-aligned.apk
+          if-no-files-found: error

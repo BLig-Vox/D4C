@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2-alpha.3
+
+- Organize Settings into Connections, System update, and Notifications with a layout that adapts to the window width.
+- Check stable or alpha GitHub releases from the Linux and Windows desktop clients and download the matching package.
+- Add a portable Windows x86_64 client with GStreamer for chat video playback.
+
 ## 0.1.2-alpha.2
 
 - Play videos and view images exported by Codex from the live conversation and chat history. Update both the app and its server to use this feature.
