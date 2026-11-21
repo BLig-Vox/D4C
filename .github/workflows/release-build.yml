@@ -82,6 +82,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup update stable && rustup target add --toolchain stable aarch64-linux-android
+      - uses: android-actions/setup-android@v3
       - name: Build Android APK for signing
         run: |
           sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358'
