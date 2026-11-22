@@ -3969,6 +3969,8 @@ fn message_bubble(
         message.text.clone()
     };
     let outgoing = message.role == "user";
+    let show_select =
+        ui.ctx().os() == egui::os::OperatingSystem::Android && !display_text.is_empty();
     let tool = message
         .item_id
         .as_deref()
@@ -3993,9 +3995,14 @@ fn message_bubble(
             .map(|line| line.chars().take(120).count())
             .max()
             .unwrap_or(0);
-        (longest as f32 * 8.0 + 32.0)
-            .max(if outgoing { 104.0 } else { 128.0 })
-            .min(max_width)
+        // Android's message header also needs room for the Select button.
+        let min_width = match (outgoing, show_select) {
+            (true, true) => 144.0,
+            (false, true) => 176.0,
+            (true, false) => 104.0,
+            (false, false) => 128.0,
+        };
+        (longest as f32 * 8.0 + 32.0).max(min_width).min(max_width)
     };
     ui.allocate_ui_with_layout(
         egui::vec2(available, 0.0),
@@ -4075,7 +4082,7 @@ fn message_bubble(
                             } else {
                                 lucide_icons::Icon::Bot
                             };
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 let color = if message.role == "error" {
                                     egui::Color32::from_rgb(235, 164, 157)
                                 } else if outgoing {
@@ -4085,13 +4092,13 @@ fn message_bubble(
                                 };
                                 ui.label(icon_text(icon, 12.0).color(color));
                                 ui.label(egui::RichText::new(title).size(11.0).color(color));
-                                #[cfg(target_os = "android")]
-                                if !display_text.is_empty()
+                                if show_select
                                     && ui
                                         .small_button("Select")
                                         .on_hover_text("Select or copy message")
                                         .clicked()
                                 {
+                                    #[cfg(target_os = "android")]
                                     android_text::select_message(display_text.to_string());
                                 }
                             });
@@ -4854,7 +4861,6 @@ mod composer_tests {
     }
     #[test]
     fn compact_transcript_keeps_text_inside_viewport() {
-        let ctx = egui::Context::default();
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert(
             "lucide".into(),
@@ -4864,7 +4870,6 @@ mod composer_tests {
             egui::FontFamily::Name("lucide".into()),
             vec!["lucide".into()],
         );
-        shadcn_egui::Theme::vega().apply_with_fonts(&ctx, fonts);
         let mut app = D4c::default();
         app.connected = true;
         app.session = "chat".into();
@@ -4875,7 +4880,8 @@ mod composer_tests {
             ("assistant", "message:2", "I’ll check the default for a new Bot Screen separately from the current container.".into()),
             ("commandExecution", "tool:3", "tool output".into()),
             ("assistant", "message:4", format!("The default is Arch Linux.\n\n| Name | Image |\n| --- | --- |\n| Arch | `{}` |", "registry/".repeat(30))),
-            ("assistant", "message:5", "The last reply should fit.".into()),
+            ("user", "message:5", "Why not".into()),
+            ("assistant", "message:6", "The last reply should fit, even when a short message and its Select button appear above a paragraph that wraps across several lines.".into()),
         ] {
             app.messages.push(ChatMessage {
                 role: role.into(),
@@ -4889,28 +4895,50 @@ mod composer_tests {
             "I’ll check",
             "Activity",
             "The default is Arch Linux.",
-            "The last reply should fit.",
+            "Why not",
+            "The last reply should fit",
         ];
-        for (width, sidebar_open, chat_visible) in [
-            (768.0, true, true),
-            (360.0, false, true),
-            (320.0, true, false),
-            (320.0, false, true),
+        for (width, density, sidebar_open, chat_visible) in [
+            (360.0, 3.0, false, true),
+            (320.0, 2.75, false, true),
+            (768.0, 1.0, true, true),
+            (320.0, 3.0, true, false),
         ] {
+            let ctx = egui::Context::default();
+            ctx.set_os(egui::os::OperatingSystem::Android);
+            shadcn_egui::Theme::vega().apply_with_fonts(&ctx, fonts.clone());
+            app.compact_previous = width < 640.0;
             app.sidebar_open = sidebar_open;
-            let mut output = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(width, 780.0),
-                    )),
-                    ..Default::default()
-                },
-                |ui| app.render_ui(ui),
-            );
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 960.0),
+                )),
+                ..Default::default()
+            };
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .native_pixels_per_point = Some(density);
+            let mut output = ctx.run_ui(input, |ui| app.render_ui(ui));
             output.textures_delta.clear();
             let mut visible = std::collections::HashSet::new();
+            let mut bubbles = 0;
             for egui::epaint::ClippedShape { clip_rect, shape, .. } in output.shapes {
+                if let egui::Shape::Rect(rect) = &shape
+                    && [
+                        egui::Color32::from_rgb(28, 66, 61),
+                        egui::Color32::from_rgb(33, 35, 41),
+                    ].contains(&rect.fill)
+                {
+                    bubbles += 1;
+                    assert!(
+                        rect.rect.left() >= 11.0 && rect.rect.right() <= width - 11.0,
+                        "{width} pt: message bubble {:?} is wider than its column",
+                        rect.rect,
+                    );
+                }
                 let egui::Shape::Text(text) = shape else { continue };
                 let content = &text.galley.job.text;
                 for label in expected.iter().filter(|label| content.contains(**label)) {
@@ -4923,7 +4951,12 @@ mod composer_tests {
                     );
                 }
             }
-            assert_eq!(visible.len(), if chat_visible { expected.len() } else { 0 });
+            assert_eq!(
+                visible.len(),
+                if chat_visible { expected.len() } else { 0 },
+                "{width} pt at {density}x: rendered {visible:?}",
+            );
+            assert_eq!(bubbles, if chat_visible { 5 } else { 0 });
         }
     }
 
