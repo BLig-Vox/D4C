@@ -283,7 +283,7 @@ impl Default for D4c {
             attachments: Vec::new(),
             composer_previews: Default::default(),
             markdown_cache: egui_commonmark::CommonMarkCache::default(),
-            commands: vec![],
+            commands: commands::parse(&Value::Null),
             command_request: None,
             command_status: "Connect to discover commands".into(),
             slash_selected: 0,
@@ -972,7 +972,7 @@ impl D4c {
             .is_some();
     }
     fn refresh_commands(&mut self) {
-        self.commands.clear();
+        self.commands = commands::parse(&Value::Null);
         self.command_status = "Discovering commands and skills…".into();
         let mut params = json!({"scope":"text","includeArgs":true});
         if self.sessions.iter().any(|(key, _)| key == &self.session) {
@@ -1265,6 +1265,22 @@ impl D4c {
                             continue;
                         }
                         if let Some(params) = self.sent_requests.remove(response_id) {
+                            if response_id.starts_with("chat.compact:") {
+                                if v["ok"] == false
+                                    && let Some(key) = params["sessionKey"].as_str()
+                                {
+                                    self.active_sessions.remove(key);
+                                    if key == self.session {
+                                        self.running = false;
+                                        self.composer_error = v["error"]["message"]
+                                            .as_str()
+                                            .unwrap_or("Could not start context compaction")
+                                            .into();
+                                        self.status = self.composer_error.clone();
+                                    }
+                                }
+                                continue;
+                            }
                             if v["ok"] == false {
                                 self.restore_unsent(&params);
                             }
@@ -2947,6 +2963,16 @@ impl D4c {
         if self.permission_request.is_some() {
             return;
         }
+        if self.input.split_whitespace().next() == Some("/compact") {
+            if self.input.trim() != "/compact" || !self.attachments.is_empty() {
+                self.composer_error = "Use /compact on its own, without attachments".into();
+                return;
+            }
+            if uuid::Uuid::parse_str(&self.session).is_err() {
+                self.composer_error = "Send a message before compacting this chat".into();
+                return;
+            }
+        }
         let text = std::mem::take(&mut self.input);
         let mut words = text.split_whitespace();
         if matches!(words.next(), Some("/permission" | "/permissions")) {
@@ -3015,6 +3041,24 @@ impl D4c {
         // Ignore any background tail snapshot requested before this send.
         self.history_request = None;
         self.history_dirty = true;
+        if text.trim() == "/compact" {
+            let params = json!({"sessionKey":self.session});
+            if let Some(id) = self.rpc("chat.compact", params.clone()) {
+                self.sent_requests.insert(id, params);
+                self.running = true;
+                self.active_sessions.insert(self.session.clone());
+                self.status = "Compacting context…".into();
+                self.composer_error.clear();
+                self.slash_dismissed = false;
+                self.slash_selected = 0;
+            } else {
+                if self.input.is_empty() {
+                    self.input = text;
+                }
+                self.composer_error = "Disconnected before compacting".into();
+            }
+            return;
+        }
         let send_identity = uuid::Uuid::new_v4().to_string();
         self.messages.push(ChatMessage {
             media: attachments
@@ -4663,6 +4707,35 @@ mod composer_tests {
         tx.send(event).unwrap();
         app.events(&egui::Context::default());
     }
+    #[test]
+    fn compact_dispatches_without_a_user_message_and_recovers_from_start_failure() {
+        let mut app = D4c::default();
+        app.session = uuid::Uuid::new_v4().to_string();
+        app.connected = true;
+        app.input = "/compact ".into();
+        let (out, requests) = std::sync::mpsc::channel();
+        let (_events, input) = std::sync::mpsc::channel();
+        app.gateway = Some(gateway::test_gateway(out, input));
+
+        app.send(&egui::Context::default());
+        let req = requests.try_recv().unwrap();
+        assert_eq!(req["method"], "chat.compact");
+        assert_eq!(req["params"], json!({"sessionKey":app.session}));
+        assert!(app.messages.is_empty());
+        assert!(app.running);
+
+        inject(
+            &mut app,
+            gateway::Event::Data(json!({
+                "type":"res","id":req["id"],"ok":false,"error":{"message":"Thread is busy"}
+            })),
+        );
+        assert!(!app.running);
+        assert!(!app.active_sessions.contains(&app.session));
+        assert_eq!(app.composer_error, "Thread is busy");
+        assert!(app.messages.is_empty());
+    }
+
     #[test]
     fn canonical_assistant_event_does_not_duplicate_streamed_answer() {
         for canonical_first in [true, false] {
