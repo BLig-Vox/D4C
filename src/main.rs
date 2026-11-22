@@ -4876,6 +4876,7 @@ mod composer_tests {
         app.preferences.connections.clear();
         app.settings_open = false;
         for (role, id, body) in [
+            ("assistant", "message:0", r#"Podman runs the desktop and publishes its local VNC port. **D4C connects to that port** to show the screen and send input. For direct shell access, use `podman exec -it d4c-00000000-0000-0000-0000-000000000000 bash`."#.into()),
             ("user", "message:1", "I mean which is its default".into()),
             ("assistant", "message:2", "I’ll check the default for a new Bot Screen separately from the current container.".into()),
             ("commandExecution", "tool:3", "tool output".into()),
@@ -4891,6 +4892,7 @@ mod composer_tests {
             });
         }
         let expected = [
+            "podman exec -it",
             "I mean which is its default",
             "I’ll check",
             "Activity",
@@ -4912,7 +4914,7 @@ mod composer_tests {
             let mut input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(width, 960.0),
+                    egui::vec2(width, 1300.0),
                 )),
                 ..Default::default()
             };
@@ -4921,6 +4923,10 @@ mod composer_tests {
                 .get_mut(&egui::ViewportId::ROOT)
                 .unwrap()
                 .native_pixels_per_point = Some(density);
+            ctx.run_ui(input.clone(), |ui| app.render_ui(ui))
+                .textures_delta
+                .clear();
+            app.restore_scroll = Some(0.0);
             let mut output = ctx.run_ui(input, |ui| app.render_ui(ui));
             output.textures_delta.clear();
             let mut visible = std::collections::HashSet::new();
@@ -4956,7 +4962,7 @@ mod composer_tests {
                 if chat_visible { expected.len() } else { 0 },
                 "{width} pt at {density}x: rendered {visible:?}",
             );
-            assert_eq!(bubbles, if chat_visible { 5 } else { 0 });
+            assert_eq!(bubbles, if chat_visible { 6 } else { 0 });
         }
     }
 

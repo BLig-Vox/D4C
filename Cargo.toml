@@ -47,3 +47,5 @@ epaint = { version="0.37", features=["color_fonts"] }
 [patch.crates-io]
 winit = { path = "vendor/winit" }
 eframe = { path = "vendor/eframe" }
+# Preserve row alignment when indented inline text wraps more than once.
+epaint = { path = "vendor/epaint" }
