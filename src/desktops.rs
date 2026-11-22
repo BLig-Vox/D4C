@@ -440,14 +440,17 @@ impl Desktops {
         if !v.expanded {
             // Floating overlay: preserves full chat width and the user's drag position.
             let diameter = 52.0;
+            let drag_bounds = bounds.shrink(6.0);
             let clamp_position = |pos: egui::Pos2| {
                 egui::pos2(
                     pos.x.clamp(
-                        bounds.left(),
-                        (bounds.right() - diameter).max(bounds.left()),
+                        drag_bounds.left(),
+                        (drag_bounds.right() - diameter).max(drag_bounds.left()),
                     ),
-                    pos.y
-                        .clamp(bounds.top(), (bounds.bottom() - diameter).max(bounds.top())),
+                    pos.y.clamp(
+                        drag_bounds.top(),
+                        (drag_bounds.bottom() - diameter).max(drag_bounds.top()),
+                    ),
                 )
             };
             let mut pos = clamp_position(v.bubble_pos.unwrap_or_else(|| {

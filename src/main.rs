@@ -3516,7 +3516,8 @@ impl D4c {
             ui.memory_mut(|memory| memory.request_focus(egui::Id::new("sidebar-search-input")));
         }
         let mut sidebar_open = self.sidebar_open;
-        egui::Panel::left("sidebar")
+        let showing_compact_sidebar = compact && sidebar_open;
+        let sidebar = egui::Panel::left("sidebar")
             .exact_size(sidebar_width)
             .resizable(false)
             .frame(
@@ -3524,177 +3525,183 @@ impl D4c {
                     .fill(egui::Color32::from_rgb(25, 26, 30))
                     .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 49, 54)))
                     .inner_margin(egui::Margin::same(16)),
-            )
-            .show_collapsible(ui, &mut sidebar_open, |ui| {
-                sidebar_search(ui, &mut self.session_search);
-                ui.add_space(8.0);
-                let query = self.session_search.trim().to_lowercase();
-                let mut matches = 0;
-                let list_height = (ui.available_height() - 56.0).max(20.0);
-                egui::ScrollArea::vertical()
-                    .max_height(list_height)
-                    .min_scrolled_height(0.0)
-                    .id_salt("chats")
-                    .show(ui, |ui| {
-                        let mut selected: Option<(usize, Option<String>)> = None;
-                        let mut rename = None;
-                        let mut delete = None;
-                        let connections = self.preferences.connections.clone();
-                        for (server_index, connection) in connections.iter().enumerate() {
-                            let current = connection.url == self.url;
-                            let Some(row) = self.servers.rows.get(&connection.url) else {
-                                continue;
-                            };
-                            let online = row.online;
-                            let expanded = row.expanded || !self.session_search.is_empty();
-                            let status = row.status.clone();
-                            let sessions = row.sessions.clone();
-                            let matching = sessions
-                                .iter()
-                                .filter(|s| {
-                                    self.session_search.is_empty()
-                                        || s.title.to_lowercase().contains(&query)
-                                })
-                                .count();
-                            if !query.is_empty()
-                                && matching == 0
-                                && !connection.name.to_lowercase().contains(&query)
-                            {
-                                continue;
-                            }
-                            let (toggle, new_chat) = ui
-                                .push_id(&connection.url, |ui| {
-                                    server_row(
-                                        ui,
-                                        &connection.name,
-                                        online,
-                                        current,
-                                        expanded,
-                                        &status,
-                                    )
-                                })
-                                .inner;
-                            if new_chat {
-                                selected = Some((server_index, None));
-                            }
-                            if toggle {
-                                self.servers.toggle(&connection.url);
-                            }
-                            if expanded {
-                                ui.indent(("server_chats", &connection.url), |ui| {
-                                    for session in &sessions {
-                                        if !query.is_empty()
-                                            && !session.title.to_lowercase().contains(&query)
-                                            && !connection.name.to_lowercase().contains(&query)
-                                        {
-                                            continue;
-                                        }
-                                        matches += 1;
-                                        ui.push_id((&connection.url, &session.key), |ui| {
-                                            if current {
-                                                let count = self.center.unread(Some(&session.key))
-                                                    + self.questions.pending_count(&session.key);
-                                                let (click, edit, remove) = chat_row(
-                                                    ui,
-                                                    &session.key,
-                                                    &session.title,
-                                                    self.session == session.key,
-                                                    count,
-                                                    session.running,
-                                                    true,
-                                                );
-                                                if click {
-                                                    selected = Some((
-                                                        server_index,
-                                                        Some(session.key.clone()),
-                                                    ));
-                                                }
-                                                if edit {
-                                                    rename = Some((
-                                                        session.key.clone(),
-                                                        session.title.clone(),
-                                                    ));
-                                                }
-                                                if remove {
-                                                    delete = Some((
-                                                        session.key.clone(),
-                                                        session.title.clone(),
-                                                    ));
-                                                }
-                                            } else {
-                                                let (click, _, _) = chat_row(
-                                                    ui,
-                                                    &session.key,
-                                                    &session.title,
-                                                    false,
-                                                    0,
-                                                    session.running,
-                                                    false,
-                                                );
-                                                if click {
-                                                    selected = Some((
-                                                        server_index,
-                                                        Some(session.key.clone()),
-                                                    ));
-                                                }
+            );
+        let sidebar_contents = |ui: &mut egui::Ui| {
+            sidebar_search(ui, &mut self.session_search);
+            ui.add_space(8.0);
+            let query = self.session_search.trim().to_lowercase();
+            let mut matches = 0;
+            let list_height = (ui.available_height() - 56.0).max(20.0);
+            egui::ScrollArea::vertical()
+                .max_height(list_height)
+                .min_scrolled_height(0.0)
+                .id_salt("chats")
+                .show(ui, |ui| {
+                    let mut selected: Option<(usize, Option<String>)> = None;
+                    let mut rename = None;
+                    let mut delete = None;
+                    let connections = self.preferences.connections.clone();
+                    for (server_index, connection) in connections.iter().enumerate() {
+                        let current = connection.url == self.url;
+                        let Some(row) = self.servers.rows.get(&connection.url) else {
+                            continue;
+                        };
+                        let online = row.online;
+                        let expanded = row.expanded || !self.session_search.is_empty();
+                        let status = row.status.clone();
+                        let sessions = row.sessions.clone();
+                        let matching = sessions
+                            .iter()
+                            .filter(|s| {
+                                self.session_search.is_empty()
+                                    || s.title.to_lowercase().contains(&query)
+                            })
+                            .count();
+                        if !query.is_empty()
+                            && matching == 0
+                            && !connection.name.to_lowercase().contains(&query)
+                        {
+                            continue;
+                        }
+                        let (toggle, new_chat) = ui
+                            .push_id(&connection.url, |ui| {
+                                server_row(
+                                    ui,
+                                    &connection.name,
+                                    online,
+                                    current,
+                                    expanded,
+                                    &status,
+                                )
+                            })
+                            .inner;
+                        if new_chat {
+                            selected = Some((server_index, None));
+                        }
+                        if toggle {
+                            self.servers.toggle(&connection.url);
+                        }
+                        if expanded {
+                            ui.indent(("server_chats", &connection.url), |ui| {
+                                for session in &sessions {
+                                    if !query.is_empty()
+                                        && !session.title.to_lowercase().contains(&query)
+                                        && !connection.name.to_lowercase().contains(&query)
+                                    {
+                                        continue;
+                                    }
+                                    matches += 1;
+                                    ui.push_id((&connection.url, &session.key), |ui| {
+                                        if current {
+                                            let count = self.center.unread(Some(&session.key))
+                                                + self.questions.pending_count(&session.key);
+                                            let (click, edit, remove) = chat_row(
+                                                ui,
+                                                &session.key,
+                                                &session.title,
+                                                self.session == session.key,
+                                                count,
+                                                session.running,
+                                                true,
+                                            );
+                                            if click {
+                                                selected = Some((
+                                                    server_index,
+                                                    Some(session.key.clone()),
+                                                ));
                                             }
-                                        });
-                                        ui.add_space(2.0);
-                                    }
-                                    if sessions.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new(if online {
-                                                "No chats"
-                                            } else {
-                                                "Offline"
-                                            })
-                                            .small()
-                                            .weak(),
-                                        );
-                                    }
-                                });
-                            }
-                            ui.add_space(8.0);
+                                            if edit {
+                                                rename = Some((
+                                                    session.key.clone(),
+                                                    session.title.clone(),
+                                                ));
+                                            }
+                                            if remove {
+                                                delete = Some((
+                                                    session.key.clone(),
+                                                    session.title.clone(),
+                                                ));
+                                            }
+                                        } else {
+                                            let (click, _, _) = chat_row(
+                                                ui,
+                                                &session.key,
+                                                &session.title,
+                                                false,
+                                                0,
+                                                session.running,
+                                                false,
+                                            );
+                                            if click {
+                                                selected = Some((
+                                                    server_index,
+                                                    Some(session.key.clone()),
+                                                ));
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(2.0);
+                                }
+                                if sessions.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(if online {
+                                            "No chats"
+                                        } else {
+                                            "Offline"
+                                        })
+                                        .small()
+                                        .weak(),
+                                    );
+                                }
+                            });
                         }
-                        if let Some((index, key)) = selected {
-                            let load = key.is_some();
-                            let target =
-                                key.unwrap_or_else(|| format!("draft:{}", uuid::Uuid::new_v4()));
-                            if index == self.preferences.selected {
-                                self.select_session(target, load);
-                            } else {
-                                self.switch_to(index, ui.ctx(), Some(target));
-                            }
-                            if compact {
-                                self.sidebar_open = false;
-                            }
-                        }
-                        if let Some(value) = rename {
-                            self.rename = Some(value);
-                            self.rename_error.clear();
-                        }
-                        if let Some(value) = delete {
-                            if self.delete_pending.is_none() {
-                                self.delete_chat = Some(value);
-                                self.delete_error.clear();
-                            }
-                        }
-                        if matches == 0 && !query.is_empty() {
-                            ui.weak("No matching chats");
-                        }
-                    });
-                ui.add_space((ui.available_height() - 44.0).max(0.0));
-                ui.separator();
-                if navigation_footer(ui).clicked() {
-                    self.settings_open = true;
-                    self.notifications_open = false;
-                    self.workspace_open = false;
-                    if compact {
-                        self.sidebar_open = false;
+                        ui.add_space(8.0);
                     }
+                    if let Some((index, key)) = selected {
+                        let load = key.is_some();
+                        let target =
+                            key.unwrap_or_else(|| format!("draft:{}", uuid::Uuid::new_v4()));
+                        if index == self.preferences.selected {
+                            self.select_session(target, load);
+                        } else {
+                            self.switch_to(index, ui.ctx(), Some(target));
+                        }
+                        if compact {
+                            self.sidebar_open = false;
+                        }
+                    }
+                    if let Some(value) = rename {
+                        self.rename = Some(value);
+                        self.rename_error.clear();
+                    }
+                    if let Some(value) = delete {
+                        if self.delete_pending.is_none() {
+                            self.delete_chat = Some(value);
+                            self.delete_error.clear();
+                        }
+                    }
+                    if matches == 0 && !query.is_empty() {
+                        ui.weak("No matching chats");
+                    }
+                });
+            ui.add_space((ui.available_height() - 44.0).max(0.0));
+            ui.separator();
+            if navigation_footer(ui).clicked() {
+                self.settings_open = true;
+                self.notifications_open = false;
+                self.workspace_open = false;
+                if compact {
+                    self.sidebar_open = false;
                 }
-            });
-        if self.sidebar_open != sidebar_open && !compact {
+            }
+        };
+        // On compact screens the sidebar replaces the transcript for the entire frame.
+        if showing_compact_sidebar {
+            sidebar.show(ui, sidebar_contents);
+        } else if compact {
+            ui.skip_ahead_auto_ids(1);
+        } else {
+            sidebar.show_collapsible(ui, &mut sidebar_open, sidebar_contents);
             self.sidebar_open = sidebar_open;
         }
 
@@ -3731,7 +3738,7 @@ impl D4c {
                     .inner_margin(egui::Margin::same(if compact { 12 } else { 20 })),
             )
             .show(ui, |ui| {
-                if compact && self.sidebar_open {
+                if showing_compact_sidebar {
                     return;
                 }
                 if self.notifications_open && compact {
@@ -3787,9 +3794,11 @@ impl D4c {
                                 if self.messages.is_empty() { loading_conversation(ui); }
                                 else { loading_bar(ui, 160.0_f32.min(ui.available_width()), 5.0); }
                             }
+                            let message_ids = self.messages.iter().filter_map(|m| m.item_id.as_deref()).collect();
+                            let mut cards = self.questions.cards_by_anchor(&self.session, &message_ids);
                             if self.messages.is_empty()
                                 && !self.history_loading
-                                && !self.questions.has_session(&self.session)
+                                && cards.is_empty()
                             {
                                 ui.add_space((ui.available_height() * 0.25).max(24.0));
                                 ui.vertical_centered(|ui| {
@@ -3800,8 +3809,6 @@ impl D4c {
                                     });
                                 });
                             }
-                            let message_ids = self.messages.iter().filter_map(|m| m.item_id.as_deref()).collect();
-                            let mut cards = self.questions.cards_by_anchor(&self.session, &message_ids);
                             let mut replies = Vec::new();
                             let mut index = 0;
                             while index < self.messages.len() {
@@ -4845,6 +4852,81 @@ mod composer_tests {
         assert_eq!(app.messages[0].text, "Server B");
         assert!(app.gateway.is_none());
     }
+    #[test]
+    fn compact_transcript_keeps_text_inside_viewport() {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "lucide".into(),
+            egui::FontData::from_static(lucide_icons::LUCIDE_FONT_BYTES).into(),
+        );
+        fonts.families.insert(
+            egui::FontFamily::Name("lucide".into()),
+            vec!["lucide".into()],
+        );
+        shadcn_egui::Theme::vega().apply_with_fonts(&ctx, fonts);
+        let mut app = D4c::default();
+        app.connected = true;
+        app.session = "chat".into();
+        app.preferences.connections.clear();
+        app.settings_open = false;
+        for (role, id, body) in [
+            ("user", "message:1", "I mean which is its default".into()),
+            ("assistant", "message:2", "I’ll check the default for a new Bot Screen separately from the current container.".into()),
+            ("commandExecution", "tool:3", "tool output".into()),
+            ("assistant", "message:4", format!("The default is Arch Linux.\n\n| Name | Image |\n| --- | --- |\n| Arch | `{}` |", "registry/".repeat(30))),
+            ("assistant", "message:5", "The last reply should fit.".into()),
+        ] {
+            app.messages.push(ChatMessage {
+                role: role.into(),
+                item_id: Some(id.into()),
+                text: body,
+                media: vec![],
+            });
+        }
+        let expected = [
+            "I mean which is its default",
+            "I’ll check",
+            "Activity",
+            "The default is Arch Linux.",
+            "The last reply should fit.",
+        ];
+        for (width, sidebar_open, chat_visible) in [
+            (768.0, true, true),
+            (360.0, false, true),
+            (320.0, true, false),
+            (320.0, false, true),
+        ] {
+            app.sidebar_open = sidebar_open;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 780.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.render_ui(ui),
+            );
+            output.textures_delta.clear();
+            let mut visible = std::collections::HashSet::new();
+            for egui::epaint::ClippedShape { clip_rect, shape, .. } in output.shapes {
+                let egui::Shape::Text(text) = shape else { continue };
+                let content = &text.galley.job.text;
+                for label in expected.iter().filter(|label| content.contains(**label)) {
+                    visible.insert(*label);
+                    let left = text.pos.x;
+                    let right = left + text.galley.size().x;
+                    assert!(
+                        left >= clip_rect.left() && right <= clip_rect.right().min(width),
+                        "{width} pt: {content:?} at {left}..{right} is clipped by {clip_rect:?}"
+                    );
+                }
+            }
+            assert_eq!(visible.len(), if chat_visible { expected.len() } else { 0 });
+        }
+    }
+
     #[test]
     fn skeleton_fits_mobile_and_desktop() {
         for width in [320.0, 390.0, 768.0, 1440.0] {
