@@ -3775,6 +3775,12 @@ impl D4c {
                     self.notification_ui(ui);
                 });
         }
+        let dock_width = if self.settings_open || showing_compact_sidebar {
+            None
+        } else {
+            desktops::Desktops::dock_width(ui)
+        };
+        let desktop_docked = self.desktops.viewer_dock_ui(ui, dock_width);
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -3969,7 +3975,9 @@ impl D4c {
                 self.sidebar_open = false;
             }
         }
-        self.desktops.viewer_ui(ui.ctx());
+        if !desktop_docked {
+            self.desktops.viewer_ui(ui.ctx(), dock_width.is_some());
+        }
         media::finish_frame(ui.ctx());
         self.dialogs_ui(ui.ctx(), compact);
         self.cron.flush(self.gateway.as_ref());

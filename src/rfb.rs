@@ -44,6 +44,57 @@ fn dimensions(w: u16, h: u16) -> io::Result<usize> {
     }
     Ok(w as usize * h as usize * 4)
 }
+
+pub(crate) struct Rectangle {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    pub encoding: i32,
+    pub header_len: usize,
+    pub payload_len: usize,
+}
+
+pub(crate) fn rectangle(header: &[u8]) -> io::Result<Option<Rectangle>> {
+    if header.len() < 12 {
+        return Ok(None);
+    }
+    let width = u16be(&header[4..]);
+    let height = u16be(&header[6..]);
+    let encoding = i32::from_be_bytes(header[8..12].try_into().unwrap());
+    let (header_len, payload_len) = match encoding {
+        0 => {
+            if width > MAX_WIDTH || height > MAX_HEIGHT {
+                return Err(err("Rectangle too large"));
+            }
+            (12, width as usize * height as usize * 4)
+        }
+        6 => {
+            if header.len() < 16 {
+                return Ok(None);
+            }
+            let size = u32be(&header[12..]) as usize;
+            if size > MAX_BUFFER {
+                return Err(err("Compressed rectangle too large"));
+            }
+            (16, size)
+        }
+        -223 => {
+            dimensions(width, height)?;
+            (12, 0)
+        }
+        _ => return Err(err("Unsupported rectangle encoding")),
+    };
+    Ok(Some(Rectangle {
+        x: u16be(header),
+        y: u16be(&header[2..]),
+        width,
+        height,
+        encoding,
+        header_len,
+        payload_len,
+    }))
+}
 impl Session {
     pub fn connect(port: u16) -> io::Result<Self> {
         let s = TcpStream::connect_timeout(
@@ -258,53 +309,35 @@ impl Decoder {
             let mut rectangles = Vec::new();
             let mut incomplete = false;
             for _ in 0..count {
-                if self.buffer.len() < pos + 12 {
+                let Some(rect) = rectangle(&self.buffer[pos..])? else {
                     incomplete = true;
                     break;
-                }
-                let x = u16be(&self.buffer[pos..]);
-                let y = u16be(&self.buffer[pos + 2..]);
-                let w = u16be(&self.buffer[pos + 4..]);
-                let h = u16be(&self.buffer[pos + 6..]);
-                let encoding =
-                    i32::from_be_bytes(self.buffer[pos + 8..pos + 12].try_into().unwrap());
-                pos += 12;
-                let len = match encoding {
-                    0 => {
-                        if w > MAX_WIDTH || h > MAX_HEIGHT {
-                            return Err(err("Rectangle too large"));
-                        }
-                        w as usize * h as usize * 4
-                    }
-                    6 => {
-                        if self.buffer.len() < pos + 4 {
-                            incomplete = true;
-                            break;
-                        }
-                        let len = u32be(&self.buffer[pos..]) as usize;
-                        pos += 4;
-                        if len > MAX_BUFFER {
-                            return Err(err("Compressed rectangle too large"));
-                        }
-                        len
-                    }
-                    -223 => {
-                        dimensions(w, h)?;
-                        0
-                    }
-                    _ => return Err(err("Unsupported rectangle encoding")),
                 };
-                if self.buffer.len() < pos + len {
+                pos += rect.header_len;
+                if self.buffer.len() < pos + rect.payload_len {
                     incomplete = true;
                     break;
                 }
-                rectangles.push((x, y, w, h, encoding, pos, len));
-                pos += len;
+                pos += rect.payload_len;
+                rectangles.push(rect);
             }
             if incomplete {
                 break;
             }
-            for (x, y, w, h, encoding, start, len) in rectangles {
+            let mut start = 4;
+            for Rectangle {
+                x,
+                y,
+                width: w,
+                height: h,
+                encoding,
+                header_len,
+                payload_len: len,
+            } in rectangles
+            {
+                let end = start + header_len + len;
+                let source_bytes = &self.buffer[start + header_len..end];
+                start = end;
                 if encoding == -223 {
                     self.width = w;
                     self.height = h;
@@ -324,11 +357,7 @@ impl Decoder {
                     let input_before = self.zlib.total_in();
                     let status = self
                         .zlib
-                        .decompress(
-                            &self.buffer[start..start + len],
-                            &mut out,
-                            FlushDecompress::Sync,
-                        )
+                        .decompress(source_bytes, &mut out, FlushDecompress::Sync)
                         .map_err(|e| err(&e.to_string()))?;
                     if self.zlib.total_out() - before != expected as u64
                         || self.zlib.total_in() - input_before != len as u64
@@ -341,7 +370,7 @@ impl Decoder {
                     }
                     out
                 } else {
-                    self.buffer[start..start + len].to_vec()
+                    source_bytes.to_vec()
                 };
                 for row in 0..h as usize {
                     for col in 0..w as usize {

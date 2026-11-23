@@ -1,6 +1,7 @@
 use crate::{
     auth,
     manager::{Actor, Manager},
+    rfb,
     store::Result,
 };
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
@@ -577,17 +578,17 @@ fn viewer(mut socket: Socket, manager: Manager, id: &str, compressed: bool) -> R
         .set_read_timeout(Some(Duration::from_millis(20)))
         .map_err(|e| e.to_string())?;
     session.request(false).map_err(|e| e.to_string())?;
-    let mut refresh = Instant::now();
+    let mut updates = ViewerUpdates::default();
     let mut bytes = [0; 65536];
     let mut heartbeat = Heartbeat::new();
+    let mut next_client_check = Instant::now();
     loop {
-        if refresh.elapsed() > Duration::from_millis(100) {
-            session.request(true).map_err(|e| e.to_string())?;
-            refresh = Instant::now();
-        }
         match session.socket.read(&mut bytes) {
             Ok(0) => return Err("VNC disconnected".into()),
             Ok(n) => {
+                updates
+                    .advance(&bytes[..n], &mut session)
+                    .map_err(|e| e.to_string())?;
                 let packet = if compressed {
                     crate::desktop_wire::encode(&bytes[..n]).map_err(|e| e.to_string())?
                 } else {
@@ -599,10 +600,18 @@ fn viewer(mut socket: Socket, manager: Manager, id: &str, compressed: bool) -> R
             Err(e)
                 if matches!(
                     e.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
                 ) => {}
             Err(e) => return Err(e.to_string()),
         }
+        // A large framebuffer spans multiple chunks. Check for client traffic
+        // periodically so an idle WebSocket cannot delay every chunk.
+        if Instant::now() < next_client_check {
+            continue;
+        }
+        next_client_check = Instant::now() + Duration::from_millis(20);
         // The framebuffer channel never forwards client bytes into VNC. All input goes
         // through typed, server-authorized control RPCs, so takeover cannot be bypassed.
         heartbeat.poll(&mut socket)?;
@@ -620,6 +629,113 @@ fn viewer(mut socket: Socket, manager: Manager, id: &str, compressed: bool) -> R
                 ) => {}
             Err(e) => return Err(e.to_string()),
         }
+    }
+}
+
+// Track RFB message boundaries while relaying the original bytes. Only headers
+// are buffered here. The viewer decodes pixels and owns the framebuffer.
+#[derive(Default)]
+struct ViewerUpdates {
+    header: [u8; 16],
+    header_len: usize,
+    rectangles_left: Option<u16>,
+    payload_left: usize,
+    resize: Option<(u16, u16)>,
+}
+
+impl ViewerUpdates {
+    fn read_header(&mut self, input: &mut &[u8], len: usize) -> bool {
+        let count = (len - self.header_len).min(input.len());
+        let end = self.header_len + count;
+        self.header[self.header_len..end].copy_from_slice(&input[..count]);
+        self.header_len = end;
+        *input = &input[count..];
+        end == len
+    }
+
+    fn advance(&mut self, mut input: &[u8], session: &mut rfb::Session) -> io::Result<()> {
+        let mut complete = false;
+        let mut resize = None;
+        loop {
+            let skip = self.payload_left.min(input.len());
+            self.payload_left -= skip;
+            input = &input[skip..];
+            if self.payload_left != 0 {
+                break;
+            }
+            if self.rectangles_left == Some(0) {
+                self.rectangles_left = None;
+                complete = true;
+                resize = self.resize.take().or(resize);
+            }
+            if input.is_empty() {
+                break;
+            }
+            if let Some(count) = self.rectangles_left {
+                if !self.read_header(&mut input, 12.max(self.header_len)) {
+                    break;
+                }
+                let rect = match rfb::rectangle(&self.header[..self.header_len])? {
+                    Some(rect) => rect,
+                    None if self.read_header(&mut input, 16) => {
+                        rfb::rectangle(&self.header)?.unwrap()
+                    }
+                    None => break,
+                };
+                if rect.encoding == -223 {
+                    self.resize = Some((rect.width, rect.height));
+                }
+                self.rectangles_left = Some(count - 1);
+                self.payload_left = rect.payload_len;
+            } else {
+                let kind = if self.header_len == 0 {
+                    input[0]
+                } else {
+                    self.header[0]
+                };
+                let len = match kind {
+                    0 => 4, // FramebufferUpdate
+                    1 => 6, // SetColorMapEntries
+                    2 => 1, // Bell
+                    3 => 8, // ServerCutText
+                    _ => return Err(io::Error::other("Unsupported VNC server message")),
+                };
+                if !self.read_header(&mut input, len) {
+                    break;
+                }
+                match kind {
+                    0 => {
+                        self.rectangles_left =
+                            Some(u16::from_be_bytes([self.header[2], self.header[3]]))
+                    }
+                    1 => {
+                        self.payload_left =
+                            6 * u16::from_be_bytes([self.header[4], self.header[5]]) as usize
+                    }
+                    3 => {
+                        self.payload_left =
+                            u32::from_be_bytes(self.header[4..8].try_into().unwrap()) as usize;
+                        if self.payload_left > 1024 * 1024 {
+                            return Err(io::Error::other("VNC clipboard too large"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            self.header_len = 0;
+        }
+        // Incremental requests can stay pending indefinitely on a static
+        // desktop. Ask again only after the server answers the previous one.
+        if complete {
+            if let Some((width, height)) = resize {
+                session.width = width;
+                session.height = height;
+                session.request(false)?;
+            } else {
+                session.request(true)?;
+            }
+        }
+        Ok(())
     }
 }
 #[cfg(unix)]
@@ -757,6 +873,53 @@ fn peer_is_owner(stream: &std::os::unix::net::UnixStream, owner_uid: u32) -> Res
 #[cfg(test)]
 mod ipc_tests {
     use super::*;
+
+    #[test]
+    fn viewer_rearms_after_complete_framebuffer_updates() {
+        use std::os::unix::net::UnixStream;
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut session = rfb::Session {
+            socket: Box::new(stream),
+            width: 16,
+            height: 16,
+            name: "Test desktop".into(),
+        };
+        let mut updates = ViewerUpdates::default();
+        let mut request = [0; 10];
+        session.request(false).unwrap();
+        peer.read_exact(&mut request).unwrap();
+        assert_eq!(request, [3, 0, 0, 0, 0, 0, 0, 16, 0, 16]);
+
+        // A Bell, a clipboard message, then an update with raw and zlib rectangles.
+        let input = [
+            2, 3, 0, 0, 0, 0, 0, 0, 1, b'x', 0, 0, 0, 2, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1,
+            2, 3, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 6, 0, 0, 0, 3, 0, 1, 2,
+        ];
+        for byte in &input[..input.len() - 1] {
+            updates.advance(&[*byte], &mut session).unwrap();
+            assert_eq!(
+                peer.read(&mut request).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        updates
+            .advance(&input[input.len() - 1..], &mut session)
+            .unwrap();
+        peer.read_exact(&mut request).unwrap();
+        assert_eq!(request, [3, 1, 0, 0, 0, 0, 0, 16, 0, 16]);
+        assert_eq!(
+            peer.read(&mut request).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        // DesktopSize ends this update and requires a full request at the new size.
+        let resize = [0, 0, 0, 1, 0, 0, 0, 0, 0, 32, 0, 24, 255, 255, 255, 33];
+        updates.advance(&resize, &mut session).unwrap();
+        peer.read_exact(&mut request).unwrap();
+        assert_eq!(request, [3, 0, 0, 0, 0, 0, 0, 32, 0, 24]);
+    }
+
     #[test]
     fn live_codex_reply_delivers_a_video_without_a_tool_call() {
         let root = std::env::temp_dir().join(format!("d4c-history-{}", uuid::Uuid::new_v4()));
