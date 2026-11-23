@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2-alpha.12
+
+- Restore the left sidebar and per-chat BotScreen layout when D4C reopens.
+- Start the right dock at 75% width on wide screens and drag its divider to resize it.
+- Use the compact BotScreen toolbar and press Ctrl+B to toggle the left sidebar.
 ## 0.1.2-alpha.3
 
 - Organize Settings into Connections, System update, and Notifications with a layout that adapts to the window width.

@@ -16,6 +16,8 @@ pub struct Settings {
     pub desktop: bool,
     pub sound: bool,
     pub alpha_updates: bool,
+    sidebar_wide_open: bool,
+    sidebar_compact_open: bool,
     pub workspace_urls: std::collections::BTreeMap<String, String>,
     pub model_defaults: std::collections::BTreeMap<String, (String, String)>,
 }
@@ -30,6 +32,8 @@ impl Default for Settings {
             desktop: true,
             sound: true,
             alpha_updates: false,
+            sidebar_wide_open: true,
+            sidebar_compact_open: false,
             workspace_urls: Default::default(),
             model_defaults: Default::default(),
         }
@@ -62,6 +66,8 @@ impl Settings {
         s.desktop = v["desktop"].as_bool().unwrap_or(true);
         s.sound = v["sound"].as_bool().unwrap_or(true);
         s.alpha_updates = v["alphaUpdates"].as_bool().unwrap_or(false);
+        s.sidebar_wide_open = v["sidebar"]["wideOpen"].as_bool().unwrap_or(true);
+        s.sidebar_compact_open = v["sidebar"]["compactOpen"].as_bool().unwrap_or(false);
         if let Some(urls) = v["workspaceUrls"].as_object() {
             for (gateway, url) in urls.iter().take(12) {
                 if valid_url(gateway) {
@@ -96,8 +102,22 @@ impl Settings {
             .cloned()
             .unwrap_or((String::new(), "medium".into()))
     }
+    pub fn sidebar_open(&self, compact: bool) -> bool {
+        if compact {
+            self.sidebar_compact_open
+        } else {
+            self.sidebar_wide_open
+        }
+    }
+    pub fn set_sidebar_open(&mut self, compact: bool, open: bool) {
+        if compact {
+            self.sidebar_compact_open = open;
+        } else {
+            self.sidebar_wide_open = open;
+        }
+    }
     pub fn value(&self) -> Value {
-        json!({"workspaceUrls":self.workspace_urls,"connections":self.connections.iter().map(|c|json!({"name":c.name,"url":c.url})).collect::<Vec<_>>(),"selected":self.selected,"desktop":self.desktop,"sound":self.sound,"alphaUpdates":self.alpha_updates,"modelDefaults":self.model_defaults.iter().map(|(u,(m,t))|(u.clone(),json!({"model":m,"thinking":t}))).collect::<serde_json::Map<_,_>>()})
+        json!({"sidebar":{"wideOpen":self.sidebar_wide_open,"compactOpen":self.sidebar_compact_open},"workspaceUrls":self.workspace_urls,"connections":self.connections.iter().map(|c|json!({"name":c.name,"url":c.url})).collect::<Vec<_>>(),"selected":self.selected,"desktop":self.desktop,"sound":self.sound,"alphaUpdates":self.alpha_updates,"modelDefaults":self.model_defaults.iter().map(|(u,(m,t))|(u.clone(),json!({"model":m,"thinking":t}))).collect::<serde_json::Map<_,_>>()})
     }
     pub fn save(&self) -> io::Result<()> {
         write("settings.json", &self.value())
@@ -143,6 +163,18 @@ pub fn write(name: &str, v: &Value) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sidebar_layout_roundtrips_with_separate_mobile_and_desktop_defaults() {
+        let mut settings = Settings::parse(&json!({}));
+        assert!(settings.sidebar_open(false));
+        assert!(!settings.sidebar_open(true));
+        settings.set_sidebar_open(false, false);
+        settings.set_sidebar_open(true, true);
+        let restored = Settings::parse(&settings.value());
+        assert!(!restored.sidebar_open(false));
+        assert!(restored.sidebar_open(true));
+    }
+
     #[test]
     fn model_defaults_survive_roundtrip_and_are_connection_scoped() {
         let mut s = Settings::default();

@@ -103,7 +103,6 @@ struct ServerView {
     questions: questions::Questions,
     messages: Vec<ChatMessage>,
     scroll: (f32, f32),
-    desktop: desktops::UiState,
 }
 const SERVER_CACHE_BYTES: usize = 16 * 1024 * 1024;
 fn message_cache_bytes(m: &ChatMessage) -> usize {
@@ -214,6 +213,7 @@ impl Default for D4c {
         let servers = servers::Catalogs::default();
         let remembered = servers.rows.get(&url).and_then(|row| row.selected.clone());
         let (default_model, default_thinking) = preferences.defaults(&url);
+        let sidebar_open = preferences.sidebar_open(false);
         Self {
             desktops: Default::default(),
             servers,
@@ -240,7 +240,7 @@ impl Default for D4c {
             switch_pending: None,
             composer_picker: None,
             compact_previous: false,
-            sidebar_open: true,
+            sidebar_open,
             show_cron: false,
             workspace_open: false,
             task_chat: false,
@@ -361,6 +361,7 @@ impl D4c {
         }
     }
     fn reset_connection(&mut self, index: usize, token: String) {
+        self.save_layout(true);
         self.deleted_sessions.clear();
         self.pending_sends.clear();
         let mut preferences = self.preferences.clone();
@@ -392,7 +393,6 @@ impl D4c {
                     questions: std::mem::take(&mut self.questions),
                     messages,
                     scroll: self.history_scroll,
-                    desktop: self.desktops.capture_ui(),
                 },
             ));
         }
@@ -429,7 +429,6 @@ impl D4c {
             })
             .unwrap_or_default();
         if let Some(view) = restored {
-            next.desktops.restore_ui(view.desktop);
             next.questions = view.questions;
             next.session = view.session;
             next.messages = view.messages;
@@ -3190,6 +3189,7 @@ impl eframe::App for D4c {
     #[cfg(target_os = "android")]
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         media::reset();
+        self.save_layout(true);
         self.restore_pending_sends();
         let _ = self.save_server_drafts();
         self.servers.select(&self.url, &self.session);
@@ -3198,6 +3198,7 @@ impl eframe::App for D4c {
     #[cfg(not(target_os = "android"))]
     fn on_exit(&mut self) {
         media::reset();
+        self.save_layout(true);
         self.restore_pending_sends();
         let _ = self.save_server_drafts();
         self.servers.select(&self.url, &self.session);
@@ -3236,9 +3237,23 @@ impl eframe::App for D4c {
                 })
             });
         }
+        self.save_layout(false);
     }
 }
 impl D4c {
+    fn save_layout(&mut self, force: bool) {
+        self.desktops.save_layout(force);
+        let compact = self.compact_previous;
+        let previous = self.preferences.sidebar_open(compact);
+        if previous != self.sidebar_open {
+            self.preferences.set_sidebar_open(compact, self.sidebar_open);
+            if let Err(error) = self.preferences.save() {
+                self.preferences.set_sidebar_open(compact, previous);
+                eprintln!("Could not save sidebar layout: {error}");
+            }
+        }
+    }
+
     fn load_media(&mut self) {
         self.media_requests
             .retain(|_, (session, artifact, offset, started)| {
@@ -3433,8 +3448,8 @@ impl D4c {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_secs(1));
         let compact = ui.ctx().content_rect().width() < 640.0;
-        if compact && !self.compact_previous {
-            self.sidebar_open = false;
+        if compact != self.compact_previous {
+            self.sidebar_open = self.preferences.sidebar_open(compact);
         }
         self.compact_previous = compact;
         let dropped = ui.ctx().input(|i| i.raw.dropped_files.clone());
@@ -3447,6 +3462,29 @@ impl D4c {
                 ),
             ));
         }
+        let toggle_sidebar = !self.dialog_open()
+            && !media::is_fullscreen()
+            && ui.input_mut(|input| {
+                let mut toggle = false;
+                input.events.retain(|event| match event {
+                    egui::Event::Key {
+                        key: egui::Key::B,
+                        pressed: true,
+                        repeat,
+                        modifiers,
+                        ..
+                    } if modifiers.ctrl
+                        && !modifiers.shift
+                        && !modifiers.alt
+                        && !modifiers.mac_cmd =>
+                    {
+                        toggle |= !repeat;
+                        false
+                    }
+                    _ => true,
+                });
+                toggle
+            });
         egui::Panel::top("top_bar")
             .exact_size(52.0)
             .frame(
@@ -3463,8 +3501,9 @@ impl D4c {
                     };
                     if ui
                         .add(egui::Button::new(icon_text(icon, 20.0)).frame(false))
-                        .on_hover_text("Toggle sidebar")
+                        .on_hover_text("Toggle left sidebar (Ctrl+B)")
                         .clicked()
+                        || toggle_sidebar
                     {
                         self.sidebar_open = !self.sidebar_open;
                         if compact {
@@ -4940,6 +4979,57 @@ mod composer_tests {
         assert_eq!(app.messages[0].text, "Server B");
         assert!(app.gateway.is_none());
     }
+    #[test]
+    fn ctrl_b_toggles_left_sidebar_once_per_press() {
+        let mut app = D4c::default();
+        app.preferences.connections.clear();
+        app.settings_open = false;
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "lucide".into(),
+            egui::FontData::from_static(lucide_icons::LUCIDE_FONT_BYTES).into(),
+        );
+        fonts.families.insert(
+            egui::FontFamily::Name("lucide".into()),
+            vec!["lucide".into()],
+        );
+        ctx.set_fonts(fonts);
+        let mut frame = |pressed, modifiers| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::B,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| app.render_ui(ui))
+                .textures_delta
+                .clear();
+            app.sidebar_open
+        };
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        assert!(frame(true, egui::Modifiers::NONE));
+        assert!(frame(false, egui::Modifiers::NONE));
+        assert!(frame(true, ctrl | egui::Modifiers::SHIFT));
+        assert!(frame(false, ctrl | egui::Modifiers::SHIFT));
+        assert!(!frame(true, ctrl));
+        assert!(!frame(true, ctrl));
+        assert!(!frame(false, ctrl));
+        assert!(frame(true, ctrl));
+    }
+
     #[test]
     fn compact_transcript_keeps_text_inside_viewport() {
         let mut fonts = egui::FontDefinitions::default();

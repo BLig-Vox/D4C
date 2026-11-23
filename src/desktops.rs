@@ -1,9 +1,19 @@
 use crate::{
-    button_label, icon_text,
+    button_label, icon_text, preferences,
     workspace::{self, Event, Link, Workspace},
 };
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
+
+const MIN_DOCK_CHAT_WIDTH: f32 = 340.0;
+const MIN_DOCK_VIEWER_WIDTH: f32 = 360.0;
+
 #[derive(Default)]
 pub struct Desktops {
     pub workspace: Workspace,
@@ -12,22 +22,25 @@ pub struct Desktops {
     rename: Option<(String, String)>,
     delete: Option<String>,
     viewer: Option<Viewer>,
-    pending_restore:Option<UiState>,
     focused_session: Option<String>,
     bound_desktop: Option<String>,
-    bubble_positions: std::collections::HashMap<String, egui::Pos2>,
-    docked_chats: std::collections::HashMap<String, String>,
+    layouts: HashMap<String, ViewerLayout>,
+    layout_file: Option<String>,
+    layout_dirty_since: Option<Instant>,
     choose_other: bool,
     pending_create: Option<PendingCreate>,
 }
-#[derive(Clone,Default)]
-pub(crate) struct UiState {
-    positions: std::collections::HashMap<String, egui::Pos2>,
-    docked_chats: std::collections::HashMap<String, String>,
-    viewer: Option<Placement>,
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+struct ViewerLayout {
+    desktop: String,
+    bubble: Option<[f32; 2]>,
+    expanded: bool,
+    zoom: f32,
+    fullscreen: bool,
+    floating: Option<[[f32; 2]; 2]>,
+    docked: bool,
+    dock_width: Option<f32>,
 }
-#[derive(Clone)]
-struct Placement {id:String,bubble:Option<egui::Pos2>,expanded:bool,zoom:f32,fullscreen:bool,rect:Option<egui::Rect>}
 struct PendingCreate {
     session: String,
     name: String,
@@ -54,7 +67,7 @@ struct Viewer {
     docked: bool,
     touch_control: bool,
     text: String,
-    reset_float: bool,
+    dock_width: Option<f32>,
     initial_fit: bool,
     float_rect: Option<egui::Rect>,
 }
@@ -82,19 +95,71 @@ impl Viewer {
     fn pause(&mut self) { self.buttons=0;self.expanded=false;self.link=None;self.waiting_for_frame=true; }
 }
 impl Desktops {
-    pub(crate) fn capture_ui(&self)->UiState {
-        if let Some(state)=self.pending_restore.as_ref(){return state.clone();}
-        UiState {positions:self.bubble_positions.clone(),docked_chats:self.docked_chats.clone(),viewer:self.viewer.as_ref().map(|v|Placement{id:v.id.clone(),bubble:v.bubble_pos,expanded:v.expanded,zoom:v.zoom,fullscreen:v.fullscreen,rect:v.float_rect})}
+    fn load_layout(&mut self, url: &str) {
+        use sha2::{Digest, Sha256};
+        if !preferences::valid_url(url) {
+            return;
+        }
+        let file = format!("desktop-layout-{:x}.json", Sha256::digest(url.as_bytes()));
+        if self.layout_file.as_ref() != Some(&file) {
+            self.save_layout(true);
+            self.layouts = serde_json::from_value(preferences::read(&file)).unwrap_or_default();
+            self.layout_file = Some(file);
+            self.layout_dirty_since = None;
+        }
     }
-    pub(crate) fn restore_ui(&mut self,state:UiState) {self.pending_restore=Some(state);}
+
+    fn remember_viewer_layout(&mut self) {
+        let (Some(chat), Some(viewer)) = (self.focused_session.as_ref(), self.viewer.as_ref()) else {
+            return;
+        };
+        if self.bound_desktop.as_ref() != Some(&viewer.id) {
+            return;
+        }
+        let layout = ViewerLayout {
+            desktop: viewer.id.clone(),
+            bubble: viewer.bubble_pos.map(|pos| [pos.x, pos.y]),
+            expanded: viewer.expanded,
+            zoom: viewer.zoom,
+            fullscreen: viewer.fullscreen,
+            floating: viewer
+                .float_rect
+                .map(|rect| [[rect.min.x, rect.min.y], [rect.max.x, rect.max.y]]),
+            docked: viewer.docked,
+            dock_width: viewer.dock_width,
+        };
+        if self.layouts.get(chat) != Some(&layout) {
+            self.layouts.insert(chat.clone(), layout);
+            self.layout_dirty_since.get_or_insert_with(Instant::now);
+        }
+    }
+
+    pub(crate) fn save_layout(&mut self, force: bool) {
+        self.remember_viewer_layout();
+        let (Some(file), Some(since)) = (&self.layout_file, self.layout_dirty_since) else {
+            return;
+        };
+        if !force && since.elapsed() < Duration::from_millis(400) {
+            return;
+        }
+        match serde_json::to_value(&self.layouts)
+            .map_err(std::io::Error::from)
+            .and_then(|value| preferences::write(file, &value))
+        {
+            Ok(()) => self.layout_dirty_since = None,
+            Err(error) => {
+                eprintln!("Could not save BotScreen layout: {error}");
+                self.layout_dirty_since = Some(Instant::now());
+            }
+        }
+    }
 
     pub fn connect(&mut self, url: &str, ctx: &egui::Context) {
-        if self.pending_restore.is_none() && self.viewer.is_some(){self.pending_restore=Some(self.capture_ui());}
+        self.save_layout(true);
+        self.load_layout(url);
         self.viewer = None;
         self.focused_session = None;
         self.bound_desktop = None;
-        self.bubble_positions.clear();
-        self.docked_chats.clear();
         self.pending_create = None;
         self.choose_other = false;
         self.workspace.connect(url, ctx);
@@ -104,6 +169,9 @@ impl Desktops {
     pub fn follow_session(&mut self, session: &str, url: &str, ctx: &egui::Context) {
         if !self.workspace.ready {
             return;
+        }
+        if self.layout_file.is_none() {
+            self.load_layout(url);
         }
         let desktop = self
             .workspace
@@ -120,11 +188,7 @@ impl Desktops {
         if self.focused_session.as_deref() == Some(session) && self.bound_desktop == id {
             return;
         }
-        let restored=self.pending_restore.take();
-        if let Some(state) = restored.as_ref() {
-            self.bubble_positions.clone_from(&state.positions);
-            self.docked_chats.clone_from(&state.docked_chats);
-        }
+        self.remember_viewer_layout();
         if let Some(old) = self.viewer.take() {
             if old.buttons != 0 {
                 self.workspace.rpc(
@@ -132,25 +196,12 @@ impl Desktops {
                     json!({"id":old.id,"type":"pointer","x":0,"y":0,"buttons":0}),
                 );
             }
-            if let (Some(key), Some(pos)) = (self.focused_session.as_ref(), old.bubble_pos) {
-                if self.bubble_positions.len() >= 128 {
-                    self.bubble_positions.clear();
-                }
-                self.bubble_positions.insert(key.clone(), pos);
-            }
         }
         self.choose_other = false;
         self.focused_session = Some(session.into());
         self.bound_desktop = id;
         if let Some(desktop) = desktop {
             self.view(&desktop, url, ctx);
-            if let Some(v) = self.viewer.as_mut() {
-                v.bubble_pos = self.bubble_positions.get(session).copied();
-                if let Some(placement)=restored.and_then(|s|s.viewer).filter(|p|p.id==v.id) {
-                    v.bubble_pos=placement.bubble;v.zoom=placement.zoom;v.fullscreen=placement.fullscreen;v.float_rect=placement.rect;v.reset_float=placement.rect.is_some();v.expanded=placement.expanded;
-                    if v.expanded {v.link=Some(workspace::connect(v.base.clone(),Some(v.id.clone()),ctx.clone()));}
-                }
-            }
         }
     }
     pub fn poll_ui(&mut self, ctx: &egui::Context) {
@@ -222,18 +273,23 @@ impl Desktops {
             return;
         };
         let id = d["id"].as_str().unwrap_or("").to_string();
-        let docked = self
+        self.remember_viewer_layout();
+        let layout = self
             .focused_session
             .as_ref()
-            .and_then(|session| self.docked_chats.get(session))
-            == Some(&id);
+            .and_then(|session| self.layouts.get(session))
+            .filter(|layout| layout.desktop == id);
+        let expanded = layout.is_some_and(|layout| layout.expanded);
+        let link = expanded.then(|| workspace::connect(base.clone(), Some(id.clone()), ctx.clone()));
         self.viewer = Some(Viewer {
             id,
             name: d["name"].as_str().unwrap_or("Desktop").into(),
-            link: None,
+            link,
             base,
-            expanded: false,
-            bubble_pos: None,
+            expanded,
+            bubble_pos: layout
+                .and_then(|layout| layout.bubble)
+                .map(|[x, y]| egui::pos2(x, y)),
             texture: None,
             width: 1280,
             height: 800,
@@ -241,14 +297,18 @@ impl Desktops {
             waiting_for_frame: true,
             last_claim: std::time::Instant::now(),
             buttons: 0,
-            zoom: 1.0,
-            fullscreen: false,
-            docked,
+            zoom: layout.map_or(1.0, |layout| layout.zoom.clamp(1.0, 5.0)),
+            fullscreen: layout.is_some_and(|layout| layout.fullscreen),
+            docked: layout.is_some_and(|layout| layout.docked),
             touch_control: false,
             text: String::new(),
-            reset_float: false,
+            dock_width: layout.and_then(|layout| layout.dock_width),
             initial_fit: true,
-            float_rect: None,
+            float_rect: layout
+                .and_then(|layout| layout.floating)
+                .map(|[[x, y], [right, bottom]]| {
+                    egui::Rect::from_min_max(egui::pos2(x, y), egui::pos2(right, bottom))
+                }),
         });
     }
     pub fn slash(&mut self, text: &str, session: &str, url: &str, ctx: &egui::Context) -> bool {
@@ -418,13 +478,11 @@ impl Desktops {
   }});
     }
     pub fn dock_width(ui: &egui::Ui) -> Option<f32> {
-        const MIN_CHAT_WIDTH: f32 = 340.0;
-        const MIN_VIEWER_WIDTH: f32 = 360.0;
         let bounds = crate::platform::content_rect(ui.ctx());
         let narrow_portrait = bounds.width() < 760.0 && bounds.width() < bounds.height();
         let width = ui.available_width();
-        (!narrow_portrait && width >= MIN_CHAT_WIDTH + MIN_VIEWER_WIDTH)
-            .then(|| (width * 0.8).min(width - MIN_CHAT_WIDTH))
+        (!narrow_portrait && width >= MIN_DOCK_CHAT_WIDTH + MIN_DOCK_VIEWER_WIDTH)
+            .then(|| (width * 0.75).min(width - MIN_DOCK_CHAT_WIDTH))
     }
 
     pub fn viewer_dock_ui(&mut self, ui: &mut egui::Ui, width: Option<f32>) -> bool {
@@ -555,6 +613,7 @@ impl Desktops {
                     );
                     if response.dragged() {
                         pos = clamp_position(pos + response.drag_delta());
+                        v.bubble_pos = Some(pos);
                         ctx.request_repaint();
                     }
                     expand = response.clicked();
@@ -566,7 +625,6 @@ impl Desktops {
                         }
                     });
                 });
-            v.bubble_pos = Some(pos);
             if dismiss {
                 self.viewer = None;
             } else if expand {
@@ -591,52 +649,164 @@ impl Desktops {
         let mut open = true;
         let mut close = false;
         let was_fullscreen = v.fullscreen;
-        let was_docked = v.docked;
         let floating = dock.is_none();
         let mut content = |ui: &mut egui::Ui, v: &mut Viewer| {
-            ui.spacing_mut().item_spacing=egui::vec2(6.0,6.0);
-            ui.horizontal(|ui|{
-                let actions=if mobile{210.0}else{226.0};
-                let width=(ui.available_width()-actions).max(70.0);
-                ui.allocate_ui_with_layout(egui::vec2(width,40.0),egui::Layout::top_down(egui::Align::LEFT),|ui|{
-                    ui.set_width(width);ui.set_min_height(40.0);
-                    ui.horizontal(|ui|{ui.label(icon_text(lucide_icons::Icon::Monitor,15.0));ui.add(egui::Label::new(egui::RichText::new(&v.name).size(14.0).strong()).truncate());});
-                    ui.horizontal(|ui|{
-                        if in_use&&!human{ui.label(egui::RichText::new("●").size(9.0).color(egui::Color32::from_rgb(143,191,178)));}
-                        let status=if own{"Your control"}else if human{"Human control"}else if in_use{"Computer in use"}else{"Agent mode"};
-                        ui.label(egui::RichText::new(status).size(10.0).color(if human{egui::Color32::from_rgb(223,187,121)}else{egui::Color32::from_rgb(143,191,178)}));
-                    });
-                });
-                if ui.add_enabled(!pending_control && self.workspace.ready && self.workspace.status=="Online" && (stream_live||human),egui::Button::new(egui::RichText::new(if human{"Return to agent"}else{"Take over"}).size(11.0)).min_size(egui::vec2(if mobile{86.0}else{102.0},36.0))).clicked(){
-                    self.workspace.rpc(if human{"desktop.return_agent"}else{"desktop.claim"},json!({"id":v.id}));v.last_claim=std::time::Instant::now();own=false;v.buttons=0;
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            let button_size = if mobile { 32.0 } else { 28.0 };
+            let single_row = ui.available_width() >= 570.0 && !mobile;
+            let control_status = if own {
+                "Your control"
+            } else if human {
+                "Human control"
+            } else if in_use {
+                "Computer in use"
+            } else {
+                "Agent mode"
+            };
+            let status = |ui: &mut egui::Ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(control_status).size(11.0).color(
+                        if human {
+                            egui::Color32::from_rgb(223, 187, 121)
+                        } else {
+                            egui::Color32::from_rgb(143, 191, 178)
+                        },
+                    ))
+                    .truncate(),
+                );
+            };
+            let icon_button = |ui: &mut egui::Ui, icon, tooltip: &str| {
+                ui.add(
+                    egui::Button::new(icon_text(icon, 15.0))
+                        .frame(false)
+                        .min_size(egui::Vec2::splat(button_size)),
+                )
+                .on_hover_text(tooltip)
+                .clicked()
+            };
+            // Both rows reserve room for the controls before laying out text.
+            let view_controls = |ui: &mut egui::Ui, v: &mut Viewer| {
+                if mobile && own
+                    && ui
+                        .add(
+                            egui::Button::selectable(
+                                v.touch_control,
+                                egui::RichText::new(if v.touch_control { "Touch" } else { "Pan" })
+                                    .size(11.0),
+                            )
+                            .min_size(egui::vec2(0.0, button_size)),
+                        )
+                        .on_hover_text(if v.touch_control { "Touch control" } else { "Swipe to pan" })
+                        .clicked()
+                {
+                    v.touch_control = !v.touch_control;
                 }
-                if ui.add(egui::Button::new(icon_text(lucide_icons::Icon::RotateCw,16.0)).frame(false).min_size(egui::vec2(32.0,36.0))).on_hover_text(&v.status).clicked(){
-                    if let Some(link)=v.link.as_ref(){link.reconnect();}v.waiting_for_frame=true;v.status="Reconnecting…".into();
-                }
-                if ui.add(egui::Button::new(icon_text(if v.fullscreen{lucide_icons::Icon::Minimize}else{lucide_icons::Icon::Maximize},16.0)).frame(false).min_size(egui::vec2(32.0,36.0))).on_hover_text(if v.fullscreen{"Exit fullscreen"}else{"Fullscreen"}).clicked(){v.fullscreen=!v.fullscreen;if !v.fullscreen{v.reset_float=true;}ctx.request_repaint();}
-                if ui.add(egui::Button::new(icon_text(lucide_icons::Icon::Minus,17.0)).frame(false).min_size(egui::vec2(32.0,36.0))).on_hover_text("Minimize to bubble").clicked(){close=true;}
-            });
-            ui.separator();
-            ui.horizontal(|ui|{
-                if ui.add(egui::Button::new(icon_text(lucide_icons::Icon::Minus,15.0)).frame(false).min_size(egui::vec2(32.0,32.0))).on_hover_text("Zoom out").clicked(){v.zoom=(v.zoom/1.4).max(1.0);}
-                if ui.add(egui::Button::new(egui::RichText::new("Fit").size(11.0)).frame(false).min_size(egui::vec2(32.0,32.0))).on_hover_text("Fit to widget").clicked(){v.zoom=1.0;}
-                if ui.add(egui::Button::new(icon_text(lucide_icons::Icon::Plus,15.0)).frame(false).min_size(egui::vec2(32.0,32.0))).on_hover_text("Zoom in").clicked(){v.zoom=(v.zoom*1.4).min(5.0);}
-                ui.label(egui::RichText::new(format!("{:.0}%",v.zoom*100.0)).size(10.0).weak());
                 if can_dock && !v.fullscreen {
                     let (icon, label) = if floating {
                         (lucide_icons::Icon::PanelRightOpen, "Dock right")
                     } else {
                         (lucide_icons::Icon::PictureInPicture, "Float")
                     };
-                    if ui.add(egui::Button::new(button_label(icon, label)).frame(false)).clicked() {
+                    if icon_button(ui, icon, label) {
                         v.docked = floating;
                         ctx.request_repaint();
                     }
                 }
-                if own&&mobile{
-                    if ui.add(egui::Button::selectable(v.touch_control,egui::RichText::new(if v.touch_control{"Touch control"}else{"Swipe to pan"}).size(11.0)).min_size(egui::vec2(0.0,32.0))).clicked(){v.touch_control=!v.touch_control;}
-                }else if mobile{ui.label(egui::RichText::new("Swipe to pan").size(10.0).weak());}
+                if icon_button(ui, lucide_icons::Icon::Plus, "Zoom in") {
+                    v.zoom = (v.zoom * 1.4).min(5.0);
+                }
+                if ui.add(
+                    egui::Button::new(egui::RichText::new(format!("Fit  {:.0}%", v.zoom * 100.0)).size(11.0))
+                        .frame(false)
+                        .min_size(egui::vec2(64.0, button_size)),
+                )
+                .on_hover_text("Fit to viewer")
+                .clicked()
+                {
+                    v.zoom = 1.0;
+                }
+                if icon_button(ui, lucide_icons::Icon::Minus, "Zoom out") {
+                    v.zoom = (v.zoom / 1.4).max(1.0);
+                }
+            };
+            let mut control_changed = false;
+            let row_size = egui::vec2(ui.available_width(), button_size);
+            let row_layout = egui::Layout::right_to_left(egui::Align::Center);
+            let title_layout = egui::Layout::left_to_right(egui::Align::Center);
+            ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
+                if icon_button(ui, lucide_icons::Icon::Minus, "Minimize to bubble") {
+                    close = true;
+                }
+                let (fullscreen_icon, fullscreen_label) = if v.fullscreen {
+                    (lucide_icons::Icon::Minimize, "Exit fullscreen")
+                } else {
+                    (lucide_icons::Icon::Maximize, "Fullscreen")
+                };
+                if icon_button(ui, fullscreen_icon, fullscreen_label) {
+                    v.fullscreen = !v.fullscreen;
+                    ctx.request_repaint();
+                }
+                if icon_button(ui, lucide_icons::Icon::RotateCw, &v.status) {
+                    if let Some(link) = v.link.as_ref() {
+                        link.reconnect();
+                    }
+                    v.waiting_for_frame = true;
+                    v.status = "Reconnecting…".into();
+                }
+                if ui
+                    .add_enabled(
+                        !pending_control && self.workspace.ready && self.workspace.status == "Online"
+                            && (stream_live || human),
+                        egui::Button::new(
+                            egui::RichText::new(if human { "Return to agent" } else { "Take over" })
+                                .size(11.0),
+                        )
+                        .min_size(egui::vec2(92.0, button_size)),
+                    )
+                    .clicked()
+                {
+                    self.workspace.rpc(
+                        if human { "desktop.return_agent" } else { "desktop.claim" },
+                        json!({"id":v.id}),
+                    );
+                    v.last_claim = std::time::Instant::now();
+                    v.buttons = 0;
+                    control_changed = true;
+                }
+                if single_row {
+                    ui.add_space(8.0);
+                    view_controls(ui, v);
+                    ui.add_space(8.0);
+                }
+                ui.with_layout(title_layout, |ui| {
+                    ui.label(icon_text(lucide_icons::Icon::Monitor, 15.0));
+                    let title =
+                        egui::Label::new(egui::RichText::new(&v.name).size(14.0).strong())
+                            .truncate();
+                    if single_row {
+                        let width = (ui.available_width() - 104.0).max(0.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(width, button_size),
+                            title_layout,
+                            |ui| ui.add(title),
+                        );
+                        ui.add_space(4.0);
+                        status(ui);
+                    } else {
+                        ui.add(title);
+                    }
+                });
             });
+            if !single_row {
+                ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
+                    view_controls(ui, v);
+                    ui.with_layout(title_layout, status);
+                });
+            }
+            if control_changed {
+                own = false;
+            }
+            ui.separator();
             if own {
                 ui.horizontal(|ui|{
                     let edit=ui.add(egui::TextEdit::singleline(&mut v.text).hint_text("Type on desktop…").desired_width((ui.available_width()-92.0).max(40.0)));
@@ -698,9 +868,27 @@ impl Desktops {
             }
         };
         if let Some((ui, width)) = dock {
-            egui::Panel::right("desktop_viewer_dock")
-                .exact_size(width)
-                .resizable(false)
+            let available = ui.available_width();
+            let max_width = available - MIN_DOCK_CHAT_WIDTH;
+            let width = v.dock_width.unwrap_or(width).clamp(MIN_DOCK_VIEWER_WIDTH, max_width);
+            let salt = (
+                "desktop_viewer_dock",
+                &v.base,
+                self.focused_session.as_deref(),
+                &v.id,
+            );
+            let id = ui.scope_id().with_salt(egui::IdSalt::new(salt));
+            let mut rect = ui.available_rect_before_wrap();
+            rect.min.x = rect.right() - width;
+            // Seed the panel from the preferred width so temporary viewport constraints
+            // do not replace the user's setting.
+            ctx.data_mut(|data| {
+                data.insert_persisted(id, egui::containers::panel::PanelState { outer_rect: rect });
+            });
+            egui::Panel::right(salt)
+                .default_size(width)
+                .size_range(MIN_DOCK_VIEWER_WIDTH..=max_width)
+                .resizable(true)
                 .frame(
                     egui::Frame::new()
                         .fill(egui::Color32::from_rgb(25, 27, 32))
@@ -708,6 +896,10 @@ impl Desktops {
                         .inner_margin(10),
                 )
                 .show(ui, |ui| content(ui, v));
+            let actual_width = available - ui.available_width();
+            if (actual_width - width).abs() > 1.0 {
+                v.dock_width = Some(actual_width);
+            }
         } else {
             let mobile_width = (bounds.width() - 24.0).max(260.0);
             let default_size = if mobile {
@@ -723,7 +915,15 @@ impl Desktops {
                 )
             };
             let mut floating = egui::Window::new(&v.name)
-                .id(egui::Id::unique(("desktop_viewer_compact_v3", &v.id, mobile)))
+                .id(egui::Id::unique((
+                    "desktop_viewer",
+                    &v.base,
+                    self.focused_session.as_deref(),
+                    &v.id,
+                    mobile,
+                    was_fullscreen,
+                    v.docked,
+                )))
                 .open(&mut open)
                 .title_bar(false)
                 .drag_area(egui::containers::WindowDrag::Anywhere)
@@ -738,17 +938,16 @@ impl Desktops {
                 .resizable(!v.fullscreen)
                 .min_size([260.0, 220.0])
                 .default_size(default_size);
-            if mobile && v.initial_fit && !v.fullscreen {
+            if let Some(rect) = v.float_rect {
+                floating = floating.default_rect(egui::Rect::from_min_size(
+                    rect.min,
+                    rect.size().min(bounds.size()),
+                ));
+            } else if mobile && v.initial_fit && !was_fullscreen {
                 floating = floating.fixed_size(default_size);
-                v.initial_fit = false;
             }
-            if v.reset_float {
-                if let Some(rect) = v.float_rect {
-                    floating = floating.current_pos(rect.min).fixed_size(rect.size());
-                }
-                v.reset_float = false;
-            }
-            if v.fullscreen {
+            v.initial_fit = false;
+            if was_fullscreen {
                 floating = floating
                     .fixed_rect(bounds.shrink(2.0))
                     .movable(false)
@@ -756,17 +955,9 @@ impl Desktops {
             }
             if let Some(shown) = floating.show(ctx, |ui| content(ui, v))
                 && !was_fullscreen
+                && !v.docked
             {
                 v.float_rect = Some(shown.response.rect);
-            }
-        }
-        if was_docked != v.docked
-            && let Some(chat) = self.focused_session.as_ref()
-        {
-            if v.docked {
-                self.docked_chats.insert(chat.clone(), v.id.clone());
-            } else {
-                self.docked_chats.remove(chat);
             }
         }
         if !open || close {
@@ -874,15 +1065,72 @@ mod tests {
         }
         desktops
     }
+    fn layout_test_input(width: f32) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 900.0),
+            )),
+            ..Default::default()
+        }
+    }
     #[test]
-    fn quick_switch_keeps_pending_viewer_placement() {
-        let mut d=Desktops::default();
-        let state=UiState{positions:std::collections::HashMap::from([("chat".into(),egui::pos2(50.0,80.0))]),docked_chats:Default::default(),viewer:Some(Placement{id:"desktop-a".into(),bubble:Some(egui::pos2(50.0,80.0)),expanded:true,zoom:1.5,fullscreen:true,rect:None})};
-        d.restore_ui(state);let captured=d.capture_ui();
-        assert_eq!(captured.positions["chat"],egui::pos2(50.0,80.0));
-        let v=captured.viewer.unwrap();assert_eq!(v.id,"desktop-a");assert!(v.expanded && v.fullscreen);assert_eq!(v.zoom,1.5);
-        d.connect("wss://localhost:9",&egui::Context::default());
-        assert_eq!(d.capture_ui().viewer.unwrap().id,"desktop-a");
+    fn restart_restores_layout_only_for_the_matching_chat_and_desktop() {
+        let url = "wss://desktop-layout-restart.test";
+        let ctx = egui::Context::default();
+        let mut before = bound_chats();
+        before.follow_session("chat-a", url, &ctx);
+        let viewer = before.viewer.as_mut().unwrap();
+        viewer.expanded = true;
+        viewer.docked = true;
+        viewer.bubble_pos = Some(egui::pos2(50.0, 80.0));
+        viewer.zoom = 1.4;
+        viewer.dock_width = Some(950.0);
+        let rect = egui::Rect::from_min_size(egui::pos2(80.0, 120.0), egui::vec2(680.0, 480.0));
+        viewer.float_rect = Some(rect);
+        before.save_layout(true);
+
+        let mut after = bound_chats();
+        let fresh_ctx = egui::Context::default();
+        after.follow_session("chat-b", url, &fresh_ctx);
+        assert!(!after.viewer.as_ref().unwrap().expanded);
+        after.follow_session("chat-a", url, &fresh_ctx);
+        let viewer = after.viewer.as_ref().unwrap();
+        assert!(viewer.expanded && viewer.docked);
+        assert_eq!(viewer.bubble_pos, Some(egui::pos2(50.0, 80.0)));
+        assert_eq!(viewer.zoom, 1.4);
+        assert_eq!(viewer.dock_width, Some(950.0));
+        assert_eq!(viewer.float_rect, Some(rect));
+        assert!(viewer.link.is_some());
+
+        for (width, expected_chat) in [(1900.0, 950.0), (1050.0, 340.0), (1900.0, 950.0)] {
+            for _ in 0..2 {
+                fresh_ctx.run_ui(layout_test_input(width), |ui| {
+                    let width = Desktops::dock_width(ui);
+                    assert!(after.viewer_dock_ui(ui, width));
+                    assert!((ui.available_width() - expected_chat).abs() <= 1.0);
+                }).textures_delta.clear();
+            }
+        }
+        assert_eq!(after.viewer.as_ref().unwrap().dock_width, Some(950.0));
+        after.viewer.as_mut().unwrap().docked = false;
+        for _ in 0..3 {
+            fresh_ctx.run_ui(layout_test_input(1900.0), |ui| {
+                after.viewer_ui(ui.ctx(), true);
+            }).textures_delta.clear();
+        }
+        let actual_rect = after.viewer.as_ref().unwrap().float_rect.unwrap();
+        assert!((actual_rect.min - rect.min).length() <= 1.0, "{actual_rect}");
+        assert!((actual_rect.size() - rect.size()).length() <= 1.0, "{actual_rect}");
+
+        after.workspace.objects.insert(
+            ("binding".into(), "chat-a".into()),
+            json!({"id":"chat-a","desktopId":"desktop-b"}),
+        );
+        after.follow_session("chat-a", url, &fresh_ctx);
+        let viewer = after.viewer.as_ref().unwrap();
+        assert!(!viewer.expanded && !viewer.docked);
+        assert_eq!(viewer.zoom, 1.0);
     }
     #[test]
     fn minimized_viewer_keeps_its_last_image() {
@@ -923,7 +1171,8 @@ mod tests {
             if frame == 10 {
                 first = window.size();
             }
-            if frame > 10 {
+            // The newly created fullscreen area needs its initial sizing pass.
+            if frame > 10 && frame != 30 {
                 assert!((window.size() - first).abs().max_elem() <= 1.0, "viewer resized from {first} to {}", window.size());
                 let image = ctx.tessellate(output.shapes, output.pixels_per_point)
                     .iter()
@@ -944,6 +1193,57 @@ mod tests {
             assert!(window.height() <= 680.0, "unexpected window size {window}");
         }
     }
+    #[test]
+    fn dragging_dock_divider_resizes_both_panes_within_their_limits() {
+        let ctx = egui::Context::default();
+        let mut desktops = Desktops::default();
+        desktops.view(&json!({"id":"test"}), "wss://localhost:9", &ctx);
+        let viewer = desktops.viewer.as_mut().unwrap();
+        viewer.expanded = true;
+        viewer.docked = true;
+        let mut draw = |events| {
+            let mut chat_width = 0.0;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1900.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let dock_width = Desktops::dock_width(ui);
+                    assert!(desktops.viewer_dock_ui(ui, dock_width));
+                    chat_width = ui.available_width();
+                },
+            );
+            output.textures_delta.clear();
+            chat_width
+        };
+
+        draw(vec![]);
+        let divider = egui::pos2(draw(vec![]), 450.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            pressed,
+            button: egui::PointerButton::Primary,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        draw(vec![egui::Event::PointerMoved(divider)]);
+        draw(vec![button(divider, true)]);
+        for (x, expected) in [(850.0, 850.0), (1800.0, 1540.0), (100.0, 340.0)] {
+            let actual = draw(vec![egui::Event::PointerMoved(egui::pos2(x, divider.y))]);
+            assert!(
+                (actual - expected).abs() <= 2.0,
+                "chat width {actual}, expected {expected}"
+            );
+        }
+        draw(vec![button(egui::pos2(100.0, divider.y), false)]);
+        assert!((draw(vec![]) - 340.0).abs() <= 2.0);
+    }
+
     #[test]
     fn opted_in_desktop_docks_with_chat_space_and_falls_back_in_portrait() {
         let ctx = egui::Context::default();
@@ -1002,7 +1302,7 @@ mod tests {
                 assert!(chat_width < width / 2.0);
                 assert!(image.left() >= chat_width);
                 if width == 1900.0 {
-                    assert!((chat_width - 380.0).abs() <= 2.0, "chat width {chat_width}");
+                    assert!((chat_width - 475.0).abs() <= 2.0, "chat width {chat_width}");
                 }
             } else {
                 assert_eq!(chat_width, width);
