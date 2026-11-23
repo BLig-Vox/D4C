@@ -617,7 +617,7 @@ impl Desktops {
             ui.separator();
             ui.horizontal(|ui|{
                 if ui.add(egui::Button::new(icon_text(lucide_icons::Icon::Minus,15.0)).frame(false).min_size(egui::vec2(32.0,32.0))).on_hover_text("Zoom out").clicked(){v.zoom=(v.zoom/1.4).max(1.0);}
-                if ui.add(egui::Button::new(egui::RichText::new("Fit").size(11.0)).frame(false).min_size(egui::vec2(32.0,32.0))).clicked(){v.zoom=1.0;}
+                if ui.add(egui::Button::new(egui::RichText::new("Fit").size(11.0)).frame(false).min_size(egui::vec2(32.0,32.0))).on_hover_text("Fit to widget").clicked(){v.zoom=1.0;}
                 if ui.add(egui::Button::new(icon_text(lucide_icons::Icon::Plus,15.0)).frame(false).min_size(egui::vec2(32.0,32.0))).on_hover_text("Zoom in").clicked(){v.zoom=(v.zoom*1.4).min(5.0);}
                 ui.label(egui::RichText::new(format!("{:.0}%",v.zoom*100.0)).size(10.0).weak());
                 if own&&mobile{
@@ -644,12 +644,14 @@ impl Desktops {
             if v.texture.is_none() {desktop_skeleton(ui,v.width,v.height);}
             if !self.workspace.error.is_empty(){ui.colored_label(egui::Color32::LIGHT_RED,&self.workspace.error);}
             if let Some(texture)=v.texture.as_ref(){
-                let available=ui.available_size().max(egui::vec2(100.0,100.0));
-                let ratio=(available.x/v.width as f32).min((available.y-8.0).max(40.0)/v.height as f32).max(0.01)*v.zoom;
+                let available = (ui.available_size() - egui::vec2(0.0, 8.0)).max(egui::Vec2::splat(1.0));
+                let ratio=(available.x/v.width as f32).min(available.y/v.height as f32)*v.zoom;
                 let size=egui::vec2(v.width as f32*ratio,v.height as f32*ratio);
                 egui::ScrollArea::both().id_salt(("vnc_pan",&v.id)).auto_shrink([false,false]).scroll_source(egui::scroll_area::ScrollSource{scroll_bar:true,drag:if mobile&&!v.touch_control||!own{egui::scroll_area::DragScroll::Always}else{egui::scroll_area::DragScroll::Never},mouse_wheel:!own||mobile&&!v.touch_control}).show(ui,|ui|{
                     let interactive=own && (!mobile||v.touch_control);
-                    let response=ui.add(egui::Image::new((texture.id(),size)).tint(if stream_live {egui::Color32::WHITE}else{egui::Color32::from_gray(145)}).sense(if interactive{egui::Sense::click_and_drag()}else{egui::Sense::hover()}));
+                    let (viewport, _) = ui.allocate_exact_size(size.max(available), egui::Sense::hover());
+                    let image_rect = egui::Rect::from_center_size(viewport.center(), size);
+                    let response=ui.place(image_rect, egui::Image::new((texture.id(),size)).tint(if stream_live {egui::Color32::WHITE}else{egui::Color32::from_gray(145)}).sense(if interactive{egui::Sense::click_and_drag()}else{egui::Sense::hover()}));
                     if interactive {
                         if response.clicked()||response.drag_started(){response.request_focus();}
                         let events=ctx.input(|i|i.events.clone());
@@ -802,15 +804,56 @@ mod tests {
         assert!(v.texture.is_some());assert!(!v.expanded);assert!(v.waiting_for_frame);assert!(v.link.is_none());
     }
     #[test]
-    fn viewer_does_not_grow_between_frames() {
+    fn viewer_scales_the_image_when_the_viewport_changes() {
         let ctx=egui::Context::default();let mut d=Desktops::default();
         d.view(&json!({"id":"test","name":"Desktop"}),"wss://a.example",&ctx);
-        let v=d.viewer.as_mut().unwrap();v.expanded=true;
-        let mut first=0.0;
+        let v = d.viewer.as_mut().unwrap();
+        v.expanded = true;
+        let texture = ctx.load_texture(
+            "test desktop",
+            egui::ColorImage::filled([2, 2], egui::Color32::BLACK),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut first = egui::Vec2::ZERO;
+        let mut floating_image = egui::Vec2::ZERO;
         for frame in 0..60 {
-            let mut output=ctx.run_ui(egui::RawInput{screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(1440.0,900.0))),..Default::default()},|ui|{d.viewer_ui(ui.ctx());});output.textures_delta.clear();
-            let height=d.viewer.as_ref().unwrap().float_rect.unwrap().height();
-            if frame==5{first=height;}if frame>5{assert!(height<=first+1.0,"viewer grew from {first} to {height}");} assert!(height<=680.0,"unexpected height {height}");
+            if frame == 6 {
+                d.viewer.as_mut().unwrap().texture = Some(texture.clone());
+            }
+            if frame == 30 {
+                d.viewer.as_mut().unwrap().fullscreen = true;
+            }
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))),
+                    ..Default::default()
+                },
+                |ui| { d.viewer_ui(ui.ctx()); },
+            );
+            output.textures_delta.clear();
+            let window = d.viewer.as_ref().unwrap().float_rect.unwrap();
+            if frame == 10 {
+                first = window.size();
+            }
+            if frame > 10 {
+                assert!((window.size() - first).abs().max_elem() <= 1.0, "viewer resized from {first} to {}", window.size());
+                let image = ctx.tessellate(output.shapes, output.pixels_per_point)
+                    .iter()
+                    .find_map(|shape| match &shape.primitive {
+                        egui::epaint::Primitive::Mesh(mesh) if mesh.texture_id == texture.id() => Some(mesh.calc_bounds()),
+                        _ => None
+                    }).expect("VNC image");
+                assert!((image.aspect_ratio() - 1.6).abs() < 0.01, "image is stretched");
+                let viewer = d.viewer.as_ref().unwrap();
+                assert_eq!((viewer.width, viewer.height), (1280, 800));
+                if frame < 30 {
+                    assert!((image.center().x - window.center().x).abs() <= 1.0, "image is not centered");
+                    floating_image = image.size();
+                } else if frame > 32 {
+                    assert!(image.width() > floating_image.x && image.height() > floating_image.y);
+                }
+            }
+            assert!(window.height() <= 680.0, "unexpected window size {window}");
         }
     }
     #[test]
