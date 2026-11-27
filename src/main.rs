@@ -21,6 +21,7 @@ mod preferences;
 mod questions;
 mod rfb;
 mod servers;
+mod session_tabs;
 #[cfg(not(target_os = "android"))]
 mod updates;
 mod uploads;
@@ -56,7 +57,7 @@ fn main() -> eframe::Result {
                 ))
                 .expect("packaged D4C icon"),
             )
-            .with_fullscreen(!cfg!(target_os = "windows")),
+            .with_fullscreen(cfg!(target_os = "android")),
         ..Default::default()
     };
     run(options)
@@ -114,6 +115,7 @@ struct D4c {
     desktops: desktops::Desktops,
     servers: servers::Catalogs,
     server_views: std::collections::VecDeque<(String, ServerView)>,
+    tabs: session_tabs::Tabs,
     explicit_selection: bool,
     jump_latest: bool,
     workspace_hydrated: bool,
@@ -207,18 +209,47 @@ struct D4c {
 }
 impl Default for D4c {
     fn default() -> Self {
-        let preferences = preferences::Settings::load();
+        Self::load(true)
+    }
+}
+impl D4c {
+    fn load(restore_tabs: bool) -> Self {
+        let mut preferences = preferences::Settings::load();
+        let saved_tabs = restore_tabs
+            .then(|| {
+                session_tabs::Tabs::load(|url| {
+                    preferences.connections.iter().any(|c| c.url == url)
+                })
+            })
+            .flatten();
+        if let Some((_, Some(active))) = &saved_tabs
+            && let Some(index) = preferences.connections.iter().position(|c| c.url == active.url)
+        {
+            preferences.selected = index;
+        }
         let url = preferences.current().url.clone();
         let center = activity::Center::load(&url);
         let servers = servers::Catalogs::default();
-        let remembered = servers.rows.get(&url).and_then(|row| row.selected.clone());
+        let (tabs, remembered, explicit_selection) = match saved_tabs {
+            Some((tabs, active)) => (tabs, active.map(|id| id.session), true),
+            None => {
+                let remembered = servers.rows.get(&url).and_then(|row| row.selected.clone());
+                let mut tabs = session_tabs::Tabs::default();
+                if let Some(key) = remembered.as_deref().filter(|key| !key.starts_with("draft:")) {
+                    tabs.open(session_tabs::TabId::new(&url, key));
+                }
+                let explicit = remembered.is_some();
+                (tabs, remembered, explicit)
+            }
+        };
         let (default_model, default_thinking) = preferences.defaults(&url);
         let sidebar_open = preferences.sidebar_open(false);
         Self {
             desktops: Default::default(),
             servers,
             server_views: Default::default(),
-            explicit_selection: remembered.is_some(),
+            tabs,
+            explicit_selection,
             jump_latest: false,
             workspace_hydrated: false,
             queued_messages: Default::default(),
@@ -404,8 +435,9 @@ impl D4c {
         while views.len() > 2 {
             views.pop_front();
         }
-        let mut next = Self::default();
+        let mut next = Self::load(false);
         next.server_views = views;
+        next.tabs = std::mem::take(&mut self.tabs);
         next.queued_messages = std::mem::take(&mut self.queued_messages);
         next.servers = servers;
         next.session = remembered.unwrap_or_else(|| format!("draft:{}", uuid::Uuid::new_v4()));
@@ -531,9 +563,7 @@ impl D4c {
             return;
         }
         if self.preferences.connections[index].url == self.url {
-            if let Some(key) = target
-                && key != self.session
-            {
+            if let Some(key) = target {
                 let load = !key.starts_with("draft:");
                 self.select_session(key, load);
             }
@@ -594,11 +624,11 @@ impl D4c {
             }
             self.persist_rekeys();
         }
-        if let Some(key) = target
-            && key != self.session
-        {
+        if let Some(key) = target {
             let load = !key.starts_with("draft:");
             self.select_session(key, load);
+        } else if !self.session.starts_with("draft:") {
+            self.tabs.open(self.active_tab());
         }
         for params in sends.failed {
             self.restore_unsent(&params);
@@ -879,6 +909,7 @@ impl D4c {
         if old == new || uuid::Uuid::parse_str(new).is_err() {
             return;
         }
+        self.tabs.rekey(&self.url, old, new);
         if self.active_sessions.remove(old) {
             self.active_sessions.insert(new.into());
         }
@@ -987,8 +1018,39 @@ impl D4c {
             .or_else(|| self.fallback_titles.get(&self.session).map(String::as_str))
             .unwrap_or("New chat")
     }
+    fn active_tab(&self) -> session_tabs::TabId {
+        session_tabs::TabId::new(&self.url, &self.session)
+    }
+    fn select_tab(&mut self, id: &session_tabs::TabId, ctx: &egui::Context) {
+        if id.url == self.url {
+            self.select_session(id.session.clone(), !id.session.starts_with("draft:"));
+        } else if let Some(index) = self
+            .preferences
+            .connections
+            .iter()
+            .position(|c| c.url == id.url)
+        {
+            self.switch_to(index, ctx, Some(id.session.clone()));
+        }
+    }
+    fn close_tab(&mut self, id: &session_tabs::TabId, ctx: &egui::Context) {
+        if &self.active_tab() == id {
+            if let Some(neighbor) = self.tabs.neighbor(id).cloned() {
+                self.select_tab(&neighbor, ctx);
+                if &self.active_tab() == id {
+                    return;
+                }
+            } else {
+                self.select_session_impl(format!("draft:{}", uuid::Uuid::new_v4()), false, true);
+            }
+        }
+        self.tabs.remove(id);
+    }
     fn select_session(&mut self, key: String, load: bool) {
-        self.select_session_impl(key, load, true);
+        if !self.deleted_sessions.contains(&key) {
+            self.tabs.open(session_tabs::TabId::new(&self.url, &key));
+            self.select_session_impl(key, load, true);
+        }
     }
     fn select_session_impl(&mut self, key: String, load: bool, save_previous: bool) {
         self.jump_latest = false;
@@ -1010,7 +1072,7 @@ impl D4c {
                 .workspace
                 .rpc("notification.read", json!({"session":key}));
         }
-        if self.session == key && load {
+        if self.session == key {
             return;
         }
         if save_previous {
@@ -2885,6 +2947,7 @@ impl D4c {
             json!({"kind":"draft","id":key,"expectedRevision":rev,"value":{"text":""}}),
         );
         self.sessions.retain(|(k, _)| k != key);
+        self.tabs.remove(&session_tabs::TabId::new(&self.url, key));
         self.session_settings.remove(key);
         self.questions.forget_session(key);
         self.drafts.remove(key);
@@ -2899,6 +2962,7 @@ impl D4c {
         if self.session == key {
             if let Some((next, _)) = self.sessions.first().cloned() {
                 self.select_session_impl(next, true, false);
+                self.tabs.open(self.active_tab());
             } else {
                 self.select_session_impl(format!("draft:{}", uuid::Uuid::new_v4()), false, false);
             }
@@ -3091,6 +3155,7 @@ impl D4c {
         } else if !self.dispatch_send(params) {
             return;
         }
+        self.tabs.open(self.active_tab());
         self.running = true;
         self.active_sessions.insert(self.session.clone());
         self.live
@@ -3188,21 +3253,11 @@ fn message_text(v: &Value) -> String {
 impl eframe::App for D4c {
     #[cfg(target_os = "android")]
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        media::reset();
-        self.save_layout(true);
-        self.restore_pending_sends();
-        let _ = self.save_server_drafts();
-        self.servers.select(&self.url, &self.session);
-        self.servers.save();
+        self.save_on_exit();
     }
     #[cfg(not(target_os = "android"))]
     fn on_exit(&mut self) {
-        media::reset();
-        self.save_layout(true);
-        self.restore_pending_sends();
-        let _ = self.save_server_drafts();
-        self.servers.select(&self.url, &self.session);
-        self.servers.save();
+        self.save_on_exit();
     }
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         #[cfg(target_os = "android")]
@@ -3238,9 +3293,26 @@ impl eframe::App for D4c {
             });
         }
         self.save_layout(false);
+        self.save_tab_layout();
     }
 }
 impl D4c {
+    fn save_on_exit(&mut self) {
+        media::reset();
+        self.save_layout(true);
+        self.save_tab_layout();
+        self.restore_pending_sends();
+        let _ = self.save_server_drafts();
+        self.servers.select(&self.url, &self.session);
+        self.servers.save();
+    }
+
+    fn save_tab_layout(&mut self) {
+        if let Err(error) = self.tabs.save(&self.active_tab()) {
+            eprintln!("Could not save session tabs: {error}");
+        }
+    }
+
     fn save_layout(&mut self, force: bool) {
         self.desktops.save_layout(force);
         let compact = self.compact_previous;
@@ -3511,23 +3583,76 @@ impl D4c {
                             self.notifications_open = false;
                         }
                     }
-                    let status_width = 112.0;
-                    let (title_rect, title_response) = ui.allocate_exact_size(
-                        egui::vec2((ui.available_width() - status_width).max(24.0), 36.0),
-                        egui::Sense::hover(),
-                    );
-                    paint_ellipsis(
-                        ui,
-                        title_rect,
-                        if self.settings_open {
+                    let title_width = (ui.available_width() - 112.0).max(24.0);
+                    if self.tabs.is_empty() {
+                        let (title_rect, title_response) = ui.allocate_exact_size(
+                            egui::vec2(title_width, 36.0),
+                            egui::Sense::hover(),
+                        );
+                        let title = if self.settings_open {
                             "Settings"
                         } else {
                             self.chat_title()
-                        },
-                        15.0,
-                        ui.visuals().text_color(),
-                    );
-                    title_response.on_hover_text(self.chat_title());
+                        };
+                        paint_ellipsis(ui, title_rect, title, 15.0, ui.visuals().text_color());
+                        title_response.on_hover_text(title);
+                    } else {
+                        let active = self.active_tab();
+                        let action = ui
+                            .allocate_ui_with_layout(
+                                egui::vec2(title_width, 36.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.set_width(title_width);
+                                    self.tabs.ui(ui, &active, |id| {
+                                        let title = if id.url == self.url {
+                                            self.sessions
+                                                .iter()
+                                                .find(|(key, _)| key == &id.session)
+                                                .map(|(_, title)| title.as_str())
+                                                .or_else(|| {
+                                                    self.fallback_titles
+                                                        .get(&id.session)
+                                                        .map(String::as_str)
+                                                })
+                                        } else {
+                                            None
+                                        };
+                                        let title = title.or_else(|| {
+                                            self.servers
+                                                .rows
+                                                .get(&id.url)
+                                                .and_then(|row| {
+                                                    row.sessions
+                                                        .iter()
+                                                        .find(|session| session.key == id.session)
+                                                })
+                                                .map(|session| session.title.as_str())
+                                        });
+                                        let server = self
+                                            .preferences
+                                            .connections
+                                            .iter()
+                                            .find(|connection| connection.url == id.url)
+                                            .map(|connection| connection.name.as_str());
+                                        (title, server)
+                                    })
+                                },
+                            )
+                            .inner;
+                        if let Some(action) = action {
+                            match action {
+                                session_tabs::Action::Select(id) => {
+                                    self.select_tab(&id, ui.ctx());
+                                    if compact {
+                                        self.sidebar_open = false;
+                                    }
+                                }
+                                session_tabs::Action::Close(id) => self.close_tab(&id, ui.ctx()),
+                            }
+                            ui.ctx().request_repaint();
+                        }
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add(
@@ -5498,5 +5623,62 @@ mod recovery_tests {
                 .any(|m| m.item_id.as_deref() == Some("tool:call-1"))
         );
         assert!(app.live.contains_key(&app.session));
+    }
+}
+
+#[cfg(test)]
+mod session_tab_tests {
+    use super::*;
+    use session_tabs::TabId;
+
+    #[test]
+    fn selection_opens_tabs_once_and_closing_preserves_the_chat_and_draft() {
+        let mut app = D4c {
+            url: "wss://work.example".into(),
+            sessions: vec![
+                ("first".into(), "First".into()),
+                ("second".into(), "Second".into()),
+            ],
+            ..Default::default()
+        };
+        let first = TabId::new(&app.url, "first");
+        let second = TabId::new(&app.url, "second");
+        app.select_session(first.session.clone(), true);
+        app.input = "unfinished".into();
+        app.select_session(second.session.clone(), true);
+        app.select_session(first.session.clone(), true);
+        assert_eq!(app.tabs.ids().collect::<Vec<_>>(), [&first, &second]);
+
+        let ctx = egui::Context::default();
+        app.close_tab(&first, &ctx);
+        assert_eq!(app.session, second.session);
+        assert_eq!(app.tabs.ids().collect::<Vec<_>>(), [&second]);
+        assert!(app.sessions.iter().any(|(key, _)| key == &first.session));
+
+        app.close_tab(&second, &ctx);
+        assert!(app.session.starts_with("draft:"));
+        assert_eq!(app.tabs.ids().count(), 0);
+        app.select_session(first.session, true);
+        assert_eq!(app.input, "unfinished");
+    }
+
+    #[test]
+    fn draft_promotion_keeps_its_tab_without_merging_same_keys_on_other_servers() {
+        let mut app = D4c {
+            url: "wss://work.example".into(),
+            ..Default::default()
+        };
+        let remote = TabId::new("wss://doom.example", "draft:one");
+        app.tabs.open(remote.clone());
+        app.select_session("draft:one".into(), false);
+        app.history_initialized = true;
+        let ctx = egui::Context::default();
+        app.select_tab(&TabId::new(&app.url, "draft:one"), &ctx);
+        assert!(app.history_initialized);
+        let canonical = uuid::Uuid::new_v4().to_string();
+        app.adopt_session("draft:one", &canonical);
+        let promoted = TabId::new(&app.url, &canonical);
+        assert_eq!(app.tabs.ids().collect::<Vec<_>>(), [&remote, &promoted]);
+        assert_eq!(app.session, canonical);
     }
 }

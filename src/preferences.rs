@@ -134,9 +134,22 @@ pub fn valid_url(url: &str) -> bool {
         && !url.chars().any(char::is_whitespace)
         && !url.contains(['@', '?', '#'])
 }
+#[cfg(not(test))]
 fn dir() -> io::Result<PathBuf> {
     crate::platform::config_directory()
 }
+
+#[cfg(test)]
+fn dir() -> io::Result<PathBuf> {
+    thread_local! {
+        static TEST_CONFIG: io::Result<tempfile::TempDir> = tempfile::tempdir();
+    }
+    TEST_CONFIG.with(|directory| match directory {
+        Ok(directory) => Ok(directory.path().to_path_buf()),
+        Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+    })
+}
+
 pub fn read(name: &str) -> Value {
     dir()
         .ok()
