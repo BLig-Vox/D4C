@@ -127,6 +127,7 @@ impl D4c {
                 ui.add_space(4.0);
                 ui.heading("Settings");
                 ui.add_space(4.0);
+                settings_card(ui, "SSH servers", |ui| self.ssh.settings_ui(ui));
                 if ui.available_width() >= 780.0 {
                     ui.columns(2, |columns| {
                         self.connection_settings(&mut columns[0], &mut switch, &mut forget);

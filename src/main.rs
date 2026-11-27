@@ -22,6 +22,7 @@ mod questions;
 mod rfb;
 mod servers;
 mod session_tabs;
+mod ssh;
 #[cfg(not(target_os = "android"))]
 mod updates;
 mod uploads;
@@ -114,6 +115,7 @@ fn message_cache_bytes(m: &ChatMessage) -> usize {
 struct D4c {
     desktops: desktops::Desktops,
     servers: servers::Catalogs,
+    ssh: ssh::Servers,
     server_views: std::collections::VecDeque<(String, ServerView)>,
     tabs: session_tabs::Tabs,
     explicit_selection: bool,
@@ -247,6 +249,7 @@ impl D4c {
         Self {
             desktops: Default::default(),
             servers,
+            ssh: ssh::Servers::default(),
             server_views: Default::default(),
             tabs,
             explicit_selection,
@@ -440,6 +443,7 @@ impl D4c {
         next.tabs = std::mem::take(&mut self.tabs);
         next.queued_messages = std::mem::take(&mut self.queued_messages);
         next.servers = servers;
+        next.ssh = std::mem::take(&mut self.ssh);
         next.session = remembered.unwrap_or_else(|| format!("draft:{}", uuid::Uuid::new_v4()));
         next.explicit_selection = true;
         next.url = preferences.current().url.clone();
@@ -3477,6 +3481,7 @@ impl D4c {
         );
         self.servers
             .poll(&self.preferences.connections, &self.url, ui.ctx());
+        self.ssh.poll(ui.ctx());
         self.reconcile_history();
         self.desktops.poll_ui(ui.ctx());
         self.sync_workspace();
@@ -3745,6 +3750,7 @@ impl D4c {
                 .min_scrolled_height(0.0)
                 .id_salt("chats")
                 .show(ui, |ui| {
+                    matches += self.ssh.rows_ui(ui, &query);
                     let mut selected: Option<(usize, Option<String>)> = None;
                     let mut rename = None;
                     let mut delete = None;
@@ -3889,7 +3895,7 @@ impl D4c {
                         }
                     }
                     if matches == 0 && !query.is_empty() {
-                        ui.weak("No matching chats");
+                        ui.weak("No matching servers or chats");
                     }
                 });
             ui.add_space((ui.available_height() - 44.0).max(0.0));
