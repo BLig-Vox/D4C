@@ -359,22 +359,6 @@ impl Manager {
         d["lastError"] = Value::Null;
         let saved = (|| {
             let mut db = self.db.lock().map_err(|_| "Database unavailable")?;
-            if action == "start" && !crate::runtime::host_desktop(&id)
-                && db
-                    .list("desktop")?
-                    .iter()
-                    .filter(|other| {
-                        other["deleted"] != true
-                            && other["id"] != id
-                            && other["desired"] == "running"
-                            && other["status"] != "error"
-                            && !other["id"].as_str().is_some_and(crate::runtime::host_desktop)
-                    })
-                    .count()
-                    >= 2
-            {
-                return Err("Two desktops are already running. Stop one first.".into());
-            }
             db.put("desktop", &id, Some(rev), d)
         })();
         let saved = match saved {
@@ -511,6 +495,40 @@ fn input(p: &Value) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fifth_desktop_can_start() {
+        let mut db = Store::memory();
+        for number in 0..4 {
+            db.put(
+                "desktop",
+                &format!("running-{number}"),
+                Some(0),
+                json!({"status":"running","desired":"running"}),
+            )
+            .unwrap();
+        }
+        // This ID lets us test admission without launching a real container.
+        let id = "test-desktop";
+        let desktop = db
+            .put("desktop", id, Some(0), json!({"status":"stopped"}))
+            .unwrap();
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let manager = Manager {
+            db: Arc::new(Mutex::new(db)),
+            runtime: Arc::new(Runtime::new(root.clone()).unwrap()),
+            busy: Default::default(),
+        };
+        let result = manager.dispatch(
+            &Actor::Human("test-client".into()),
+            "desktop.start",
+            &json!({"id":id,"expectedRevision":desktop["rev"]}),
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        let desktop = result.unwrap();
+        assert_eq!(desktop["status"], "starting");
+        assert_eq!(desktop["desired"], "running");
+    }
+
     #[test]
     fn input_is_typed_and_nested_batches_are_rejected() {
         assert!(input(&json!({"type":"pointer","x":99999,"y":0,"buttons":0})).is_err());
