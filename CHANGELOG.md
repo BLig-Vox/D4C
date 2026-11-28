@@ -3,6 +3,9 @@
 ## 0.1.2
 
 - Connect to Lovetrain servers over SSH and sign in to Codex per server.
+- See Codex usage and context compaction below the composer.
+- Attach TODOs and notes to chats and access them through Codex tools.
+- Share an existing Linux X11 session without Podman or TigerVNC; the container-backed option remains available.
 - Keep chat tabs on desktop; use the sidebar on mobile and in narrow windows.
 - Restore each chat’s BotScreen layout when it reopens.
 - Ship Android arm64, Linux x86_64, and Windows x86_64 client packages. Linux x86_64 also supports installing the prebuilt client with cargo-binstall.

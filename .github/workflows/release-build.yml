@@ -13,11 +13,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup update stable
-      - run: sudo apt-get update && sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+      - run: sudo apt-get update && sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev xvfb
       - name: Test and package
         run: |
           export XDG_CONFIG_HOME="$(mktemp -d)"
           cargo +stable test --locked --bin vox-d4c
+          cargo +stable test --locked --manifest-path server/Cargo.toml --lib
+          cargo +stable test --locked --manifest-path server/Cargo.toml --test native_screen -- --ignored
           cargo +stable build --locked --release --bin vox-d4c
           cargo +stable build --locked --release --manifest-path server/Cargo.toml --target-dir target
           python3 scripts/package-release.py --binaries target/release --output dist --epoch "$(git log -1 --format=%ct)"

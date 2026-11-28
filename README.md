@@ -58,10 +58,10 @@ Use the full DNS name printed here in the client so the name matches the TLS cer
 
 Use an x86_64 Linux host with systemd, Python 3, Node.js and npm. For desktops, install rootless Podman with Quadlet, pasta, subordinate UID/GID support and a user D-Bus session. For scheduled jobs, install the Python packages providing `croniter` and `websocket` (websocket-client). The packaged units were exercised with systemd 262 and Codex CLI 0.169.0.
 
-Download the **server** archive and `SHA256SUMS` from the same release into one directory. Run the remaining setup commands from inside the extracted archive. [D4C alpha.14 downloads](https://github.com/BLig-Vox/D4C/releases/tag/v0.1.0-alpha.14)
+Download the **server** archive and `SHA256SUMS` from the same release into one directory. Run the remaining setup commands from inside the extracted archive. [D4C 0.1.2 downloads](https://github.com/BLig-Vox/D4C/releases/tag/v0.1.2)
 
 ```sh
-archive=d4c-server-0.1.0-alpha.14-linux-x86_64.tar.gz
+archive=d4c-server-0.1.2-linux-x86_64.tar.gz
 awk -v f="$archive" '$2 == f' SHA256SUMS | sha256sum -c - &&
   tar -xzf "$archive" && cd "${archive%.tar.gz}"
 ```
@@ -176,7 +176,7 @@ For this **alpha.8 → alpha.14 media fix**, use the verified server archive fro
 )
 ```
 
-The last command checks the **running process**. For this release it should print `d4c-server 0.1.0-alpha.14`. If the manager fails to start, inspect `sudo journalctl -u d4c-manager -n 50`. To roll back, copy the printed backup to a sibling staging file, replace the binary with `mv`, and restart `d4c-manager`.
+The last command checks the **running process**. For this release it should print `d4c-server 0.1.2`. If the manager fails to start, inspect `sudo journalctl -u d4c-manager -n 50`. To roll back, copy the printed backup to a sibling staging file, replace the binary with `mv`, and restart `d4c-manager`.
 
 **Verify from a fresh test chat** on the host you upgraded.
 
@@ -227,13 +227,13 @@ For OAuth-based tools, run `codex mcp login NAME` under the same account and env
 
 ## Prebuilt Linux install
 
-Download `d4c-0.1.0-alpha.14-linux-x86_64.tar.gz` and `SHA256SUMS` from
-[Releases](https://github.com/Blig-Vox/D4C/releases/tag/v0.1.0-alpha.14), then:
+Download `d4c-0.1.2-linux-x86_64.tar.gz` and `SHA256SUMS` from
+[Releases](https://github.com/Blig-Vox/D4C/releases/tag/v0.1.2), then:
 
 ```sh
 sha256sum --ignore-missing -c SHA256SUMS
-tar -xzf d4c-0.1.0-alpha.14-linux-x86_64.tar.gz
-cd d4c-0.1.0-alpha.14-linux-x86_64
+tar -xzf d4c-0.1.2-linux-x86_64.tar.gz
+cd d4c-0.1.2-linux-x86_64
 python3 scripts/install-desktop.py bin/vox-d4c
 ~/.local/bin/vox-d4c
 ```
