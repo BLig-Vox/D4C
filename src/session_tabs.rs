@@ -5,6 +5,17 @@ use serde::{Deserialize, Serialize};
 
 const LAYOUT_FILE: &str = "session-tabs.json";
 const ACCENT: Color32 = Color32::from_rgb(132, 203, 189);
+const NUMBER_KEYS: [egui::Key; 9] = [
+    egui::Key::Num1,
+    egui::Key::Num2,
+    egui::Key::Num3,
+    egui::Key::Num4,
+    egui::Key::Num5,
+    egui::Key::Num6,
+    egui::Key::Num7,
+    egui::Key::Num8,
+    egui::Key::Num9,
+];
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct TabId {
@@ -100,6 +111,36 @@ impl Tabs {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    pub fn consume_number_shortcut(&self, input: &mut egui::InputState) -> Option<TabId> {
+        let mut selected = None;
+        let mut suppress_next_text = false;
+        input.events.retain(|event| {
+            // egui-winit can emit a Text event immediately after an Alt keypress.
+            if std::mem::take(&mut suppress_next_text) && matches!(event, egui::Event::Text(_)) {
+                return false;
+            }
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                repeat,
+                modifiers: egui::Modifiers::ALT,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            let Some(index) = NUMBER_KEYS.iter().position(|number| number == key) else {
+                return true;
+            };
+            suppress_next_text = true;
+            if !repeat && let Some(tab) = self.entries.get(index) {
+                selected = Some(tab.id.clone());
+            }
+            false
+        });
+        selected
     }
 
     #[cfg(test)]
@@ -292,10 +333,14 @@ impl Tabs {
                         } else if body.clicked() {
                             action = Some(Action::Select(tab.id.clone()));
                         }
-                        body.on_hover_text(match server {
+                        let mut tooltip = match server {
                             Some(server) => format!("{} · {server}", tab.title),
                             None => tab.title.clone(),
-                        });
+                        };
+                        if index < NUMBER_KEYS.len() {
+                            tooltip.push_str(&format!(" (Alt+{})", index + 1));
+                        }
+                        body.on_hover_text(tooltip);
                         close.on_hover_text("Close tab");
                     }
                 });
@@ -337,6 +382,51 @@ impl Tabs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alt_number_uses_tab_order_and_ignores_repeats_and_extra_modifiers() {
+        let mut tabs = Tabs::default();
+        let first = TabId::new("server-a", "first");
+        let second = TabId::new("server-b", "second");
+        tabs.open(first.clone());
+        tabs.open(second.clone());
+        let keypress = |key, modifiers, repeat| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers,
+        };
+        let mut input = egui::InputState::default();
+        input.events = vec![
+            keypress(
+                egui::Key::Num1,
+                egui::Modifiers::ALT | egui::Modifiers::CTRL,
+                false,
+            ),
+            keypress(egui::Key::Num9, egui::Modifiers::ALT, false),
+            egui::Event::Text("9".into()),
+            keypress(egui::Key::Num2, egui::Modifiers::ALT, true),
+            egui::Event::Text("2".into()),
+            egui::Event::Text("ordinary typing".into()),
+        ];
+        assert_eq!(tabs.consume_number_shortcut(&mut input), None);
+        assert_eq!(input.events.len(), 2);
+        assert_eq!(input.events[1], egui::Event::Text("ordinary typing".into()));
+
+        for expected in [&second, &first] {
+            input
+                .events
+                .push(keypress(egui::Key::Num2, egui::Modifiers::ALT, false));
+            input.events.push(egui::Event::Text("2".into()));
+            assert_eq!(
+                tabs.consume_number_shortcut(&mut input).as_ref(),
+                Some(expected)
+            );
+            assert_eq!(input.events.len(), 2);
+            tabs.move_to_gap(0, 2);
+        }
+    }
 
     #[test]
     fn saved_layout_restores_order_and_active_chat_across_servers() {

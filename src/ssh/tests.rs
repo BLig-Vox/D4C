@@ -17,6 +17,59 @@ fn managed_public_key_matches_the_saved_identity_and_is_reused() {
     }
 }
 
+#[test]
+fn codex_usage_follows_the_active_server_and_only_groups_known_shared_accounts() {
+    fn server(port: u16, email: &str, workspace: Option<&str>) -> Connection {
+        Connection {
+            endpoint: Endpoint {
+                host: "localhost".into(),
+                port,
+                user: "tester".into(),
+            },
+            events: mpsc::channel().1,
+            _stop: oneshot::channel().0,
+            status: "Connected".into(),
+            codex: codex::Status {
+                account: Some(email.into()),
+                quota_scope: workspace.map(|workspace| (email.into(), workspace.into())),
+                chatgpt: true,
+                ..Default::default()
+            },
+            redirect_input: String::new(),
+            chat: None,
+            commands: tokio::sync::mpsc::unbounded_channel().0,
+        }
+    }
+
+    let servers = Servers {
+        servers: vec![
+            server(2201, "a@example.com", Some("personal")),
+            server(2202, "a@example.com", Some("personal")),
+            server(2203, "b@example.com", Some("personal")),
+            server(2204, "a@example.com", Some("team")),
+            server(2205, "a@example.com", None),
+            server(2206, "a@example.com", None),
+        ],
+        ..Default::default()
+    };
+
+    for (port, email, shared) in [
+        (2201, "a@example.com", 2),
+        (2203, "b@example.com", 1),
+        (2204, "a@example.com", 1),
+        (2205, "a@example.com", 0),
+        (2206, "a@example.com", 0),
+        (2202, "a@example.com", 2),
+    ] {
+        let active = servers
+            .codex_quota_server(&format!("ssh://tester@localhost:{port}"))
+            .unwrap();
+        assert_eq!(active.codex.account.as_deref(), Some(email));
+        assert_eq!(servers.shared_count(active), shared);
+    }
+    assert!(servers.codex_quota_server("http://localhost").is_none());
+}
+
 struct TestServer;
 
 impl server::Handler for TestServer {
@@ -51,10 +104,17 @@ fn verifies_host_before_authenticating() {
                 auth_rejection_time: Duration::ZERO,
                 ..Default::default()
             });
-            for (trust, password, expected) in [
-                (false, "test-password", "Host key not accepted."),
-                (true, "wrong", "SSH authentication was rejected."),
-                (true, "test-password", ""),
+            for (trust, pin, password, expected) in [
+                (Some(false), None, "test-password", "Host key not accepted."),
+                (Some(true), None, "wrong", "SSH authentication was rejected."),
+                (Some(true), None, "test-password", ""),
+                (None, Some(fingerprint.clone()), "test-password", ""),
+                (
+                    None,
+                    Some("SHA256:different".into()),
+                    "test-password",
+                    "Saved SSH host key does not match. Verify the server before trusting a new key.",
+                ),
             ] {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let endpoint = Endpoint {
@@ -77,10 +137,12 @@ fn verifies_host_before_authenticating() {
                         tx,
                         ctx: egui::Context::default(),
                     },
+                    pin,
                 ));
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        if let Ok(Event::Verify {
+                    if let Some(trust) = trust {
+                        loop {
+                            if let Ok(Event::Verify {
                             fingerprint: actual,
                             reply,
                         }) = rx.try_recv()
@@ -88,12 +150,14 @@ fn verifies_host_before_authenticating() {
                             assert_eq!(actual, fingerprint);
                             assert!(!task.is_finished());
                             reply.send(trust).unwrap();
-                            break;
+                                break;
+                            }
+                            assert!(!task.is_finished(), "connection ended before verification");
+                            tokio::time::sleep(Duration::from_millis(5)).await;
                         }
-                        assert!(!task.is_finished(), "connection ended before verification");
-                        tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                     let result = task.await.unwrap();
+                    assert!(rx.try_recv().is_err(), "unexpected fingerprint prompt");
                     if expected.is_empty() {
                         assert!(!result.unwrap_or_else(|error| panic!("{error}")).is_closed());
                     } else {
@@ -212,7 +276,14 @@ impl server::Handler for CodexServer {
                 "initialize" => json!({}),
                 "initialized" => continue,
                 "account/read" => {
-                    json!({"account":self.signed_in.then(|| json!({"type":"chatgpt","email":"fixture@example.test"})),"requiresOpenaiAuth":true})
+                    json!({"account":self.signed_in.then(|| json!({"type":"chatgpt","email":"fixture@example.test","planType":"plus"})),"requiresOpenaiAuth":true})
+                }
+                "account/rateLimits/read" => {
+                    assert!(self.signed_in);
+                    json!({"rateLimitsByLimitId":{"codex":{"limitId":"codex",
+                        "primary":{"usedPercent":28,"windowDurationMins":300,"resetsAt":4102444800u64},
+                        "secondary":{"usedPercent":40,"windowDurationMins":10080,"resetsAt":4102444800u64}
+                    }}})
                 }
                 "account/login/start" if self.device => {
                     assert_eq!(params["type"], "chatgptDeviceCode");
@@ -249,6 +320,15 @@ impl server::Handler for CodexServer {
                             "method":"item/agentMessage/delta","params":{
                                 "threadId":params["threadId"],"turnId":"fixture-turn","itemId":"reply","delta":"fixture response"
                             }
+                        }),
+                    )?;
+                    Self::send(
+                        session,
+                        channel,
+                        json!({
+                            "method":"account/rateLimits/updated","params":{"rateLimits":{
+                                "limitId":"codex","primary":{"usedPercent":35,"windowDurationMins":300,"resetsAt":4102444800u64}
+                            }}
                         }),
                     )?;
                     continue;
@@ -311,7 +391,7 @@ fn verify_codex_sign_in_and_chat(device: bool, paste_redirect: bool) {
                 let (commands, mut incoming) = tokio::sync::mpsc::unbounded_channel();
                 let task = tokio::spawn(async move {
                     let ctx = egui::Context::default();
-                    let connection = connect(endpoint, Credential::Password("test-password".into()), Reporter { tx: tx.clone(), ctx: ctx.clone() }).await.unwrap();
+                    let connection = connect(endpoint, Credential::Password("test-password".into()), Reporter { tx: tx.clone(), ctx: ctx.clone() }, None).await.unwrap();
                     codex::serve(&connection, &mut incoming, &Reporter { tx, ctx }).await.unwrap();
                 });
                 let Event::Verify { reply, .. } = recv(&rx).await else { panic!("expected SSH fingerprint") };
@@ -357,7 +437,12 @@ fn verify_codex_sign_in_and_chat(device: bool, paste_redirect: bool) {
                             }
                             if let Some(account) = status.account {
                                 assert_eq!(account, "fixture@example.test");
-                                break;
+                                if let Some(quota) = status.quota {
+                                    assert!(status.quota_live);
+                                    assert_eq!(quota.buckets["codex"].primary.as_ref().unwrap().remaining(), 72);
+                                    assert_eq!(quota.buckets["codex"].secondary.as_ref().unwrap().remaining(), 60);
+                                    break;
+                                }
                             }
                         }
                         _ => {}
@@ -379,9 +464,43 @@ fn verify_codex_sign_in_and_chat(device: bool, paste_redirect: bool) {
                         _ => {}
                     }
                 }
+                loop {
+                    if let Event::Codex(status) = recv(&rx).await
+                        && let Some(quota) = status.quota
+                    {
+                        assert!(status.quota_live);
+                        assert_eq!(quota.buckets["codex"].primary.as_ref().unwrap().remaining(), 65);
+                        assert_eq!(quota.buckets["codex"].secondary.as_ref().unwrap().remaining(), 60);
+                        break;
+                    }
+                }
                 drop(commands);
                 task.await.unwrap();
                 server.abort();
             }).await.unwrap();
     });
+}
+
+#[test]
+fn remembered_ssh_server_restores_the_selected_chat() {
+    let endpoint = Endpoint {
+        host: "127.0.0.1".into(),
+        port: 3221,
+        user: "tester".into(),
+    };
+    let mut ssh = Servers::default();
+    ssh.remember(endpoint.clone(), "SHA256:trusted".into()).unwrap();
+
+    let tab = crate::session_tabs::TabId::new(&endpoint.chat_id(), "chat-before-restart");
+    let mut tabs = crate::session_tabs::Tabs::default();
+    tabs.open(tab.clone());
+    tabs.save(&tab).unwrap();
+
+    let restored = crate::D4c::load(true);
+    assert_eq!(restored.url, endpoint.chat_id());
+    assert_eq!(restored.session, "chat-before-restart");
+    assert!(restored.ssh.remembers(&endpoint.chat_id()));
+
+    ssh.forget(&endpoint).unwrap();
+    assert!(!crate::D4c::load(true).ssh.remembers(&endpoint.chat_id()));
 }

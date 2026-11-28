@@ -388,7 +388,10 @@ impl Runtime {
         let mut gate = gate.lock().map_err(|_| "VNC connection gate unavailable")?;
         gate.connect(|| {
             if host_desktop(id) {
-                return rfb::Session::connect_local(&self.root.join("host-screen.sock"))
+                let socket = std::env::var_os("D4C_HOST_SCREEN_SOCKET")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| self.root.join("host-screen.sock"));
+                return rfb::Session::connect_local(&socket)
                     .map_err(|e| format!("Host screen: {e}"));
             }
             rfb::Session::connect(self.port(id)?).map_err(|e| {

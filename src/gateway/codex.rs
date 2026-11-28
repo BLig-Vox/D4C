@@ -1,8 +1,20 @@
 //! Translation between D4C's UI events and the Codex app-server protocol.
+use crate::organizer_tools;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use uuid::Uuid;
+
+#[derive(Debug)]
+pub(crate) struct OrganizerCall {
+    pub token: Uuid,
+    pub thread: String,
+    pub operation: Uuid,
+    pub args: Value,
+}
 
 pub(crate) enum Output {
+    Organizer(OrganizerCall),
     Wire(Value),
     Ui(Value),
 }
@@ -19,6 +31,7 @@ pub(crate) struct Adapter {
     cwd: HashMap<String, String>,
     skills: HashMap<String, HashMap<String, String>>,
     questions: HashMap<String, (Value, String, Value)>,
+    pending_organizer: HashMap<Uuid, Value>,
     serial: u64,
 }
 
@@ -88,6 +101,7 @@ impl Adapter {
             options["excludeTurns"] = json!(true);
             self.call("thread/resume", options, context);
         } else {
+            options["dynamicTools"] = json!([organizer_tools::namespace_spec()]);
             self.call("thread/start", options, context);
         }
     }
@@ -105,6 +119,15 @@ impl Adapter {
         let p = &req["params"];
         let method = string(&req["method"]);
         match method {
+            "organizer.result" => {
+                if let Some(token) = p["token"]
+                    .as_str()
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                    && let Some(id) = self.pending_organizer.remove(&token)
+                {
+                    self.organizer_reply(id, p["success"] == true, string(&p["text"]));
+                }
+            }
             "sessions.list" => {
                 let params = json!({"limit":100,"modelProviders":[],"sourceKinds":["cli","vscode","exec","appServer","unknown"],"sortKey":"updated_at","cursor":req["cursor"]});
                 self.call("thread/list", params, req);
@@ -430,6 +453,14 @@ impl Adapter {
                 self.event("sessions.changed",json!({"sessionKey":k,"reason":"delete"}));
             }
             "skills/changed"=>self.event("skills.changed",json!({})),
+            "thread/tokenUsage/updated" => {
+                let usage = &p["tokenUsage"];
+                self.event("session.context", json!({
+                    "sessionKey":k,
+                    "usedTokens":usage["last"]["totalTokens"],
+                    "contextWindow":usage["modelContextWindow"],
+                }));
+            }
             "turn/started"=>{
                 self.active.insert(k.into(),string(&turn["id"]).into());
                 self.event("chat",json!({"sessionKey":k,"state":"delta","runId":turn["id"]}));
@@ -448,6 +479,12 @@ impl Adapter {
             }
             "item/started"|"item/completed"=>{
                 let done=method=="item/completed";
+                if item["type"] == "contextCompaction" {
+                    self.event("session.context", json!({
+                        "sessionKey":k,
+                        "compaction":if done { "complete" } else { "running" },
+                    }));
+                }
                 match string(&item["type"]){
                     kind @ ("userMessage" | "contextCompaction") if done || kind == "userMessage" => {
                         if let Some(message)=transcript(item){
@@ -481,10 +518,52 @@ impl Adapter {
         }
     }
 
+    fn organizer_reply(&mut self, id: Value, success: bool, text: &str) {
+        self.wire(json!({
+            "id": id,
+            "result": {"success": success, "contentItems": [{"type":"inputText", "text":text}]}
+        }));
+    }
+
+    fn organizer_call(&mut self, id: Value, p: &Value) {
+        let thread = string(&p["threadId"]);
+        let turn = string(&p["turnId"]);
+        let call = string(&p["callId"]);
+        if p["tool"] != organizer_tools::MANAGE
+            || !self.loaded.contains(thread)
+            || turn.is_empty()
+            || self.active.get(thread).map(String::as_str) != Some(turn)
+            || call.is_empty()
+        {
+            self.organizer_reply(
+                id,
+                false,
+                "Organizer calls require a live turn on this D4C connection.",
+            );
+            return;
+        }
+
+        // A retried tool call must not create a second note or checklist row.
+        let digest = Sha256::digest(json!([thread, turn, call]).to_string().as_bytes());
+        let operation = Uuid::from_slice(&digest[..16]).expect("SHA-256 prefix is 16 bytes");
+        let token = Uuid::new_v4();
+        self.pending_organizer.insert(token, id);
+        self.output.push(Output::Organizer(OrganizerCall {
+            token,
+            thread: thread.to_owned(),
+            operation,
+            args: p["arguments"].clone(),
+        }));
+    }
+
     fn server_request(&mut self, v: Value) {
         let method = string(&v["method"]);
         let p = &v["params"];
         let qs = match method {
+            "item/tool/call" if p["namespace"] == organizer_tools::NAMESPACE => {
+                self.organizer_call(v["id"].clone(), p);
+                return;
+            }
             "item/tool/requestUserInput" => rows(&p["questions"])
                 .iter()
                 .map(|q| {
@@ -843,8 +922,71 @@ mod tests {
             .into_iter()
             .map(|o| match o {
                 Output::Ui(v) | Output::Wire(v) => v,
+                Output::Organizer(_) => panic!("Unexpected organizer call"),
             })
             .collect()
+    }
+
+    #[test]
+    fn organizer_calls_follow_the_originating_turn_and_correlate_replies() {
+        let mut adapter = Adapter::default();
+        adapter.command(super::super::rpc(
+            "chat.send",
+            json!({"sessionKey":"draft:one","message":"List my notes"}),
+        ));
+        let start = frames(&mut adapter).pop().unwrap();
+        assert_eq!(
+            start["params"]["dynamicTools"][0]["name"],
+            organizer_tools::NAMESPACE
+        );
+        adapter.incoming(json!({"id":start["id"],"result":{"thread":{"id":THREAD}}}));
+        frames(&mut adapter);
+
+        let mut request = json!({
+            "id": 17, "method":"item/tool/call", "params":{
+                "namespace":organizer_tools::NAMESPACE, "tool":organizer_tools::MANAGE,
+                "threadId":THREAD, "turnId":"turn-1", "callId":"call-1",
+                "arguments":{"action":"list","threadId":"ignored"}
+            }
+        });
+        adapter.incoming(request.clone());
+        let rejected = frames(&mut adapter).pop().unwrap();
+        assert_eq!(rejected["id"], 17);
+        assert_eq!(rejected["result"]["success"], false);
+        adapter.incoming(
+            json!({"method":"turn/started","params":{"threadId":THREAD,"turn":{"id":"turn-1"}}}),
+        );
+        frames(&mut adapter);
+
+        adapter.incoming(request.clone());
+        let Some(Output::Organizer(first)) = adapter.output.pop() else {
+            panic!("Expected a typed organizer request");
+        };
+        assert_eq!(first.thread, THREAD);
+        assert_eq!(first.args["action"], "list");
+        request["id"] = json!("retry");
+        adapter.incoming(request);
+        let Some(Output::Organizer(retry)) = adapter.output.pop() else {
+            panic!("Expected a typed organizer retry");
+        };
+        assert_eq!(first.operation, retry.operation);
+        assert_ne!(first.token, retry.token);
+
+        let reply = super::super::rpc(
+            "organizer.result",
+            json!({
+                "token":first.token,"success":true,"text":r#"{"items":[]}"#
+            }),
+        );
+        adapter.command(reply.clone());
+        adapter.command(reply);
+        let result = frames(&mut adapter);
+        assert_eq!(
+            result,
+            vec![json!({"id":17,"result":{
+                "success":true, "contentItems":[{"type":"inputText","text":r#"{"items":[]}"#}]
+            }})]
+        );
     }
 
     #[test]
@@ -868,13 +1010,37 @@ mod tests {
         let item = json!({"type":"contextCompaction","id":"compact-1"});
         let params = json!({"threadId":THREAD,"turnId":"compact-turn","item":item});
         adapter.notify("item/started", &params);
-        assert!(frames(&mut adapter).is_empty());
+        let started = frames(&mut adapter);
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0]["event"], "session.context");
+        assert_eq!(started[0]["payload"]["sessionKey"], THREAD);
+        assert_eq!(started[0]["payload"]["compaction"], "running");
         adapter.notify("item/completed", &params);
-        let event = frames(&mut adapter).pop().unwrap();
+        let events = frames(&mut adapter);
+        assert_eq!(events[0]["payload"]["compaction"], "complete");
+        let event = &events[1];
         assert_eq!(event["event"], "session.message");
         assert_eq!(event["payload"]["messageId"], "compact-1");
         assert_eq!(event["payload"]["message"], transcript(&item).unwrap());
         assert_eq!(event["payload"]["message"]["content"], "Context compacted");
+    }
+
+    #[test]
+    fn context_usage_reports_latest_request_not_lifetime_usage() {
+        let mut adapter = Adapter::default();
+        adapter.notify("thread/tokenUsage/updated", &json!({
+            "threadId":THREAD,"turnId":"turn",
+            "tokenUsage":{"last":{"totalTokens":24000},"total":{"totalTokens":400000},"modelContextWindow":100000}
+        }));
+        let events = frames(&mut adapter);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "session.context");
+        assert_eq!(
+            events[0]["payload"],
+            json!({
+                "sessionKey":THREAD,"usedTokens":24000,"contextWindow":100000
+            })
+        );
     }
 
     #[test]

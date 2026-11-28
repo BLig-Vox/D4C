@@ -5,7 +5,12 @@ use crate::gateway::{
 };
 use russh::{Channel, ChannelMsg, client};
 use serde_json::{Value, json};
-use std::{future::pending, sync::mpsc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    future::pending,
+    sync::mpsc,
+    time::{Duration, SystemTime},
+};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
@@ -22,9 +27,93 @@ pub(super) enum Command {
     SubmitRedirect(String),
 }
 
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct LimitWindow {
+    pub used_percent: i64,
+    pub window_duration_mins: Option<u64>,
+    pub resets_at: Option<u64>,
+}
+
+impl LimitWindow {
+    pub fn remaining(&self) -> i64 {
+        100 - self.used_percent.clamp(0, 100)
+    }
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct LimitBucket {
+    pub limit_name: Option<String>,
+    pub primary: Option<LimitWindow>,
+    pub secondary: Option<LimitWindow>,
+}
+
+impl LimitBucket {
+    pub fn windows(&self) -> impl Iterator<Item = (usize, &LimitWindow)> {
+        [self.primary.as_ref(), self.secondary.as_ref()]
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, window)| Some((index, window?)))
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct Quota {
+    pub buckets: BTreeMap<String, LimitBucket>,
+    pub checked: SystemTime,
+}
+
+impl Quota {
+    fn parse(value: &Value, previous: Option<&Self>) -> Option<Self> {
+        let mut buckets = previous.map_or_else(BTreeMap::new, |quota| quota.buckets.clone());
+        let mut insert = |id: &str, value: &Value| {
+            let Ok(mut bucket) = serde_json::from_value::<LimitBucket>(value.clone()) else {
+                return false;
+            };
+            if let Some(old) = buckets.get(id) {
+                if value.get("primary").is_none() {
+                    bucket.primary = old.primary.clone();
+                }
+                if value.get("secondary").is_none() {
+                    bucket.secondary = old.secondary.clone();
+                }
+                if value.get("limitName").is_none() {
+                    bucket.limit_name = old.limit_name.clone();
+                }
+            }
+            if bucket.windows().next().is_none() {
+                buckets.remove(id);
+            } else {
+                buckets.insert(id.to_owned(), bucket);
+            }
+            true
+        };
+        let mut seen = false;
+        if let Some(by_id) = value["rateLimitsByLimitId"]
+            .as_object()
+            .filter(|map| !map.is_empty())
+        {
+            for (id, bucket) in by_id {
+                seen |= insert(id, bucket);
+            }
+        } else if let Some(bucket) = value.get("rateLimits") {
+            seen = insert(bucket["limitId"].as_str().unwrap_or("codex"), bucket);
+        }
+        (seen && !buckets.is_empty()).then(|| Self {
+            buckets,
+            checked: SystemTime::now(),
+        })
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Status {
     pub account: Option<String>,
+    pub quota_scope: Option<(String, String)>,
+    pub chatgpt: bool,
+    pub quota: Option<Quota>,
+    pub quota_live: bool,
     pub unavailable: bool,
     pub busy: bool,
     pub can_cancel: bool,
@@ -58,6 +147,12 @@ impl Status {
 #[derive(Default)]
 struct Auth {
     account: Option<String>,
+    quota_scope: Option<(String, String)>,
+    chatgpt: bool,
+    quota: Option<Quota>,
+    quota_live: bool,
+    quota_request: u64,
+    next_quota_read: Option<Instant>,
     operation: Option<&'static str>,
     deadline: Option<Instant>,
     login_id: Option<String>,
@@ -70,6 +165,10 @@ impl Auth {
     fn publish(&self, report: &Reporter) {
         report.send(Event::Codex(Status {
             account: self.account.clone(),
+            quota_scope: self.quota_scope.clone(),
+            chatgpt: self.chatgpt,
+            quota: self.quota.clone(),
+            quota_live: self.quota_live,
             busy: self.operation.is_some() || self.login_id.is_some(),
             can_cancel: self.login_id.is_some(),
             browser_callback: self.callback.is_some(),
@@ -94,6 +193,26 @@ impl Auth {
     async fn read_account(&mut self, channel: &Channel<client::Msg>) -> Result<(), String> {
         self.request(channel, "auth-account", "account/read", json!({}))
             .await
+    }
+
+    async fn read_quota(&mut self, channel: &Channel<client::Msg>) -> Result<(), String> {
+        self.quota_request += 1;
+        self.next_quota_read = Some(Instant::now() + Duration::from_secs(60));
+        send(
+            channel,
+            json!({
+                "id": format!("quota-{}", self.quota_request),
+                "method": "account/rateLimits/read",
+            }),
+        )
+        .await
+    }
+
+    fn update_quota(&mut self, quota: Option<Quota>) {
+        self.quota_live = quota.is_some();
+        if quota.is_some() {
+            self.quota = quota;
+        }
     }
 
     async fn cancel(&mut self, channel: &Channel<client::Msg>) -> Result<(), String> {
@@ -436,6 +555,16 @@ async fn exchange(
                     auth.cancel(channel).await?;
                     auth.publish(report);
                 }
+                if auth.operation.is_none() && auth.login_id.is_none()
+                    && auth.next_quota_read.is_some_and(|next| Instant::now() >= next)
+                {
+                    if auth.quota_live && auth.quota.as_ref().is_some_and(|quota|
+                        quota.checked.elapsed().unwrap_or_default() > Duration::from_secs(90)) {
+                        auth.quota_live = false;
+                        auth.publish(report);
+                    }
+                    auth.read_quota(channel).await?;
+                }
                 if auth.account.is_some() {
                     for request in requests.try_iter().take(32) {
                         adapter.command(request);
@@ -447,6 +576,7 @@ async fn exchange(
             match output {
                 Output::Wire(value) => send(channel, value).await?,
                 Output::Ui(value) => emit(gateway::Event::Data(value)),
+                Output::Organizer(call) => emit(gateway::Event::Organizer(call)),
             }
         }
     }
@@ -481,6 +611,32 @@ async fn handle_auth(
                         })
                         .to_owned()
                 });
+                auth.chatgpt = account["type"] == "chatgpt";
+                // The same email can belong to several organization workspaces.
+                // Only group an explicitly identified workspace or a personal plan.
+                let scope = account["workspaceId"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .or_else(|| match account["planType"].as_str() {
+                        Some("free" | "go" | "plus" | "pro") => Some("personal"),
+                        _ => None,
+                    });
+                auth.quota_scope = auth
+                    .chatgpt
+                    .then(|| {
+                        Some((
+                            account["email"].as_str()?.to_ascii_lowercase(),
+                            scope?.to_owned(),
+                        ))
+                    })
+                    .flatten();
+                auth.quota = None;
+                auth.quota_live = false;
+                auth.next_quota_read = None;
+                auth.quota_request += 1;
+                if auth.chatgpt {
+                    auth.read_quota(channel).await?;
+                }
                 match (&previous, &auth.account) {
                     (None, Some(_)) => emit(gateway::Event::Status("Connected".into())),
                     (Some(_), None) => emit(gateway::Event::Error(
@@ -533,6 +689,25 @@ async fn handle_auth(
                 }
             }
             _ => {}
+        }
+    } else if let Some(request) = id.strip_prefix("quota-") {
+        if auth.chatgpt
+            && auth.operation.is_none()
+            && auth.login_id.is_none()
+            && request.parse::<u64>().ok() == Some(auth.quota_request)
+        {
+            auth.update_quota(Quota::parse(result, None));
+        }
+    } else if value["method"] == "account/rateLimits/updated" {
+        if auth.chatgpt
+            && auth.operation.is_none()
+            && auth.login_id.is_none()
+            && let Some(quota) = Quota::parse(params, auth.quota.as_ref())
+        {
+            auth.update_quota(Some(quota));
+            // Don't replace this push with an older in-flight snapshot.
+            auth.quota_request += 1;
+            auth.next_quota_read = Some(Instant::now() + Duration::from_secs(60));
         }
     } else if value["method"] == "account/login/completed" {
         if auth

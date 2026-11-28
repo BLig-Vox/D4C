@@ -144,7 +144,9 @@ impl D4c {
                 ui.set_max_width(ui.available_width().min(1120.0));
                 ui.spacing_mut().item_spacing.y = 10.0;
                 if ssh_tab {
-                    settings_card(ui, "SSH connections", |ui| open_ssh = self.ssh.settings_ui(ui));
+                    settings_card(ui, "SSH servers", |ui| {
+                        open_ssh = self.ssh.settings_ui(ui);
+                    });
                     return;
                 }
                 if ui.available_width() >= 780.0 {
@@ -222,7 +224,8 @@ impl D4c {
                         }
                     });
                     ui.add(
-                        egui::Label::new(egui::RichText::new(&connection.url).small().weak()).wrap(),
+                        egui::Label::new(egui::RichText::new(&connection.url).small().weak())
+                            .wrap(),
                     );
                 });
                 ui.separator();
