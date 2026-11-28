@@ -3570,6 +3570,10 @@ impl D4c {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_secs(1));
         let compact = ui.ctx().content_rect().width() < 640.0;
+        let mobile = matches!(
+            ui.ctx().os(),
+            egui::os::OperatingSystem::Android | egui::os::OperatingSystem::IOS
+        );
         if compact != self.compact_previous {
             self.sidebar_open = self.preferences.sidebar_open(compact);
         }
@@ -3634,7 +3638,7 @@ impl D4c {
                         }
                     }
                     let title_width = (ui.available_width() - 112.0).max(24.0);
-                    if self.tabs.is_empty() {
+                    if compact || mobile || self.tabs.is_empty() {
                         let (title_rect, title_response) = ui.allocate_exact_size(
                             egui::vec2(title_width, 36.0),
                             egui::Sense::hover(),
@@ -3694,9 +3698,6 @@ impl D4c {
                             match action {
                                 session_tabs::Action::Select(id) => {
                                     self.select_tab(&id, ui.ctx());
-                                    if compact {
-                                        self.sidebar_open = false;
-                                    }
                                 }
                                 session_tabs::Action::Close(id) => self.close_tab(&id, ui.ctx()),
                             }
@@ -5213,6 +5214,12 @@ mod composer_tests {
         app.session = "chat".into();
         app.preferences.connections.clear();
         app.settings_open = false;
+        app.sessions = vec![
+            ("chat".into(), "Active chat".into()),
+            ("other".into(), "Other tab".into()),
+        ];
+        app.tabs.open(app.active_tab());
+        app.tabs.open(session_tabs::TabId::new(&app.url, "other"));
         for (role, id, body) in [
             ("assistant", "message:0", r#"Podman runs the desktop and publishes its local VNC port. **D4C connects to that port** to show the screen and send input. For direct shell access, use `podman exec -it d4c-00000000-0000-0000-0000-000000000000 bash`."#.into()),
             ("user", "message:1", "I mean which is its default".into()),
@@ -5238,14 +5245,16 @@ mod composer_tests {
             "Why not",
             "The last reply should fit",
         ];
-        for (width, density, sidebar_open, chat_visible) in [
-            (360.0, 3.0, false, true),
-            (320.0, 2.75, false, true),
-            (768.0, 1.0, true, true),
-            (320.0, 3.0, true, false),
+        use egui::os::OperatingSystem::{Android, Nix};
+        for (width, density, os, sidebar_open, chat_visible, tabs_visible) in [
+            (360.0, 3.0, Android, false, true, false),
+            (320.0, 2.75, Nix, false, true, false),
+            (768.0, 1.0, Nix, true, true, true),
+            (768.0, 2.75, Android, false, true, false),
+            (320.0, 3.0, Android, true, false, false),
         ] {
             let ctx = egui::Context::default();
-            ctx.set_os(egui::os::OperatingSystem::Android);
+            ctx.set_os(os);
             shadcn_egui::Theme::vega().apply_with_fonts(&ctx, fonts.clone());
             app.compact_previous = width < 640.0;
             app.sidebar_open = sidebar_open;
@@ -5269,12 +5278,17 @@ mod composer_tests {
             output.textures_delta.clear();
             let mut visible = std::collections::HashSet::new();
             let mut bubbles = 0;
-            for egui::epaint::ClippedShape { clip_rect, shape, .. } in output.shapes {
+            let mut header_labels = Vec::new();
+            for egui::epaint::ClippedShape {
+                clip_rect, shape, ..
+            } in output.shapes
+            {
                 if let egui::Shape::Rect(rect) = &shape
                     && [
                         egui::Color32::from_rgb(28, 66, 61),
                         egui::Color32::from_rgb(33, 35, 41),
-                    ].contains(&rect.fill)
+                    ]
+                    .contains(&rect.fill)
                 {
                     bubbles += 1;
                     assert!(
@@ -5283,8 +5297,13 @@ mod composer_tests {
                         rect.rect,
                     );
                 }
-                let egui::Shape::Text(text) = shape else { continue };
+                let egui::Shape::Text(text) = shape else {
+                    continue;
+                };
                 let content = &text.galley.job.text;
+                if text.pos.y < 36.0 {
+                    header_labels.push(content.clone());
+                }
                 for label in expected.iter().filter(|label| content.contains(**label)) {
                     visible.insert(*label);
                     let left = text.pos.x;
@@ -5301,6 +5320,12 @@ mod composer_tests {
                 "{width} pt at {density}x: rendered {visible:?}",
             );
             assert_eq!(bubbles, if chat_visible { 6 } else { 0 });
+            assert!(header_labels.iter().any(|label| label == "Active chat"));
+            assert_eq!(
+                header_labels.iter().any(|label| label == "Other tab"),
+                tabs_visible,
+                "unexpected tab visibility at {width} pt on {os:?}: {header_labels:?}",
+            );
         }
     }
 
