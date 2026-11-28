@@ -5,17 +5,18 @@ by the desktop client. OpenGL ES rendering uses eframe NativeActivity. Device
 identity and settings are app-private; backups and cleartext network traffic are
 disabled. No server address or paired identity is bundled.
 
-## Install the alpha
+## Install on Android
 
-Download the APK from [Releases](https://github.com/Blig-Vox/D4C/releases), install
+Download the arm64 APK from the [latest stable release](https://github.com/BLig-Vox/D4C/releases/latest), install
 it, then follow the [server and pairing guide](../docs/setup.md). Join the same
 Tailscale network as your server. Settings supports named WSS Gateway connections
 and a separate workspace-server URL override for each Gateway.
 
 The APK targets arm64-v8a and Android 6+. Physical interaction checks during
 development used Android 12; other Android/keyboard/vendor combinations can vary.
-This is a developer-signed alpha, not a Play Store build. Updates require the same
-signing certificate. Do not uninstall to update if you want to preserve local data.
+Install the signed APK over the existing app to preserve saved connections and
+your paired device identity. Android requires matching signing certificates.
+Once installed, use **Settings → System update** for future updates.
 
 ## Build on Linux
 
@@ -49,8 +50,13 @@ Wireless debugging page's separate connection port for
 ## Mobile behavior
 
 - Native Android composer supports keyboard suggestions, selection, composition,
-  emoji input and system clipboard copying. Other egui text fields are not native
-  EditText controls. Keyboard settings still govern autocorrection/suggestions.
+  emoji input and system clipboard copying. Settings → Add server uses native
+  name and URL fields with selection handles and long-press Paste. Keyboard settings still govern autocorrection/suggestions.
+- Settings → System update checks GitHub for a newer arm64 APK. Choose Stable
+  or Stable and alpha. The app also checks on resume after six hours. Confirm the
+  download, allow Android to install from D4C if prompted, then confirm installation.
+  The updater verifies package name, version, signing certificate and size, and
+  verifies the SHA-256 digest when GitHub supplies it.
 - The visible-window bounds keep the composer above the keyboard.
 - The system document picker uploads files up to 6 MB each. Tap chat images to
   open the viewer. Pinch, double-tap or use the zoom controls to inspect details.

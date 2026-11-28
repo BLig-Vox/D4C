@@ -17,8 +17,24 @@ pub(super) enum ComposerPicker {
     Effort,
 }
 
+#[derive(Clone, Copy, Default, PartialEq)]
+pub(super) enum SettingsTab {
+    General,
+    #[default]
+    Ssh,
+}
+
 fn neutral(label: impl Into<String>) -> Button {
     Button::new(label).variant(ButtonVariant::Outline)
+}
+
+fn settings_card(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) {
+    Card::new().size(CardSize::Sm).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.strong(title);
+        ui.separator();
+        content(ui);
+    });
 }
 
 fn toggle(ui: &mut egui::Ui, value: &mut bool, label: &str) -> bool {
@@ -110,148 +126,48 @@ impl D4c {
     pub(super) fn settings_ui(&mut self, ui: &mut egui::Ui) {
         let mut switch = None;
         let mut forget = None;
+        let mut open_ssh = None;
+        ui.add_space(4.0);
+        ui.heading("Settings");
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.settings_tab, SettingsTab::General, "General");
+            ui.selectable_value(&mut self.settings_tab, SettingsTab::Ssh, "SSH & Codex");
+        });
+        ui.add_space(4.0);
+        let (scroll_id, ssh_tab) = match self.settings_tab {
+            SettingsTab::General => ("settings-general", false),
+            SettingsTab::Ssh => ("settings-ssh", true),
+        };
         egui::ScrollArea::vertical()
-            .id_salt("settings")
+            .id_salt(scroll_id)
             .show(ui, |ui| {
-                ui.set_max_width(ui.available_width().min(640.0));
-                ui.spacing_mut().item_spacing.y = 8.0;
-                ui.heading("Settings");
-                ui.add_space(8.0);
-                ui.strong("Connections");
-                for (index, connection) in self.preferences.connections.iter().enumerate() {
-                    Card::new().size(CardSize::Sm).show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.strong(&connection.name);
-                            if index == self.preferences.selected {
-                                ui.weak(if self.connected { "Online" } else { "Offline" });
-                            } else {
-                                if ui.add(neutral("Switch")).clicked() {
-                                    switch = Some(index);
-                                }
-                                ui.menu_button("More", |ui| {
-                                    if ui.add(neutral("Remove connection")).clicked() {
-                                        forget = Some(index);
-                                        ui.close();
-                                    }
-                                });
-                            }
-                        });
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(&connection.url).small().weak())
-                                .wrap(),
-                        );
+                ui.set_max_width(ui.available_width().min(1120.0));
+                ui.spacing_mut().item_spacing.y = 10.0;
+                if ssh_tab {
+                    settings_card(ui, "SSH connections", |ui| open_ssh = self.ssh.settings_ui(ui));
+                    return;
+                }
+                if ui.available_width() >= 780.0 {
+                    ui.columns(2, |columns| {
+                        self.connection_settings(&mut columns[0], &mut switch, &mut forget);
+                        self.device_settings(&mut columns[1]);
                     });
+                } else {
+                    self.connection_settings(ui, &mut switch, &mut forget);
+                    self.device_settings(ui);
                 }
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add(neutral(if self.connected {
-                            "Reconnect"
-                        } else {
-                            "Connect"
-                        }))
-                        .clicked()
-                    {
-                        self.reconnect(ui.ctx());
-                    }
-                    if ui
-                        .add_enabled(self.can_reload(), neutral("Reload current session"))
-                        .on_hover_text("Refresh Codex tools and skills while the chat is idle")
-                        .clicked()
-                    {
-                        self.reload_session();
-                    }
-                    if self.gateway.is_some() && ui.add(neutral("Disconnect")).clicked() {
-                        self.gateway = None;
-                        self.connected = false;
-                        self.running = false;
-                        self.active_sessions.clear();
-                        self.live.clear();
-                        self.status = "Disconnected".into();
-                        self.cron.disconnected();
-                    }
-                });
-                ui.add(
-                    egui::Label::new(egui::RichText::new(&self.status).small().weak())
-                        .wrap()
-                        .selectable(true),
-                );
-                ui.weak("New devices need approval on the D4C server.");
-                if preferences::valid_url(&self.url) {
-                    egui::CollapsingHeader::new("Workspace server").show(ui, |ui| {
-                        let value = self
-                            .preferences
-                            .workspace_urls
-                            .entry(self.url.clone())
-                            .or_default();
-                        ui.add(
-                            Input::new(value)
-                                .hint("wss://workspace-host:8443 (optional)")
-                                .max_width(f32::INFINITY),
-                        );
-                        if ui.add(neutral("Save workspace URL")).clicked() {
-                            if value.is_empty() || preferences::valid_url(value) {
-                                match self.preferences.save() {
-                                    Ok(()) => {
-                                        self.settings_error.clear();
-                                        self.desktops.connect(&self.url, ui.ctx());
-                                    }
-                                    Err(error) => self.settings_error = error.to_string(),
-                                }
-                            } else {
-                                self.settings_error =
-                                    "Use a secure wss:// URL without credentials or query tokens"
-                                        .into();
-                            }
-                        }
-                    });
-                }
-                egui::CollapsingHeader::new("Add server")
-                    .id_salt("add_server")
-                    .show(ui, |ui| {
-                        ui.add(
-                            Input::new(&mut self.connection_name)
-                                .hint("Name")
-                                .max_width(f32::INFINITY),
-                        );
-                        ui.add(
-                            Input::new(&mut self.connection_url)
-                                .hint("wss://your-server")
-                                .max_width(f32::INFINITY),
-                        );
-                        if ui.add(Button::new("Save connection")).clicked() {
-                            self.save_connection();
-                        }
-                    });
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.strong("Notifications");
-                let desktop_changed = toggle(ui, &mut self.preferences.desktop, "Desktop alerts");
-                let sound_changed = toggle(ui, &mut self.preferences.sound, "Sound");
-                if (desktop_changed || sound_changed)
-                    && let Err(error) = self.preferences.save()
-                {
-                    self.settings_error = error.to_string();
-                }
-                ui.weak("Alerts appear on the device running D4C, while the app is connected.");
-                if ui.add(neutral("Test notification")).clicked() {
-                    let now = activity::now();
-                    if self.center.push(json!({
-                        "id": format!("test:{}", now / 1000), "title": "D4C",
-                        "body": "Notifications are ready", "session": "", "time": now,
-                        "kind": "test", "unread": true
-                    })) {
-                        self.notifier
-                            .test(self.preferences.desktop, self.preferences.sound);
-                    }
-                }
-                ui.weak(&self.notifier.status);
                 for error in [&self.settings_error, &self.center.error] {
                     if !error.is_empty() {
                         ui.colored_label(Theme::current(ui.ctx()).palette().destructive, error);
                     }
                 }
             });
+        if let Some(url) = open_ssh {
+            self.switch_to_url(&url, ui.ctx(), None);
+            if self.url == url {
+                self.settings_open = false;
+            }
+        }
         if let Some(index) = forget {
             let previous = self.preferences.clone();
             self.preferences.connections.remove(index);
@@ -271,6 +187,241 @@ impl D4c {
             }
         }
     }
+    fn connection_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        switch: &mut Option<usize>,
+        forget: &mut Option<usize>,
+    ) {
+        settings_card(ui, "Connections", |ui| {
+            for (index, connection) in self.preferences.connections.iter().enumerate() {
+                if connection.url.is_empty() {
+                    continue;
+                }
+                ui.scope(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(&connection.name);
+                        if connection.url == self.url {
+                            ui.weak(if self.connected {
+                                "Active · Online"
+                            } else {
+                                "Active · Offline"
+                            });
+                        } else {
+                            if ui.add(neutral("Switch")).clicked() {
+                                *switch = Some(index);
+                            }
+                            if index != self.preferences.selected {
+                                ui.menu_button("More", |ui| {
+                                    if ui.add(neutral("Remove connection")).clicked() {
+                                        *forget = Some(index);
+                                        ui.close();
+                                    }
+                                });
+                            }
+                        }
+                    });
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&connection.url).small().weak()).wrap(),
+                    );
+                });
+                ui.separator();
+            }
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add(neutral(if self.connected {
+                        "Reconnect"
+                    } else {
+                        "Connect"
+                    }))
+                    .clicked()
+                {
+                    self.reconnect(ui.ctx());
+                }
+                if ui
+                    .add_enabled(self.can_reload(), neutral("Reload current session"))
+                    .on_hover_text("Refresh Codex tools and skills while the chat is idle")
+                    .clicked()
+                {
+                    self.reload_session();
+                }
+                if self.gateway.is_some() && ui.add(neutral("Disconnect")).clicked() {
+                    self.gateway = None;
+                    self.connected = false;
+                    self.running = false;
+                    self.active_sessions.clear();
+                    self.live.clear();
+                    self.status = "Disconnected".into();
+                    self.cron.disconnected();
+                }
+            });
+            ui.add(
+                egui::Label::new(egui::RichText::new(&self.status).small().weak())
+                    .wrap()
+                    .selectable(true),
+            );
+
+            if preferences::valid_url(&self.url) {
+                egui::CollapsingHeader::new("Workspace server").show(ui, |ui| {
+                    let value = self
+                        .preferences
+                        .workspace_urls
+                        .entry(self.url.clone())
+                        .or_default();
+                    ui.add(
+                        Input::new(value)
+                            .hint("wss://workspace-host:8443 (optional)")
+                            .max_width(f32::INFINITY),
+                    );
+                    if ui.add(neutral("Save workspace URL")).clicked() {
+                        if value.is_empty() || preferences::valid_url(value) {
+                            match self.preferences.save() {
+                                Ok(()) => {
+                                    self.settings_error.clear();
+                                    self.desktops.connect(&self.url, ui.ctx());
+                                }
+                                Err(error) => self.settings_error = error.to_string(),
+                            }
+                        } else {
+                            self.settings_error =
+                                "Use a secure wss:// URL without credentials or query tokens"
+                                    .into();
+                        }
+                    }
+                });
+            }
+            #[cfg(target_os = "android")]
+            {
+                if let Some((name, url)) = super::android_text::take_server_form() {
+                    self.connection_name = name;
+                    self.connection_url = url;
+                    self.save_connection();
+                }
+                if ui.add(neutral("Add server")).clicked() {
+                    super::android_text::open_settings_action(Some((
+                        self.connection_name.clone(),
+                        self.connection_url.clone(),
+                    )));
+                }
+            }
+            #[cfg(not(target_os = "android"))]
+            egui::CollapsingHeader::new("Add server")
+                .id_salt("add_server")
+                .show(ui, |ui| {
+                    ui.add(
+                        Input::new(&mut self.connection_name)
+                            .hint("Name")
+                            .max_width(f32::INFINITY),
+                    );
+                    ui.add(
+                        Input::new(&mut self.connection_url)
+                            .hint("wss://your-server")
+                            .max_width(f32::INFINITY),
+                    );
+                    if ui.add(Button::new("Save connection")).clicked() {
+                        self.save_connection();
+                    }
+                });
+        });
+    }
+
+    fn device_settings(&mut self, ui: &mut egui::Ui) {
+        settings_card(ui, "System update", |ui| self.update_settings(ui));
+        settings_card(ui, "Notifications", |ui| {
+            let desktop_changed = toggle(ui, &mut self.preferences.desktop, "Desktop alerts");
+            let sound_changed = toggle(ui, &mut self.preferences.sound, "Sound");
+            if (desktop_changed || sound_changed)
+                && let Err(error) = self.preferences.save()
+            {
+                self.settings_error = error.to_string();
+            }
+            if ui.add(neutral("Test notification")).clicked() {
+                let now = activity::now();
+                if self.center.push(json!({
+                    "id": format!("test:{}", now / 1000), "title": "D4C",
+                    "body": "Notifications are ready", "session": "", "time": now,
+                    "kind": "test", "unread": true
+                })) {
+                    self.notifier
+                        .test(self.preferences.desktop, self.preferences.sound);
+                }
+            }
+            if !self.notifier.status.is_empty() {
+                ui.weak(&self.notifier.status);
+            }
+        });
+    }
+
+    fn update_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label(format!("Installed · {}", env!("CARGO_PKG_VERSION")));
+        #[cfg(target_os = "android")]
+        if ui.add(neutral("Open updater")).clicked() {
+            super::android_text::open_settings_action(None);
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            use super::updates::Check;
+            self.updates.poll();
+            let previous = self.preferences.alpha_updates;
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("Channel");
+                ui.selectable_value(&mut self.preferences.alpha_updates, false, "Stable");
+                ui.selectable_value(&mut self.preferences.alpha_updates, true, "Alpha");
+            });
+            if previous != self.preferences.alpha_updates {
+                match self.preferences.save() {
+                    Ok(()) => {
+                        self.settings_error.clear();
+                        self.updates = Check::Idle;
+                    }
+                    Err(error) => {
+                        self.preferences.alpha_updates = previous;
+                        self.settings_error = error.to_string();
+                    }
+                }
+            }
+            let checking = matches!(self.updates, Check::Pending(_));
+            if ui
+                .add_enabled(
+                    !checking,
+                    neutral(if checking {
+                        "Checking…"
+                    } else {
+                        "Check for updates"
+                    }),
+                )
+                .clicked()
+            {
+                self.updates.start(self.preferences.alpha_updates, ui.ctx());
+            }
+            match &self.updates {
+                Check::Finished(Ok(Some(release))) => {
+                    let installed = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                        .expect("valid Cargo package version");
+                    if release.version.cmp_precedence(&installed).is_gt() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong(format!("{} available", release.version));
+                            if ui.add(Button::new("Download")).clicked() {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(&release.download));
+                            }
+                        });
+                    } else if release.version.cmp_precedence(&installed).is_eq() {
+                        ui.weak("You're up to date.");
+                    } else {
+                        ui.weak(format!("Latest on this channel · {}", release.version));
+                    }
+                }
+                Check::Finished(Ok(None)) => {
+                    ui.weak("No release for this platform on this channel.");
+                }
+                Check::Finished(Err(error)) => {
+                    ui.colored_label(Theme::current(ui.ctx()).palette().destructive, error);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn save_connection(&mut self) {
         let url = self.connection_url.trim();
         let name = self.connection_name.trim();

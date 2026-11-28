@@ -90,6 +90,11 @@ pub fn set_android_storage(path: PathBuf) {
 }
 
 pub fn config_directory() -> io::Result<PathBuf> {
+    #[cfg(target_os = "windows")]
+    return std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|path| path.join("d4c"))
+        .ok_or_else(|| io::Error::other("Local AppData unavailable"));
     #[cfg(target_os = "android")]
     {
         return ANDROID_STORAGE
@@ -97,7 +102,7 @@ pub fn config_directory() -> io::Result<PathBuf> {
             .map(|path| path.join("d4c"))
             .ok_or_else(|| io::Error::other("Android private storage unavailable"));
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(not(target_os = "android"), not(target_os = "windows")))]
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))

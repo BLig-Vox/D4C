@@ -1,9 +1,17 @@
 [package]
 name = "vox-d4c"
-version = "0.1.0-alpha.14"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Blig-Vox/D4C"
+
+[package.metadata.binstall]
+disabled-strategies = ["quick-install", "compile"]
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/d4c-{ version }-linux-x86_64.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "d4c-{ version }-linux-x86_64/bin/{ bin }{ binary-ext }"
 
 [lib]
 path = "src/android.rs"
@@ -14,6 +22,7 @@ lucide-icons = "1.73"
 shadcn-egui = "0.8"
 linkify = "0.10"
 pulldown-cmark = { version = "0.13", default-features = false }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
@@ -29,9 +38,13 @@ egui_commonmark = { version = "0.26", default-features = false }
 ureq = { version="3.5", default-features=false, features=["rustls"] }
 flate2 = "1"
 tempfile = "3"
+russh = { version = "0.65.4", default-features = false, features = ["ring", "rsa"] }
+tokio = { version = "1", features = ["rt", "net", "sync", "time", "macros", "io-util"] }
+url = "2"
 image = {version="0.25",default-features=false,features=["png","jpeg","gif","webp"]}
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
+semver = "1"
 gstreamer = "0.24"
 gstreamer-app = "0.24"
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "system_fonts", "links", "clipboard", "wayland", "wgpu", "x11"] }
@@ -46,3 +59,5 @@ epaint = { version="0.37", features=["color_fonts"] }
 [patch.crates-io]
 winit = { path = "vendor/winit" }
 eframe = { path = "vendor/eframe" }
+# Preserve row alignment when indented inline text wraps more than once.
+epaint = { path = "vendor/epaint" }

@@ -2,13 +2,13 @@
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
-pub(super) enum Output {
+pub(crate) enum Output {
     Wire(Value),
     Ui(Value),
 }
 
 #[derive(Default)]
-pub(super) struct Adapter {
+pub(crate) struct Adapter {
     pub output: Vec<Output>,
     pending: HashMap<String, (String, Value)>,
     // Serialize thread/start and thread/resume with commands that need a live thread.
@@ -114,7 +114,14 @@ impl Adapter {
                 self.call("model/list", params, req);
             }
             "sessions.messages.subscribe" if !is_thread(&k) => self.ok(&req, json!({})),
-            "sessions.messages.subscribe" | "chat.send" | "sessions.patch" | "permissions.set"
+            "chat.compact" if !is_thread(&k) => {
+                self.fail(&req, "Send a message before compacting this chat");
+            }
+            "sessions.messages.subscribe"
+            | "chat.send"
+            | "chat.compact"
+            | "sessions.patch"
+            | "permissions.set"
                 if !self.loaded.contains(&k) =>
             {
                 self.open(&k, req);
@@ -160,11 +167,14 @@ impl Adapter {
             "sessions.delete" => self.call("thread/delete", json!({"threadId":k}), req),
             "sessions.archive" => self.call("thread/archive", json!({"threadId":k}), req),
             "chat.send" => self.send_turn(req),
-            "artifacts.download" => self.call(
-                "d4c/attachment/download",
-                json!({"artifactId":p["artifactId"]}),
-                req,
-            ),
+            "chat.compact" => self.call("thread/compact/start", json!({"threadId":k}), req),
+            "artifacts.download" => {
+                let mut params = json!({"artifactId":p["artifactId"]});
+                if let Some(offset) = p["offset"].as_u64() {
+                    params["offset"] = json!(offset);
+                }
+                self.call("d4c/attachment/download", params, req)
+            }
             "chat.abort" => {
                 if let Some(turn) = self.active.get(&k) {
                     self.call("turn/interrupt", json!({"threadId":k,"turnId":turn}), req);
@@ -439,8 +449,17 @@ impl Adapter {
             "item/started"|"item/completed"=>{
                 let done=method=="item/completed";
                 match string(&item["type"]){
-                    "userMessage"=>if let Some(message)=transcript(item){self.event("session.message",json!({"sessionKey":k,"messageId":item["id"],"message":message}));},
-                    "agentMessage" if done=>self.event("chat",json!({"sessionKey":k,"state":"delta","runId":p["turnId"],"itemId":item["id"],"message":{"content":item["text"]}})),
+                    kind @ ("userMessage" | "contextCompaction") if done || kind == "userMessage" => {
+                        if let Some(message)=transcript(item){
+                            self.event("session.message",json!({"sessionKey":k,"messageId":item["id"],"message":message}));
+                        }
+                    }
+                    "contextCompaction" => {}
+                    "agentMessage" if done=>{
+                        if let Some(message)=transcript(item){
+                            self.event("chat",json!({"sessionKey":k,"state":"delta","runId":p["turnId"],"itemId":item["id"],"replace":message["content"].is_array(),"message":message}));
+                        }
+                    }
                     "reasoning" if done=>{
                         let summary=lines(&item["summary"]);
                         if !summary.is_empty(){self.event("agent",json!({"sessionKey":k,"stream":"reasoning","data":{"itemId":item["id"],"text":summary}}));}
@@ -706,7 +725,7 @@ fn upload_part(text: &str) -> Option<Value> {
         json!({"type":"file","fileName":name,"mimeType":mime,"artifactId":format!("upload/{key}/{name}")}),
     )
 }
-fn tool_media(item: &Value) -> Vec<Value> {
+fn item_media(item: &Value) -> Vec<Value> {
     let mut media = Vec::new();
     let mut add = |v: &Value| {
         if v["artifactId"].is_string()
@@ -722,6 +741,9 @@ fn tool_media(item: &Value) -> Vec<Value> {
         }
     };
     add(&item["d4cAttachment"]);
+    for part in rows(&item["d4cAttachments"]) {
+        add(part);
+    }
     for p in rows(&item["contentItems"]) {
         add(&p["d4cAttachment"]);
         if item["tool"] == "share_media"
@@ -733,6 +755,16 @@ fn tool_media(item: &Value) -> Vec<Value> {
     }
     media
 }
+fn with_media(text: Value, mut attachments: Vec<Value>) -> Value {
+    if attachments.is_empty() {
+        return text;
+    }
+    if !string(&text).is_empty() {
+        attachments.insert(0, json!({"type":"text","text":text}));
+    }
+    Value::Array(attachments)
+}
+
 fn transcript(item: &Value) -> Option<Value> {
     let kind = string(&item["type"]);
     let id = &item["id"];
@@ -748,13 +780,22 @@ fn transcript(item: &Value) -> Option<Value> {
             }).collect();
             Some(json!({"role":"user","id":id,"clientId":item["clientId"],"content":content}))
         }
-        "agentMessage" => Some(json!({"role":"assistant","id":id,"content":item["text"]})),
+        "agentMessage" => {
+            let text = item["d4cText"]
+                .as_str()
+                .map_or_else(|| item["text"].clone(), |text| json!(text));
+            let content = with_media(text, item_media(item));
+            Some(json!({"role":"assistant","id":id,"content":content}))
+        }
         "reasoning" => {
             let summary = lines(&item["summary"]);
             (!summary.is_empty())
                 .then(|| json!({"role":"custom","display":true,"id":id,"content":summary}))
         }
         "plan" => Some(json!({"role":"custom","display":true,"id":id,"content":item["text"]})),
+        "contextCompaction" => Some(json!({
+            "role":"custom","display":true,"id":id,"content":"Context compacted"
+        })),
         _ => {
             let fields: &[&str] = match kind {
                 "commandExecution" => &["command", "aggregatedOutput"],
@@ -769,7 +810,7 @@ fn transcript(item: &Value) -> Option<Value> {
                 "collabAgentToolCall" => &["prompt", "agentsStates"],
                 _ => return None,
             };
-            let mut attachments = tool_media(item);
+            let attachments = item_media(item);
             let text = fields
                 .iter()
                 .filter(|key| {
@@ -784,14 +825,7 @@ fn transcript(item: &Value) -> Option<Value> {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            let content = if attachments.is_empty() {
-                json!(text)
-            } else {
-                if !text.is_empty() {
-                    attachments.insert(0, json!({"type":"text","text":text}));
-                }
-                Value::Array(attachments)
-            };
+            let content = with_media(json!(text), attachments);
             Some(
                 json!({"role":"tool","id":id,"toolCallId":id,"toolName":item["tool"].as_str().or_else(||item["name"].as_str()).unwrap_or(kind),"isError":item["status"]=="failed" || item["success"]==false,"content":content}),
             )
@@ -811,6 +845,52 @@ mod tests {
                 Output::Ui(v) | Output::Wire(v) => v,
             })
             .collect()
+    }
+
+    #[test]
+    fn compact_resumes_existing_thread_and_reports_native_completion() {
+        let mut adapter = Adapter::default();
+        adapter.command(super::super::rpc(
+            "chat.compact",
+            json!({"sessionKey":THREAD}),
+        ));
+        let resume = frames(&mut adapter).pop().unwrap();
+        assert_eq!(resume["method"], "thread/resume");
+        adapter.incoming(json!({"id":resume["id"],"result":{"thread":{"id":THREAD}}}));
+        let native = frames(&mut adapter).pop().unwrap();
+        assert_eq!(native["method"], "thread/compact/start");
+        assert_eq!(native["params"], json!({"threadId":THREAD}));
+
+        adapter.incoming(json!({"id":native["id"],"result":{}}));
+        let ack = frames(&mut adapter);
+        assert_eq!(ack.len(), 1);
+        assert_eq!(ack[0]["ok"], true);
+        let item = json!({"type":"contextCompaction","id":"compact-1"});
+        let params = json!({"threadId":THREAD,"turnId":"compact-turn","item":item});
+        adapter.notify("item/started", &params);
+        assert!(frames(&mut adapter).is_empty());
+        adapter.notify("item/completed", &params);
+        let event = frames(&mut adapter).pop().unwrap();
+        assert_eq!(event["event"], "session.message");
+        assert_eq!(event["payload"]["messageId"], "compact-1");
+        assert_eq!(event["payload"]["message"], transcript(&item).unwrap());
+        assert_eq!(event["payload"]["message"]["content"], "Context compacted");
+    }
+
+    #[test]
+    fn compact_on_a_new_chat_does_not_create_a_thread() {
+        let mut adapter = Adapter::default();
+        adapter.command(super::super::rpc(
+            "chat.compact",
+            json!({"sessionKey":"draft"}),
+        ));
+        let messages = frames(&mut adapter);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["ok"], false);
+        assert_eq!(
+            messages[0]["error"]["message"],
+            "Send a message before compacting this chat"
+        );
     }
 
     #[test]
@@ -907,6 +987,23 @@ mod tests {
             json!({"sessionKey":THREAD,"artifactId":file["artifactId"]}),
         ));
         assert_eq!(frames(&mut adapter)[0]["method"], "d4c/attachment/download");
+    }
+
+    #[test]
+    fn completed_reply_video_is_available_in_live_chat_and_history() {
+        let file = json!({"type":"file","artifactId":"blob/id/demo.mp4","fileName":"Demo.mp4","mimeType":"video/mp4"});
+        let item = json!({"type":"agentMessage","id":"demo","text":"MEDIA: Demo.mp4","d4cText":"","d4cAttachments":[file]});
+        let history = transcript(&item).unwrap();
+        assert_eq!(history["content"], json!([file]));
+        assert_eq!(crate::media::from_message(&history).len(), 1);
+
+        let mut adapter = Adapter::default();
+        adapter
+            .incoming(json!({"method":"item/completed","params":{"item":item,"threadId":THREAD}}));
+        let live = &frames(&mut adapter)[0]["payload"];
+        assert_eq!(live["itemId"], "demo");
+        assert_eq!(live["replace"], true);
+        assert_eq!(live["message"], history);
     }
 
     #[test]

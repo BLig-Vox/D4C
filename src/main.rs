@@ -21,6 +21,10 @@ mod preferences;
 mod questions;
 mod rfb;
 mod servers;
+mod session_tabs;
+mod ssh;
+#[cfg(not(target_os = "android"))]
+mod updates;
 mod uploads;
 mod wire;
 mod workspace;
@@ -29,6 +33,20 @@ use eframe::egui;
 use serde_json::{Value, json};
 
 fn main() -> eframe::Result {
+    #[cfg(target_os = "windows")]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--check-media")) {
+        if let Err(error) = gstreamer::init() {
+            eprintln!("GStreamer initialization failed: {error}");
+            std::process::exit(1);
+        }
+        for name in ["playbin", "appsink", "qtdemux", "avdec_h264"] {
+            if gstreamer::ElementFactory::find(name).is_none() {
+                eprintln!("Missing GStreamer element: {name}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     let _ = rustls::crypto::ring::default_provider().install_default();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -40,7 +58,7 @@ fn main() -> eframe::Result {
                 ))
                 .expect("packaged D4C icon"),
             )
-            .with_fullscreen(true),
+            .with_fullscreen(cfg!(target_os = "android")),
         ..Default::default()
     };
     run(options)
@@ -87,7 +105,6 @@ struct ServerView {
     questions: questions::Questions,
     messages: Vec<ChatMessage>,
     scroll: (f32, f32),
-    desktop: desktops::UiState,
 }
 const SERVER_CACHE_BYTES: usize = 16 * 1024 * 1024;
 fn message_cache_bytes(m: &ChatMessage) -> usize {
@@ -98,16 +115,20 @@ fn message_cache_bytes(m: &ChatMessage) -> usize {
 struct D4c {
     desktops: desktops::Desktops,
     servers: servers::Catalogs,
+    ssh: ssh::Servers,
     server_views: std::collections::VecDeque<(String, ServerView)>,
+    tabs: session_tabs::Tabs,
     explicit_selection: bool,
     jump_latest: bool,
     workspace_hydrated: bool,
+    queued_messages: std::collections::HashMap<(String, String), std::collections::VecDeque<Draft>>,
     draft_queue: draft_sync::Queue,
     imported_notifications: std::collections::HashSet<String>,
     remote_notifications: std::collections::HashSet<String>,
     workspace_sync: std::time::Instant,
     sidebar_open: bool,
     settings_open: bool,
+    settings_tab: dialogs::SettingsTab,
     notifications_open: bool,
     preferences: preferences::Settings,
     center: activity::Center,
@@ -116,6 +137,8 @@ struct D4c {
     connection_name: String,
     connection_url: String,
     settings_error: String,
+    #[cfg(not(target_os = "android"))]
+    updates: updates::Check,
     switch_pending: Option<usize>,
     composer_picker: Option<(ComposerPicker, egui::Response)>,
     compact_previous: bool,
@@ -138,7 +161,7 @@ struct D4c {
     fallback_titles: std::collections::HashMap<String, String>,
     title_requests: std::collections::HashMap<String, String>,
     media_auth: Option<String>,
-    media_requests: std::collections::HashMap<String, (String, String)>,
+    media_requests: std::collections::HashMap<String, (String, String, u64, std::time::Instant)>,
     messages: Vec<ChatMessage>,
     input: String,
     questions: questions::Questions,
@@ -159,6 +182,7 @@ struct D4c {
     thinking: String,
     running: bool,
     attachments: Vec<(String, String, Vec<u8>)>,
+    composer_previews: std::collections::HashMap<[u8; 32], Option<egui::TextureHandle>>,
     markdown_cache: egui_commonmark::CommonMarkCache,
     commands: Vec<commands::Command>,
     command_request: Option<String>,
@@ -188,24 +212,57 @@ struct D4c {
 }
 impl Default for D4c {
     fn default() -> Self {
-        let preferences = preferences::Settings::load();
+        Self::load(true)
+    }
+}
+impl D4c {
+    fn load(restore_tabs: bool) -> Self {
+        let mut preferences = preferences::Settings::load();
+        let saved_tabs = restore_tabs
+            .then(|| {
+                session_tabs::Tabs::load(|url| {
+                    preferences.connections.iter().any(|c| c.url == url)
+                })
+            })
+            .flatten();
+        if let Some((_, Some(active))) = &saved_tabs
+            && let Some(index) = preferences.connections.iter().position(|c| c.url == active.url)
+        {
+            preferences.selected = index;
+        }
         let url = preferences.current().url.clone();
         let center = activity::Center::load(&url);
         let servers = servers::Catalogs::default();
-        let remembered = servers.rows.get(&url).and_then(|row| row.selected.clone());
+        let (tabs, remembered, explicit_selection) = match saved_tabs {
+            Some((tabs, active)) => (tabs, active.map(|id| id.session), true),
+            None => {
+                let remembered = servers.rows.get(&url).and_then(|row| row.selected.clone());
+                let mut tabs = session_tabs::Tabs::default();
+                if let Some(key) = remembered.as_deref().filter(|key| !key.starts_with("draft:")) {
+                    tabs.open(session_tabs::TabId::new(&url, key));
+                }
+                let explicit = remembered.is_some();
+                (tabs, remembered, explicit)
+            }
+        };
         let (default_model, default_thinking) = preferences.defaults(&url);
+        let sidebar_open = preferences.sidebar_open(false);
         Self {
             desktops: Default::default(),
             servers,
+            ssh: ssh::Servers::default(),
             server_views: Default::default(),
-            explicit_selection: remembered.is_some(),
+            tabs,
+            explicit_selection,
             jump_latest: false,
             workspace_hydrated: false,
+            queued_messages: Default::default(),
             draft_queue: Default::default(),
             imported_notifications: Default::default(),
             remote_notifications: Default::default(),
             workspace_sync: std::time::Instant::now(),
             settings_open: url.is_empty(),
+            settings_tab: Default::default(),
             notifications_open: false,
             preferences,
             center,
@@ -214,10 +271,12 @@ impl Default for D4c {
             connection_name: String::new(),
             connection_url: String::new(),
             settings_error: String::new(),
+            #[cfg(not(target_os = "android"))]
+            updates: updates::Check::default(),
             switch_pending: None,
             composer_picker: None,
             compact_previous: false,
-            sidebar_open: true,
+            sidebar_open,
             show_cron: false,
             workspace_open: false,
             task_chat: false,
@@ -258,8 +317,9 @@ impl Default for D4c {
             thinking: default_thinking,
             running: false,
             attachments: Vec::new(),
+            composer_previews: Default::default(),
             markdown_cache: egui_commonmark::CommonMarkCache::default(),
-            commands: vec![],
+            commands: commands::parse(&Value::Null),
             command_request: None,
             command_status: "Connect to discover commands".into(),
             slash_selected: 0,
@@ -289,13 +349,15 @@ impl Default for D4c {
 }
 impl D4c {
     fn reconnect(&mut self, ctx: &egui::Context) {
+        if ssh::is_chat_id(&self.url) {
+            self.settings_open = true;
+            return;
+        }
         self.composer_picker = None;
         self.workspace_hydrated = false;
         self.permission_request = None;
         self.questions.disconnected();
-        for (_, params) in std::mem::take(&mut self.pending_sends) {
-            self.restore_unsent(&params);
-        }
+        self.restore_pending_sends();
         self.sent_requests.clear();
         self.reload_request = None;
         self.selection_pending.clear();
@@ -339,18 +401,20 @@ impl D4c {
         }
     }
     fn reset_connection(&mut self, index: usize, token: String) {
+        let url = self.preferences.connections[index].url.clone();
+        self.reset_connection_for(index, token, url);
+    }
+    fn reset_connection_for(&mut self, index: usize, token: String, url: String) {
+        self.save_layout(true);
         self.deleted_sessions.clear();
         self.pending_sends.clear();
         let mut preferences = self.preferences.clone();
         preferences.selected = index;
         let servers = std::mem::take(&mut self.servers);
-        let remembered = servers
-            .rows
-            .get(&preferences.current().url)
-            .and_then(|row| row.selected.clone());
+        let remembered = servers.rows.get(&url).and_then(|row| row.selected.clone());
         let mut views = std::mem::take(&mut self.server_views);
         views.retain(|(url, _)| url != &self.url);
-        if preferences::valid_url(&self.url) {
+        if preferences::valid_url(&self.url) || ssh::is_chat_id(&self.url) {
             let mut messages = std::mem::take(&mut self.messages);
             messages.drain(..messages.len().saturating_sub(100));
             while messages
@@ -370,24 +434,26 @@ impl D4c {
                     questions: std::mem::take(&mut self.questions),
                     messages,
                     scroll: self.history_scroll,
-                    desktop: self.desktops.capture_ui(),
                 },
             ));
         }
         let restored = views
             .iter()
-            .position(|(url, _)| url == &preferences.current().url)
+            .position(|(cached_url, _)| cached_url == &url)
             .and_then(|n| views.remove(n))
             .map(|(_, v)| v);
         while views.len() > 2 {
             views.pop_front();
         }
-        let mut next = Self::default();
+        let mut next = Self::load(false);
         next.server_views = views;
+        next.tabs = std::mem::take(&mut self.tabs);
+        next.queued_messages = std::mem::take(&mut self.queued_messages);
         next.servers = servers;
+        next.ssh = std::mem::take(&mut self.ssh);
         next.session = remembered.unwrap_or_else(|| format!("draft:{}", uuid::Uuid::new_v4()));
         next.explicit_selection = true;
-        next.url = preferences.current().url.clone();
+        next.url = url;
         next.center = activity::Center::load(&next.url);
         next.preferences = preferences;
         next.token = token;
@@ -406,7 +472,6 @@ impl D4c {
             })
             .unwrap_or_default();
         if let Some(view) = restored {
-            next.desktops.restore_ui(view.desktop);
             next.questions = view.questions;
             next.session = view.session;
             next.messages = view.messages;
@@ -416,10 +481,12 @@ impl D4c {
         next.restore_server_drafts();
         *self = next;
     }
-    fn save_server_drafts(&mut self) -> std::io::Result<()> {
+    fn restore_pending_sends(&mut self) {
         for (_, params) in std::mem::take(&mut self.pending_sends) {
             self.restore_unsent(&params);
         }
+    }
+    fn save_server_drafts(&mut self) -> std::io::Result<()> {
         self.sync_drafts();
         let mut rows = Vec::new();
         let mut add = |key: &str, text: &str, attachments: &Vec<uploads::Attachment>| {
@@ -503,13 +570,29 @@ impl D4c {
         }
     }
     fn switch_to(&mut self, index: usize, ctx: &egui::Context, target: Option<String>) {
-        if index >= self.preferences.connections.len() {
+        if let Some(connection) = self.preferences.connections.get(index) {
+            self.switch_to_url(&connection.url.clone(), ctx, target);
+        }
+    }
+    fn switch_to_url(&mut self, url: &str, ctx: &egui::Context, target: Option<String>) {
+        if url == self.url {
+            if let Some(key) = target {
+                let load = !key.starts_with("draft:");
+                self.select_session(key, load);
+            }
             return;
         }
-        if !self.pending_sends.is_empty() || !self.sent_requests.is_empty() {
-            self.settings_error =
-                "Waiting for Codex to accept the message before switching servers".into();
-            self.composer_error = self.settings_error.clone();
+        let index = self
+            .preferences
+            .connections
+            .iter()
+            .position(|connection| connection.url == url);
+        if index.is_none()
+            && !self
+                .ssh
+                .chat_connections()
+                .any(|connection| connection.url == url)
+        {
             return;
         }
         if let Err(error) = self.save_server_drafts() {
@@ -520,14 +603,16 @@ impl D4c {
         self.servers.select(&self.url, &self.session);
         self.servers.save();
         self.center.save();
-        let previous = self.preferences.selected;
-        self.preferences.selected = index;
-        if let Err(e) = self.preferences.save() {
-            self.preferences.selected = previous;
-            self.settings_error = e.to_string();
-            return;
+        if let Some(index) = index {
+            let previous = self.preferences.selected;
+            self.preferences.selected = index;
+            if let Err(e) = self.preferences.save() {
+                self.preferences.selected = previous;
+                self.settings_error = e.to_string();
+                return;
+            }
         }
-        if self.preferences.current().url != self.url {
+        {
             media::reset();
             self.rpc("sessions.messages.unsubscribe", json!({"key":self.session}));
             if let Some(link) = self.gateway.take() {
@@ -539,6 +624,9 @@ impl D4c {
                     &self.status,
                 );
             }
+            let row = self.servers.rows.entry(self.url.clone()).or_default();
+            row.sends.pending = std::mem::take(&mut self.pending_sends);
+            row.sends.sent = std::mem::take(&mut self.sent_requests);
         }
         if self.desktops.workspace.link.is_some() {
             self.servers
@@ -547,13 +635,43 @@ impl D4c {
                 .or_default()
                 .workspace = Some(std::mem::take(&mut self.desktops.workspace));
         }
-        self.reset_connection(index, String::new());
-        if let Some(key) = target
-            && key != self.session
-        {
+        if let Some(index) = index {
+            self.reset_connection(index, String::new());
+        } else {
+            self.reset_connection_for(self.preferences.selected, String::new(), url.to_owned());
+        }
+        let sends = self
+            .servers
+            .rows
+            .get_mut(&self.url)
+            .map(|row| std::mem::take(&mut row.sends))
+            .unwrap_or_default();
+        self.pending_sends = sends.pending;
+        self.sent_requests = sends.sent;
+        let target = target.map(|key| sends.rekeys.get(&key).cloned().unwrap_or(key));
+        if !sends.rekeys.is_empty() {
+            for (old, new) in sends.rekeys {
+                self.adopt_session(&old, &new);
+                self.pending_rekeys.insert(old, new);
+            }
+            self.persist_rekeys();
+        }
+        if let Some(key) = target {
             let load = !key.starts_with("draft:");
             self.select_session(key, load);
+        } else if !self.session.starts_with("draft:") {
+            self.tabs.open(self.active_tab());
         }
+        for params in sends.failed {
+            self.restore_unsent(&params);
+        }
+        self.active_sessions.extend(
+            self.pending_sends
+                .values()
+                .chain(self.sent_requests.values())
+                .filter_map(|params| params["sessionKey"].as_str().map(str::to_owned)),
+        );
+        self.running |= self.active_sessions.contains(&self.session);
         if let Some((link, media_token, online, status)) = self.servers.take_warm(&self.url) {
             self.gateway = Some(link);
             self.media_auth = media_token;
@@ -566,12 +684,14 @@ impl D4c {
                 .and_then(|r| r.workspace.take())
             {
                 self.desktops.workspace = workspace;
-            } else {
+            } else if !ssh::is_chat_id(&self.url) {
                 self.desktops.connect(&self.url, ctx);
             }
             if online {
                 self.activate_chat();
             }
+        } else if ssh::is_chat_id(&self.url) {
+            self.status = "Codex connection unavailable. Check SSH servers in Settings.".into();
         } else {
             self.reconnect(ctx);
         }
@@ -823,6 +943,7 @@ impl D4c {
         if old == new || uuid::Uuid::parse_str(new).is_err() {
             return;
         }
+        self.tabs.rekey(&self.url, old, new);
         if self.active_sessions.remove(old) {
             self.active_sessions.insert(new.into());
         }
@@ -848,6 +969,15 @@ impl D4c {
             }
             target.attachments.extend(draft.attachments);
         }
+        if let Some(queue) = self
+            .queued_messages
+            .remove(&(self.url.clone(), old.to_owned()))
+        {
+            self.queued_messages
+                .entry((self.url.clone(), new.to_owned()))
+                .or_default()
+                .extend(queue);
+        }
         self.draft_queue.rekey(old, new);
         for key in self
             .selection_pending
@@ -872,7 +1002,7 @@ impl D4c {
         {
             *key = new.into();
         }
-        for (key, _) in self.media_requests.values_mut() {
+        for (key, ..) in self.media_requests.values_mut() {
             if key == old {
                 *key = new.into();
             }
@@ -906,7 +1036,7 @@ impl D4c {
             .is_some();
     }
     fn refresh_commands(&mut self) {
-        self.commands.clear();
+        self.commands = commands::parse(&Value::Null);
         self.command_status = "Discovering commands and skills…".into();
         let mut params = json!({"scope":"text","includeArgs":true});
         if self.sessions.iter().any(|(key, _)| key == &self.session) {
@@ -922,8 +1052,30 @@ impl D4c {
             .or_else(|| self.fallback_titles.get(&self.session).map(String::as_str))
             .unwrap_or("New chat")
     }
+    fn active_tab(&self) -> session_tabs::TabId {
+        session_tabs::TabId::new(&self.url, &self.session)
+    }
+    fn select_tab(&mut self, id: &session_tabs::TabId, ctx: &egui::Context) {
+        self.switch_to_url(&id.url, ctx, Some(id.session.clone()));
+    }
+    fn close_tab(&mut self, id: &session_tabs::TabId, ctx: &egui::Context) {
+        if &self.active_tab() == id {
+            if let Some(neighbor) = self.tabs.neighbor(id).cloned() {
+                self.select_tab(&neighbor, ctx);
+                if &self.active_tab() == id {
+                    return;
+                }
+            } else {
+                self.select_session_impl(format!("draft:{}", uuid::Uuid::new_v4()), false, true);
+            }
+        }
+        self.tabs.remove(id);
+    }
     fn select_session(&mut self, key: String, load: bool) {
-        self.select_session_impl(key, load, true);
+        if !self.deleted_sessions.contains(&key) {
+            self.tabs.open(session_tabs::TabId::new(&self.url, &key));
+            self.select_session_impl(key, load, true);
+        }
     }
     fn select_session_impl(&mut self, key: String, load: bool, save_previous: bool) {
         self.jump_latest = false;
@@ -945,7 +1097,7 @@ impl D4c {
                 .workspace
                 .rpc("notification.read", json!({"session":key}));
         }
-        if self.session == key && load {
+        if self.session == key {
             return;
         }
         if save_previous {
@@ -1080,12 +1232,19 @@ impl D4c {
         self.cron.refresh();
     }
     fn events(&mut self, ctx: &egui::Context) {
-        let events: Vec<_> = self
+        let mut events: Vec<_> = self
             .gateway
             .as_ref()
             .map(|g| g.rx.try_iter().take(64).collect())
             .unwrap_or_default();
-        if events.len() == 64 {
+        if self.gateway.is_some() && ssh::is_chat_id(&self.url) && !self.ssh.is_connected(&self.url)
+        {
+            self.gateway = None;
+            events.push(gateway::Event::Error(
+                "SSH disconnected. Reconnect in Settings.".into(),
+            ));
+        }
+        if events.len() >= 64 {
             ctx.request_repaint();
         }
         for event in events {
@@ -1098,9 +1257,7 @@ impl D4c {
                     }
                 }
                 gateway::Event::Error(s) => {
-                    for (_, params) in std::mem::take(&mut self.pending_sends) {
-                        self.restore_unsent(&params);
-                    }
+                    self.restore_pending_sends();
                     self.connected = false;
                     self.list_pending = false;
                     self.list_dirty = false;
@@ -1201,6 +1358,22 @@ impl D4c {
                             continue;
                         }
                         if let Some(params) = self.sent_requests.remove(response_id) {
+                            if response_id.starts_with("chat.compact:") {
+                                if v["ok"] == false
+                                    && let Some(key) = params["sessionKey"].as_str()
+                                {
+                                    self.active_sessions.remove(key);
+                                    if key == self.session {
+                                        self.running = false;
+                                        self.composer_error = v["error"]["message"]
+                                            .as_str()
+                                            .unwrap_or("Could not start context compaction")
+                                            .into();
+                                        self.status = self.composer_error.clone();
+                                    }
+                                }
+                                continue;
+                            }
                             if v["ok"] == false {
                                 self.restore_unsent(&params);
                             }
@@ -1334,7 +1507,7 @@ impl D4c {
                         continue;
                     }
                     let id = v["id"].as_str().unwrap_or("");
-                    if let Some((session, artifact)) = self.media_requests.remove(id) {
+                    if let Some((session, artifact, offset, _)) = self.media_requests.remove(id) {
                         if session == self.session {
                             let p = &v["payload"];
                             let bytes = p["data"]
@@ -1349,11 +1522,26 @@ impl D4c {
                                 .messages
                                 .iter_mut()
                                 .flat_map(|m| &mut m.media)
-                                .filter(|a| a.artifact.as_deref() == Some(&artifact))
+                                .filter(|a| {
+                                    a.artifact.as_deref() == Some(&artifact)
+                                        && a.pending_offset() == Some(offset)
+                                })
                             {
                                 if v["ok"] == true
                                     && let Some(bytes) = bytes.as_ref()
                                 {
+                                    if let Some(total) = p["total"].as_u64() {
+                                        if p["offset"].as_u64() == Some(offset) {
+                                            attachment.receive_video_chunk(offset, total, bytes);
+                                        } else {
+                                            attachment.download_failed("Unexpected video chunk");
+                                        }
+                                        continue;
+                                    }
+                                    if offset != 0 {
+                                        attachment.download_failed("Interrupted video download");
+                                        continue;
+                                    }
                                     let mime = p["artifact"]["mimeType"]
                                         .as_str()
                                         .unwrap_or(&attachment.mime)
@@ -2324,8 +2512,28 @@ impl D4c {
         };
         let theme = Theme::current(ui.ctx());
         let palette = theme.palette();
+        self.flush_queued_message();
+        let queue_key = (self.url.clone(), self.session.clone());
+        if let Some(queue) = self.queued_messages.get(&queue_key) {
+            ui.small(format!("{} queued", queue.len()));
+        }
         let composer_id = egui::Id::unique("message_input");
         let focused = !self.dialog_open() && ui.memory(|m| m.has_focus(composer_id));
+        #[cfg(not(target_os = "android"))]
+        if focused && self.upload.is_none() {
+            let pasted = ui.input(|input| {
+                input.events.iter().find_map(|event| match event {
+                    egui::Event::PasteImage(image) => Some(image.clone()),
+                    _ => None,
+                })
+            });
+            if let Some(image) = pasted {
+                self.upload = Some((
+                    self.session.clone(),
+                    uploads::paste_image(image, ui.ctx().clone()),
+                ));
+            }
+        }
         let mut candidates = if self.slash_dismissed {
             vec![]
         } else {
@@ -2473,15 +2681,51 @@ impl D4c {
                 }
                 if !self.attachments.is_empty() {
                     let mut remove = None;
+                    let mut visible_previews = std::collections::HashSet::new();
                     ui.horizontal_wrapped(|ui| {
-                        for (index, (name, _, bytes)) in self.attachments.iter().enumerate() {
+                        for (index, (name, mime, bytes)) in self.attachments.iter().enumerate() {
+                            let preview = if mime.starts_with("image/") {
+                                use sha2::Digest;
+                                let key: [u8; 32] = sha2::Sha256::digest(bytes).into();
+                                visible_previews.insert(key);
+                                self.composer_previews
+                                    .entry(key)
+                                    .or_insert_with(|| {
+                                        media::decode_image(bytes, 160).ok().map(|(image, _)| {
+                                            ui.ctx().load_texture(
+                                                format!("composer-{key:x?}"),
+                                                image,
+                                                egui::TextureOptions::LINEAR,
+                                            )
+                                        })
+                                    })
+                                    .as_ref()
+                            } else {
+                                None
+                            };
                             egui::Frame::new()
                                 .fill(egui::Color32::from_gray(48))
                                 .corner_radius(6)
                                 .inner_margin(6)
                                 .show(ui, |ui| {
+                                    ui.set_max_width(120.0);
+                                    if let Some(texture) = preview {
+                                        let thumbnail = egui::Image::new(texture)
+                                            .fit_to_exact_size(egui::vec2(88.0, 64.0))
+                                            .maintain_aspect_ratio(true)
+                                            .sense(egui::Sense::click());
+                                        if ui.add(thumbnail).on_hover_text("Open image").clicked() {
+                                            media::open_image(
+                                                name.clone(),
+                                                texture.clone(),
+                                                Some(std::sync::Arc::new(bytes.clone())),
+                                            );
+                                        }
+                                    }
                                     ui.horizontal(|ui| {
-                                        ui.label(icon_text(lucide_icons::Icon::File, 14.0));
+                                        if preview.is_none() {
+                                            ui.label(icon_text(lucide_icons::Icon::File, 14.0));
+                                        }
                                         ui.add(
                                             egui::Label::new(egui::RichText::new(name).small())
                                                 .truncate(),
@@ -2506,10 +2750,14 @@ impl D4c {
                                 });
                         }
                     });
+                    self.composer_previews
+                        .retain(|key, _| visible_previews.contains(key));
                     if let Some(index) = remove {
                         self.attachments.remove(index);
                     }
                     ui.add_space(5.0);
+                } else {
+                    self.composer_previews.clear();
                 }
                 let draft_scroll = egui::ScrollArea::vertical()
                     .id_salt("draft_scroll")
@@ -2560,7 +2808,17 @@ impl D4c {
                 }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let tools_width = (ui.available_width() - 42.0).max(1.0);
+                    // Reserve the send button *and* the spacing between both
+                    // groups. Otherwise the right group widens the frame and
+                    // clips its border against the edge of the window.
+                    let trailing_width = 40.0
+                        + ui.spacing().item_spacing.x
+                        + if self.upload.is_some() {
+                            24.0 + ui.spacing().item_spacing.x
+                        } else {
+                            0.0
+                        };
+                    let tools_width = (ui.available_width() - trailing_width).max(1.0);
                     ui.allocate_ui_with_layout(
                         egui::vec2(tools_width, 0.0),
                         egui::Layout::left_to_right(egui::Align::Center),
@@ -2587,7 +2845,10 @@ impl D4c {
                         },
                     );
                     ui.horizontal(|ui| {
-                        if self.running {
+                        if self.running
+                            && self.input.trim().is_empty()
+                            && self.attachments.is_empty()
+                        {
                             if ui
                                 .add(
                                     Button::new("Stop response")
@@ -2610,11 +2871,15 @@ impl D4c {
                                     && self.upload.is_none()
                                     && (!self.input.trim().is_empty()
                                         || !self.attachments.is_empty()),
-                                Button::new("Send")
+                                Button::new(if self.running { "Queue" } else { "Send" })
                                     .icon(lucide::ARROW_UP)
                                     .size(ButtonSize::Icon),
                             )
-                            .on_hover_text("Send · Enter")
+                            .on_hover_text(if self.running {
+                                "Queue message · Enter"
+                            } else {
+                                "Send · Enter"
+                            })
                             .clicked()
                         {
                             send = true;
@@ -2700,6 +2965,8 @@ impl D4c {
         if self.delete_chat.as_ref().is_some_and(|(k, _)| k == key) {
             self.delete_chat = None;
         }
+        self.queued_messages
+            .remove(&(self.url.clone(), key.to_owned()));
         self.draft_queue.forget(key);
         let rev = self
             .desktops
@@ -2712,6 +2979,7 @@ impl D4c {
             json!({"kind":"draft","id":key,"expectedRevision":rev,"value":{"text":""}}),
         );
         self.sessions.retain(|(k, _)| k != key);
+        self.tabs.remove(&session_tabs::TabId::new(&self.url, key));
         self.session_settings.remove(key);
         self.questions.forget_session(key);
         self.drafts.remove(key);
@@ -2726,6 +2994,7 @@ impl D4c {
         if self.session == key {
             if let Some((next, _)) = self.sessions.first().cloned() {
                 self.select_session_impl(next, true, false);
+                self.tabs.open(self.active_tab());
             } else {
                 self.select_session_impl(format!("draft:{}", uuid::Uuid::new_v4()), false, false);
             }
@@ -2776,7 +3045,6 @@ impl D4c {
 
     fn send(&mut self, ctx: &egui::Context) {
         if !self.connected
-            || self.running
             || self
                 .reload_request
                 .as_ref()
@@ -2789,6 +3057,16 @@ impl D4c {
         }
         if self.permission_request.is_some() {
             return;
+        }
+        if self.input.split_whitespace().next() == Some("/compact") {
+            if self.input.trim() != "/compact" || !self.attachments.is_empty() {
+                self.composer_error = "Use /compact on its own, without attachments".into();
+                return;
+            }
+            if uuid::Uuid::parse_str(&self.session).is_err() {
+                self.composer_error = "Send a message before compacting this chat".into();
+                return;
+            }
         }
         let text = std::mem::take(&mut self.input);
         let mut words = text.split_whitespace();
@@ -2809,13 +3087,76 @@ impl D4c {
         if self.desktops.slash(&text, &self.session, &self.url, ctx) {
             return;
         }
+        let draft = Draft {
+            input: text,
+            attachments: std::mem::take(&mut self.attachments),
+        };
+        let key = (self.url.clone(), self.session.clone());
+        if self.running
+            || self.active_sessions.contains(&self.session)
+            || self.queued_messages.contains_key(&key)
+        {
+            self.queued_messages
+                .entry(key)
+                .or_default()
+                .push_back(draft);
+            return;
+        }
+        self.send_message(draft);
+    }
+
+    fn flush_queued_message(&mut self) {
+        if self.queued_messages.is_empty()
+            || self.running
+            || !self.connected
+            || self.history_loading
+            || self.active_sessions.contains(&self.session)
+            || self.reload_request.is_some()
+            || self.permission_request.is_some()
+        {
+            return;
+        }
+        let key = (self.url.clone(), self.session.clone());
+        if let Some(queue) = self.queued_messages.get_mut(&key) {
+            let draft = queue.pop_front();
+            if queue.is_empty() {
+                self.queued_messages.remove(&key);
+            }
+            if let Some(draft) = draft {
+                self.send_message(draft);
+            }
+        }
+    }
+
+    fn send_message(&mut self, draft: Draft) {
+        let Draft {
+            input: text,
+            attachments,
+        } = draft;
         // Ignore any background tail snapshot requested before this send.
         self.history_request = None;
         self.history_dirty = true;
+        if text.trim() == "/compact" {
+            let params = json!({"sessionKey":self.session});
+            if let Some(id) = self.rpc("chat.compact", params.clone()) {
+                self.sent_requests.insert(id, params);
+                self.running = true;
+                self.active_sessions.insert(self.session.clone());
+                self.status = "Compacting context…".into();
+                self.composer_error.clear();
+                self.slash_dismissed = false;
+                self.slash_selected = 0;
+            } else {
+                if self.input.is_empty() {
+                    self.input = text;
+                }
+                self.composer_error = "Disconnected before compacting".into();
+            }
+            return;
+        }
         let send_identity = uuid::Uuid::new_v4().to_string();
         self.messages.push(ChatMessage {
-            media: self
-                .attachments
+            media: attachments
                 .iter()
                 .map(|(n, m, b)| media::Attachment::new(n.clone(), m.clone(), b.clone()))
                 .collect(),
@@ -2823,7 +3164,7 @@ impl D4c {
             text: text.clone(),
             item_id: Some(format!("local:{send_identity}")),
         });
-        let attachments: Vec<_> = self.attachments.drain(..).map(|(name, mime, bytes)| {
+        let attachments: Vec<_> = attachments.into_iter().map(|(name, mime, bytes)| {
             let kind = if mime.starts_with("image/") { "image" } else { "file" };
             json!({"type":kind,"fileName":name,"mimeType":mime,"content":base64::engine::general_purpose::STANDARD.encode(bytes)})
         }).collect();
@@ -2846,6 +3187,7 @@ impl D4c {
         } else if !self.dispatch_send(params) {
             return;
         }
+        self.tabs.open(self.active_tab());
         self.running = true;
         self.active_sessions.insert(self.session.clone());
         self.live
@@ -2943,17 +3285,11 @@ fn message_text(v: &Value) -> String {
 impl eframe::App for D4c {
     #[cfg(target_os = "android")]
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        media::reset();
-        let _ = self.save_server_drafts();
-        self.servers.select(&self.url, &self.session);
-        self.servers.save();
+        self.save_on_exit();
     }
     #[cfg(not(target_os = "android"))]
     fn on_exit(&mut self) {
-        media::reset();
-        let _ = self.save_server_drafts();
-        self.servers.select(&self.url, &self.session);
-        self.servers.save();
+        self.save_on_exit();
     }
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         #[cfg(target_os = "android")]
@@ -2988,10 +3324,57 @@ impl eframe::App for D4c {
                 })
             });
         }
+        self.save_layout(false);
+        self.save_tab_layout();
     }
 }
 impl D4c {
+    fn save_on_exit(&mut self) {
+        media::reset();
+        self.save_layout(true);
+        self.save_tab_layout();
+        self.restore_pending_sends();
+        let _ = self.save_server_drafts();
+        self.servers.select(&self.url, &self.session);
+        self.servers.save();
+    }
+
+    fn save_tab_layout(&mut self) {
+        if let Err(error) = self.tabs.save(&self.active_tab()) {
+            eprintln!("Could not save session tabs: {error}");
+        }
+    }
+
+    fn save_layout(&mut self, force: bool) {
+        self.desktops.save_layout(force);
+        let compact = self.compact_previous;
+        let previous = self.preferences.sidebar_open(compact);
+        if previous != self.sidebar_open {
+            self.preferences.set_sidebar_open(compact, self.sidebar_open);
+            if let Err(error) = self.preferences.save() {
+                self.preferences.set_sidebar_open(compact, previous);
+                eprintln!("Could not save sidebar layout: {error}");
+            }
+        }
+    }
+
     fn load_media(&mut self) {
+        self.media_requests
+            .retain(|_, (session, artifact, offset, started)| {
+                if started.elapsed() < std::time::Duration::from_secs(45) {
+                    return true;
+                }
+                if session == &self.session {
+                    for media in self.messages.iter_mut().flat_map(|m| &mut m.media) {
+                        if media.artifact.as_ref() == Some(artifact)
+                            && media.pending_offset() == Some(*offset)
+                        {
+                            media.download_failed("Attachment download timed out");
+                        }
+                    }
+                }
+                false
+            });
         if !self.connected {
             return;
         }
@@ -3002,23 +3385,30 @@ impl D4c {
             }
             if let Some(id) = media.artifact.as_ref()
                 && self.media_requests.len() + requests.len() < 4
-                && media.wants_download()
+                && let Some(offset) = media.download_offset()
                 && !self
                     .media_requests
                     .values()
-                    .any(|(s, a)| s == &self.session && a == id)
-                && !requests.contains(id)
+                    .any(|(s, a, ..)| s == &self.session && a == id)
+                && !requests.iter().any(|(artifact, _)| artifact == id)
             {
-                requests.push(id.clone());
+                requests.push((id.clone(), offset));
             }
         }
-        for artifact in requests {
+        for (artifact, offset) in requests {
             if let Some(id) = self.rpc(
                 "artifacts.download",
-                json!({"sessionKey":self.session,"artifactId":artifact}),
+                json!({"sessionKey":self.session,"artifactId":artifact,"offset":offset}),
             ) {
-                self.media_requests
-                    .insert(id, (self.session.clone(), artifact));
+                self.media_requests.insert(
+                    id,
+                    (
+                        self.session.clone(),
+                        artifact,
+                        offset,
+                        std::time::Instant::now(),
+                    ),
+                );
             }
         }
     }
@@ -3109,6 +3499,20 @@ impl D4c {
                 self.slash_selected = 0;
             }
         }
+        self.ssh.poll(ui.ctx());
+        let ssh_connections: Vec<_> = self.ssh.chat_connections().collect();
+        for connection in &ssh_connections {
+            if let Some(link) = self.ssh.take_chat(&connection.url) {
+                if self.url == connection.url {
+                    self.gateway = Some(link);
+                    self.connected = false;
+                    self.status = "Connecting…".into();
+                } else {
+                    self.servers
+                        .park(&connection.url, link, None, false, "Connecting…");
+                }
+            }
+        }
         self.events(ui.ctx());
         self.servers.update_active(
             &self.url,
@@ -3117,8 +3521,12 @@ impl D4c {
             self.connected,
             &self.status,
         );
-        self.servers
-            .poll(&self.preferences.connections, &self.url, ui.ctx());
+        self.servers.poll(
+            &self.preferences.connections,
+            &self.ssh,
+            &self.url,
+            ui.ctx(),
+        );
         self.reconcile_history();
         self.desktops.poll_ui(ui.ctx());
         self.sync_workspace();
@@ -3130,6 +3538,9 @@ impl D4c {
         }
         self.poll_upload();
         self.load_media();
+        if !self.media_requests.is_empty() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
         #[cfg(target_os = "android")]
         if let Some(session) = android_notifications::take_session() {
             self.select_session(session, true);
@@ -3159,8 +3570,12 @@ impl D4c {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_secs(1));
         let compact = ui.ctx().content_rect().width() < 640.0;
-        if compact && !self.compact_previous {
-            self.sidebar_open = false;
+        let mobile = matches!(
+            ui.ctx().os(),
+            egui::os::OperatingSystem::Android | egui::os::OperatingSystem::IOS
+        );
+        if compact != self.compact_previous {
+            self.sidebar_open = self.preferences.sidebar_open(compact);
         }
         self.compact_previous = compact;
         let dropped = ui.ctx().input(|i| i.raw.dropped_files.clone());
@@ -3173,6 +3588,29 @@ impl D4c {
                 ),
             ));
         }
+        let toggle_sidebar = !self.dialog_open()
+            && !media::is_fullscreen()
+            && ui.input_mut(|input| {
+                let mut toggle = false;
+                input.events.retain(|event| match event {
+                    egui::Event::Key {
+                        key: egui::Key::B,
+                        pressed: true,
+                        repeat,
+                        modifiers,
+                        ..
+                    } if modifiers.ctrl
+                        && !modifiers.shift
+                        && !modifiers.alt
+                        && !modifiers.mac_cmd =>
+                    {
+                        toggle |= !repeat;
+                        false
+                    }
+                    _ => true,
+                });
+                toggle
+            });
         egui::Panel::top("top_bar")
             .exact_size(52.0)
             .frame(
@@ -3189,8 +3627,9 @@ impl D4c {
                     };
                     if ui
                         .add(egui::Button::new(icon_text(icon, 20.0)).frame(false))
-                        .on_hover_text("Toggle sidebar")
+                        .on_hover_text("Toggle left sidebar (Ctrl+B)")
                         .clicked()
+                        || toggle_sidebar
                     {
                         self.sidebar_open = !self.sidebar_open;
                         if compact {
@@ -3198,23 +3637,73 @@ impl D4c {
                             self.notifications_open = false;
                         }
                     }
-                    let status_width = 112.0;
-                    let (title_rect, title_response) = ui.allocate_exact_size(
-                        egui::vec2((ui.available_width() - status_width).max(24.0), 36.0),
-                        egui::Sense::hover(),
-                    );
-                    paint_ellipsis(
-                        ui,
-                        title_rect,
-                        if self.settings_open {
+                    let title_width = (ui.available_width() - 112.0).max(24.0);
+                    if compact || mobile || self.tabs.is_empty() {
+                        let (title_rect, title_response) = ui.allocate_exact_size(
+                            egui::vec2(title_width, 36.0),
+                            egui::Sense::hover(),
+                        );
+                        let title = if self.settings_open {
                             "Settings"
                         } else {
                             self.chat_title()
-                        },
-                        15.0,
-                        ui.visuals().text_color(),
-                    );
-                    title_response.on_hover_text(self.chat_title());
+                        };
+                        paint_ellipsis(ui, title_rect, title, 15.0, ui.visuals().text_color());
+                        title_response.on_hover_text(title);
+                    } else {
+                        let active = self.active_tab();
+                        let action = ui
+                            .allocate_ui_with_layout(
+                                egui::vec2(title_width, 36.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.set_width(title_width);
+                                    self.tabs.ui(ui, &active, |id| {
+                                        let title = if id.url == self.url {
+                                            self.sessions
+                                                .iter()
+                                                .find(|(key, _)| key == &id.session)
+                                                .map(|(_, title)| title.as_str())
+                                                .or_else(|| {
+                                                    self.fallback_titles
+                                                        .get(&id.session)
+                                                        .map(String::as_str)
+                                                })
+                                        } else {
+                                            None
+                                        };
+                                        let title = title.or_else(|| {
+                                            self.servers
+                                                .rows
+                                                .get(&id.url)
+                                                .and_then(|row| {
+                                                    row.sessions
+                                                        .iter()
+                                                        .find(|session| session.key == id.session)
+                                                })
+                                                .map(|session| session.title.as_str())
+                                        });
+                                        let server = self
+                                            .preferences
+                                            .connections
+                                            .iter()
+                                            .find(|connection| connection.url == id.url)
+                                            .map(|connection| connection.name.as_str());
+                                        (title, server)
+                                    })
+                                },
+                            )
+                            .inner;
+                        if let Some(action) = action {
+                            match action {
+                                session_tabs::Action::Select(id) => {
+                                    self.select_tab(&id, ui.ctx());
+                                }
+                                session_tabs::Action::Close(id) => self.close_tab(&id, ui.ctx()),
+                            }
+                            ui.ctx().request_repaint();
+                        }
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add(
@@ -3286,7 +3775,8 @@ impl D4c {
             ui.memory_mut(|memory| memory.request_focus(egui::Id::new("sidebar-search-input")));
         }
         let mut sidebar_open = self.sidebar_open;
-        egui::Panel::left("sidebar")
+        let showing_compact_sidebar = compact && sidebar_open;
+        let sidebar = egui::Panel::left("sidebar")
             .exact_size(sidebar_width)
             .resizable(false)
             .frame(
@@ -3294,177 +3784,175 @@ impl D4c {
                     .fill(egui::Color32::from_rgb(25, 26, 30))
                     .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 49, 54)))
                     .inner_margin(egui::Margin::same(16)),
-            )
-            .show_collapsible(ui, &mut sidebar_open, |ui| {
-                sidebar_search(ui, &mut self.session_search);
-                ui.add_space(8.0);
-                let query = self.session_search.trim().to_lowercase();
-                let mut matches = 0;
-                let list_height = (ui.available_height() - 56.0).max(20.0);
-                egui::ScrollArea::vertical()
-                    .max_height(list_height)
-                    .min_scrolled_height(0.0)
-                    .id_salt("chats")
-                    .show(ui, |ui| {
-                        let mut selected: Option<(usize, Option<String>)> = None;
-                        let mut rename = None;
-                        let mut delete = None;
-                        let connections = self.preferences.connections.clone();
-                        for (server_index, connection) in connections.iter().enumerate() {
-                            let current = connection.url == self.url;
-                            let Some(row) = self.servers.rows.get(&connection.url) else {
-                                continue;
-                            };
-                            let online = row.online;
-                            let expanded = row.expanded || !self.session_search.is_empty();
-                            let status = row.status.clone();
-                            let sessions = row.sessions.clone();
-                            let matching = sessions
-                                .iter()
-                                .filter(|s| {
-                                    self.session_search.is_empty()
-                                        || s.title.to_lowercase().contains(&query)
-                                })
-                                .count();
-                            if !query.is_empty()
-                                && matching == 0
-                                && !connection.name.to_lowercase().contains(&query)
-                            {
-                                continue;
-                            }
-                            let (toggle, new_chat) = ui
-                                .push_id(&connection.url, |ui| {
-                                    server_row(
-                                        ui,
-                                        &connection.name,
-                                        online,
-                                        current,
-                                        expanded,
-                                        &status,
-                                    )
-                                })
-                                .inner;
-                            if new_chat {
-                                selected = Some((server_index, None));
-                            }
-                            if toggle {
-                                self.servers.toggle(&connection.url);
-                            }
-                            if expanded {
-                                ui.indent(("server_chats", &connection.url), |ui| {
-                                    for session in &sessions {
-                                        if !query.is_empty()
-                                            && !session.title.to_lowercase().contains(&query)
-                                            && !connection.name.to_lowercase().contains(&query)
-                                        {
-                                            continue;
-                                        }
-                                        matches += 1;
-                                        ui.push_id((&connection.url, &session.key), |ui| {
-                                            if current {
-                                                let count = self.center.unread(Some(&session.key))
-                                                    + self.questions.pending_count(&session.key);
-                                                let (click, edit, remove) = chat_row(
-                                                    ui,
-                                                    &session.key,
-                                                    &session.title,
-                                                    self.session == session.key,
-                                                    count,
-                                                    session.running,
-                                                    true,
-                                                );
-                                                if click {
-                                                    selected = Some((
-                                                        server_index,
-                                                        Some(session.key.clone()),
-                                                    ));
-                                                }
-                                                if edit {
-                                                    rename = Some((
-                                                        session.key.clone(),
-                                                        session.title.clone(),
-                                                    ));
-                                                }
-                                                if remove {
-                                                    delete = Some((
-                                                        session.key.clone(),
-                                                        session.title.clone(),
-                                                    ));
-                                                }
-                                            } else {
-                                                let (click, _, _) = chat_row(
-                                                    ui,
-                                                    &session.key,
-                                                    &session.title,
-                                                    false,
-                                                    0,
-                                                    session.running,
-                                                    false,
-                                                );
-                                                if click {
-                                                    selected = Some((
-                                                        server_index,
-                                                        Some(session.key.clone()),
-                                                    ));
-                                                }
+            );
+        let sidebar_contents = |ui: &mut egui::Ui| {
+            sidebar_search(ui, &mut self.session_search);
+            ui.add_space(8.0);
+            let query = self.session_search.trim().to_lowercase();
+            let mut matches = 0;
+            let list_height = (ui.available_height() - 56.0).max(20.0);
+            egui::ScrollArea::vertical()
+                .max_height(list_height)
+                .min_scrolled_height(0.0)
+                .id_salt("chats")
+                .show(ui, |ui| {
+                    matches += self.ssh.rows_ui(ui, &query);
+                    let mut selected: Option<(String, Option<String>)> = None;
+                    let mut rename = None;
+                    let mut delete = None;
+                    let connections = self.preferences.connections.clone();
+                    for connection in connections.iter().chain(&ssh_connections) {
+                        if connection.url.is_empty() {
+                            continue;
+                        }
+                        let current = connection.url == self.url;
+                        let Some(row) = self.servers.rows.get(&connection.url) else {
+                            continue;
+                        };
+                        let online = row.online;
+                        let expanded = row.expanded || !self.session_search.is_empty();
+                        let status = row.status.clone();
+                        let sessions = row.sessions.clone();
+                        let matching = sessions
+                            .iter()
+                            .filter(|s| {
+                                self.session_search.is_empty()
+                                    || s.title.to_lowercase().contains(&query)
+                            })
+                            .count();
+                        if !query.is_empty()
+                            && matching == 0
+                            && !connection.name.to_lowercase().contains(&query)
+                        {
+                            continue;
+                        }
+                        let (toggle, new_chat) = ui
+                            .push_id(&connection.url, |ui| {
+                                server_row(ui, &connection.name, online, current, expanded, &status)
+                            })
+                            .inner;
+                        if new_chat {
+                            selected = Some((connection.url.clone(), None));
+                        }
+                        if toggle {
+                            self.servers.toggle(&connection.url);
+                        }
+                        if expanded {
+                            ui.indent(("server_chats", &connection.url), |ui| {
+                                for session in &sessions {
+                                    if !query.is_empty()
+                                        && !session.title.to_lowercase().contains(&query)
+                                        && !connection.name.to_lowercase().contains(&query)
+                                    {
+                                        continue;
+                                    }
+                                    matches += 1;
+                                    ui.push_id((&connection.url, &session.key), |ui| {
+                                        if current {
+                                            let count = self.center.unread(Some(&session.key))
+                                                + self.questions.pending_count(&session.key);
+                                            let (click, edit, remove) = chat_row(
+                                                ui,
+                                                &session.key,
+                                                &session.title,
+                                                self.session == session.key,
+                                                count,
+                                                session.running,
+                                                true,
+                                            );
+                                            if click {
+                                                selected = Some((
+                                                    connection.url.clone(),
+                                                    Some(session.key.clone()),
+                                                ));
                                             }
-                                        });
-                                        ui.add_space(2.0);
-                                    }
-                                    if sessions.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new(if online {
-                                                "No chats"
-                                            } else {
-                                                "Offline"
-                                            })
-                                            .small()
-                                            .weak(),
-                                        );
-                                    }
-                                });
-                            }
-                            ui.add_space(8.0);
+                                            if edit {
+                                                rename = Some((
+                                                    session.key.clone(),
+                                                    session.title.clone(),
+                                                ));
+                                            }
+                                            if remove {
+                                                delete = Some((
+                                                    session.key.clone(),
+                                                    session.title.clone(),
+                                                ));
+                                            }
+                                        } else {
+                                            let (click, _, _) = chat_row(
+                                                ui,
+                                                &session.key,
+                                                &session.title,
+                                                false,
+                                                0,
+                                                session.running,
+                                                false,
+                                            );
+                                            if click {
+                                                selected = Some((
+                                                    connection.url.clone(),
+                                                    Some(session.key.clone()),
+                                                ));
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(2.0);
+                                }
+                                if sessions.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(if online {
+                                            "No chats"
+                                        } else {
+                                            "Offline"
+                                        })
+                                        .small()
+                                        .weak(),
+                                    );
+                                }
+                            });
                         }
-                        if let Some((index, key)) = selected {
-                            let load = key.is_some();
-                            let target =
-                                key.unwrap_or_else(|| format!("draft:{}", uuid::Uuid::new_v4()));
-                            if index == self.preferences.selected {
-                                self.select_session(target, load);
-                            } else {
-                                self.switch_to(index, ui.ctx(), Some(target));
-                            }
-                            if compact {
-                                self.sidebar_open = false;
-                            }
-                        }
-                        if let Some(value) = rename {
-                            self.rename = Some(value);
-                            self.rename_error.clear();
-                        }
-                        if let Some(value) = delete {
-                            if self.delete_pending.is_none() {
-                                self.delete_chat = Some(value);
-                                self.delete_error.clear();
-                            }
-                        }
-                        if matches == 0 && !query.is_empty() {
-                            ui.weak("No matching chats");
-                        }
-                    });
-                ui.add_space((ui.available_height() - 44.0).max(0.0));
-                ui.separator();
-                if navigation_footer(ui).clicked() {
-                    self.settings_open = true;
-                    self.notifications_open = false;
-                    self.workspace_open = false;
-                    if compact {
-                        self.sidebar_open = false;
+                        ui.add_space(8.0);
                     }
+                    if let Some((url, key)) = selected {
+                        let target =
+                            key.unwrap_or_else(|| format!("draft:{}", uuid::Uuid::new_v4()));
+                        self.switch_to_url(&url, ui.ctx(), Some(target));
+                        if compact {
+                            self.sidebar_open = false;
+                        }
+                    }
+                    if let Some(value) = rename {
+                        self.rename = Some(value);
+                        self.rename_error.clear();
+                    }
+                    if let Some(value) = delete {
+                        if self.delete_pending.is_none() {
+                            self.delete_chat = Some(value);
+                            self.delete_error.clear();
+                        }
+                    }
+                    if matches == 0 && !query.is_empty() {
+                        ui.weak("No matching servers or chats");
+                    }
+                });
+            ui.add_space((ui.available_height() - 44.0).max(0.0));
+            ui.separator();
+            if navigation_footer(ui).clicked() {
+                self.settings_open = true;
+                self.notifications_open = false;
+                self.workspace_open = false;
+                if compact {
+                    self.sidebar_open = false;
                 }
-            });
-        if self.sidebar_open != sidebar_open && !compact {
+            }
+        };
+        // On compact screens the sidebar replaces the transcript for the entire frame.
+        if showing_compact_sidebar {
+            sidebar.show(ui, sidebar_contents);
+        } else if compact {
+            ui.skip_ahead_auto_ids(1);
+        } else {
+            sidebar.show_collapsible(ui, &mut sidebar_open, sidebar_contents);
             self.sidebar_open = sidebar_open;
         }
 
@@ -3494,6 +3982,12 @@ impl D4c {
                     self.notification_ui(ui);
                 });
         }
+        let dock_width = if self.settings_open || showing_compact_sidebar {
+            None
+        } else {
+            desktops::Desktops::dock_width(ui)
+        };
+        let desktop_docked = self.desktops.viewer_dock_ui(ui, dock_width);
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -3501,7 +3995,7 @@ impl D4c {
                     .inner_margin(egui::Margin::same(if compact { 12 } else { 20 })),
             )
             .show(ui, |ui| {
-                if compact && self.sidebar_open {
+                if showing_compact_sidebar {
                     return;
                 }
                 if self.notifications_open && compact {
@@ -3557,9 +4051,11 @@ impl D4c {
                                 if self.messages.is_empty() { loading_conversation(ui); }
                                 else { loading_bar(ui, 160.0_f32.min(ui.available_width()), 5.0); }
                             }
+                            let message_ids = self.messages.iter().filter_map(|m| m.item_id.as_deref()).collect();
+                            let mut cards = self.questions.cards_by_anchor(&self.session, &message_ids);
                             if self.messages.is_empty()
                                 && !self.history_loading
-                                && !self.questions.has_session(&self.session)
+                                && cards.is_empty()
                             {
                                 ui.add_space((ui.available_height() * 0.25).max(24.0));
                                 ui.vertical_centered(|ui| {
@@ -3570,8 +4066,6 @@ impl D4c {
                                     });
                                 });
                             }
-                            let message_ids = self.messages.iter().filter_map(|m| m.item_id.as_deref()).collect();
-                            let mut cards = self.questions.cards_by_anchor(&self.session, &message_ids);
                             let mut replies = Vec::new();
                             let mut index = 0;
                             while index < self.messages.len() {
@@ -3688,7 +4182,9 @@ impl D4c {
                 self.sidebar_open = false;
             }
         }
-        self.desktops.viewer_ui(ui.ctx());
+        if !desktop_docked {
+            self.desktops.viewer_ui(ui.ctx(), dock_width.is_some());
+        }
         media::finish_frame(ui.ctx());
         self.dialogs_ui(ui.ctx(), compact);
         self.cron.flush(self.gateway.as_ref());
@@ -3732,6 +4228,8 @@ fn message_bubble(
         message.text.clone()
     };
     let outgoing = message.role == "user";
+    let show_select =
+        ui.ctx().os() == egui::os::OperatingSystem::Android && !display_text.is_empty();
     let tool = message
         .item_id
         .as_deref()
@@ -3756,9 +4254,14 @@ fn message_bubble(
             .map(|line| line.chars().take(120).count())
             .max()
             .unwrap_or(0);
-        (longest as f32 * 8.0 + 32.0)
-            .max(if outgoing { 104.0 } else { 128.0 })
-            .min(max_width)
+        // Android's message header also needs room for the Select button.
+        let min_width = match (outgoing, show_select) {
+            (true, true) => 144.0,
+            (false, true) => 176.0,
+            (true, false) => 104.0,
+            (false, false) => 128.0,
+        };
+        (longest as f32 * 8.0 + 32.0).max(min_width).min(max_width)
     };
     ui.allocate_ui_with_layout(
         egui::vec2(available, 0.0),
@@ -3838,7 +4341,7 @@ fn message_bubble(
                             } else {
                                 lucide_icons::Icon::Bot
                             };
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 let color = if message.role == "error" {
                                     egui::Color32::from_rgb(235, 164, 157)
                                 } else if outgoing {
@@ -3848,6 +4351,15 @@ fn message_bubble(
                                 };
                                 ui.label(icon_text(icon, 12.0).color(color));
                                 ui.label(egui::RichText::new(title).size(11.0).color(color));
+                                if show_select
+                                    && ui
+                                        .small_button("Select")
+                                        .on_hover_text("Select or copy message")
+                                        .clicked()
+                                {
+                                    #[cfg(target_os = "android")]
+                                    android_text::select_message(display_text.to_string());
+                                }
                             });
                             ui.add_space(3.0);
                             for media in &message.media {
@@ -4411,6 +4923,35 @@ mod composer_tests {
         app.events(&egui::Context::default());
     }
     #[test]
+    fn compact_dispatches_without_a_user_message_and_recovers_from_start_failure() {
+        let mut app = D4c::default();
+        app.session = uuid::Uuid::new_v4().to_string();
+        app.connected = true;
+        app.input = "/compact ".into();
+        let (out, requests) = std::sync::mpsc::channel();
+        let (_events, input) = std::sync::mpsc::channel();
+        app.gateway = Some(gateway::test_gateway(out, input));
+
+        app.send(&egui::Context::default());
+        let req = requests.try_recv().unwrap();
+        assert_eq!(req["method"], "chat.compact");
+        assert_eq!(req["params"], json!({"sessionKey":app.session}));
+        assert!(app.messages.is_empty());
+        assert!(app.running);
+
+        inject(
+            &mut app,
+            gateway::Event::Data(json!({
+                "type":"res","id":req["id"],"ok":false,"error":{"message":"Thread is busy"}
+            })),
+        );
+        assert!(!app.running);
+        assert!(!app.active_sessions.contains(&app.session));
+        assert_eq!(app.composer_error, "Thread is busy");
+        assert!(app.messages.is_empty());
+    }
+
+    #[test]
     fn canonical_assistant_event_does_not_duplicate_streamed_answer() {
         for canonical_first in [true, false] {
             let mut app = D4c::default();
@@ -4607,6 +5148,188 @@ mod composer_tests {
         assert!(app.gateway.is_none());
     }
     #[test]
+    fn ctrl_b_toggles_left_sidebar_once_per_press() {
+        let mut app = D4c::default();
+        app.preferences.connections.clear();
+        app.settings_open = false;
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "lucide".into(),
+            egui::FontData::from_static(lucide_icons::LUCIDE_FONT_BYTES).into(),
+        );
+        fonts.families.insert(
+            egui::FontFamily::Name("lucide".into()),
+            vec!["lucide".into()],
+        );
+        ctx.set_fonts(fonts);
+        let mut frame = |pressed, modifiers| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::B,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| app.render_ui(ui))
+                .textures_delta
+                .clear();
+            app.sidebar_open
+        };
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        assert!(frame(true, egui::Modifiers::NONE));
+        assert!(frame(false, egui::Modifiers::NONE));
+        assert!(frame(true, ctrl | egui::Modifiers::SHIFT));
+        assert!(frame(false, ctrl | egui::Modifiers::SHIFT));
+        assert!(!frame(true, ctrl));
+        assert!(!frame(true, ctrl));
+        assert!(!frame(false, ctrl));
+        assert!(frame(true, ctrl));
+    }
+
+    #[test]
+    fn compact_transcript_keeps_text_inside_viewport() {
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "lucide".into(),
+            egui::FontData::from_static(lucide_icons::LUCIDE_FONT_BYTES).into(),
+        );
+        fonts.families.insert(
+            egui::FontFamily::Name("lucide".into()),
+            vec!["lucide".into()],
+        );
+        let mut app = D4c::default();
+        app.connected = true;
+        app.session = "chat".into();
+        app.preferences.connections.clear();
+        app.settings_open = false;
+        app.sessions = vec![
+            ("chat".into(), "Active chat".into()),
+            ("other".into(), "Other tab".into()),
+        ];
+        app.tabs.open(app.active_tab());
+        app.tabs.open(session_tabs::TabId::new(&app.url, "other"));
+        for (role, id, body) in [
+            ("assistant", "message:0", r#"Podman runs the desktop and publishes its local VNC port. **D4C connects to that port** to show the screen and send input. For direct shell access, use `podman exec -it d4c-00000000-0000-0000-0000-000000000000 bash`."#.into()),
+            ("user", "message:1", "I mean which is its default".into()),
+            ("assistant", "message:2", "I’ll check the default for a new Bot Screen separately from the current container.".into()),
+            ("commandExecution", "tool:3", "tool output".into()),
+            ("assistant", "message:4", format!("The default is Arch Linux.\n\n| Name | Image |\n| --- | --- |\n| Arch | `{}` |", "registry/".repeat(30))),
+            ("user", "message:5", "Why not".into()),
+            ("assistant", "message:6", "The last reply should fit, even when a short message and its Select button appear above a paragraph that wraps across several lines.".into()),
+        ] {
+            app.messages.push(ChatMessage {
+                role: role.into(),
+                item_id: Some(id.into()),
+                text: body,
+                media: vec![],
+            });
+        }
+        let expected = [
+            "podman exec -it",
+            "I mean which is its default",
+            "I’ll check",
+            "Activity",
+            "The default is Arch Linux.",
+            "Why not",
+            "The last reply should fit",
+        ];
+        use egui::os::OperatingSystem::{Android, Nix};
+        for (width, density, os, sidebar_open, chat_visible, tabs_visible) in [
+            (360.0, 3.0, Android, false, true, false),
+            (320.0, 2.75, Nix, false, true, false),
+            (768.0, 1.0, Nix, true, true, true),
+            (768.0, 2.75, Android, false, true, false),
+            (320.0, 3.0, Android, true, false, false),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.set_os(os);
+            shadcn_egui::Theme::vega().apply_with_fonts(&ctx, fonts.clone());
+            app.compact_previous = width < 640.0;
+            app.sidebar_open = sidebar_open;
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 1300.0),
+                )),
+                ..Default::default()
+            };
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .native_pixels_per_point = Some(density);
+            ctx.run_ui(input.clone(), |ui| app.render_ui(ui))
+                .textures_delta
+                .clear();
+            app.restore_scroll = Some(0.0);
+            let mut output = ctx.run_ui(input, |ui| app.render_ui(ui));
+            output.textures_delta.clear();
+            let mut visible = std::collections::HashSet::new();
+            let mut bubbles = 0;
+            let mut header_labels = Vec::new();
+            for egui::epaint::ClippedShape {
+                clip_rect, shape, ..
+            } in output.shapes
+            {
+                if let egui::Shape::Rect(rect) = &shape
+                    && [
+                        egui::Color32::from_rgb(28, 66, 61),
+                        egui::Color32::from_rgb(33, 35, 41),
+                    ]
+                    .contains(&rect.fill)
+                {
+                    bubbles += 1;
+                    assert!(
+                        rect.rect.left() >= 11.0 && rect.rect.right() <= width - 11.0,
+                        "{width} pt: message bubble {:?} is wider than its column",
+                        rect.rect,
+                    );
+                }
+                let egui::Shape::Text(text) = shape else {
+                    continue;
+                };
+                let content = &text.galley.job.text;
+                if text.pos.y < 36.0 {
+                    header_labels.push(content.clone());
+                }
+                for label in expected.iter().filter(|label| content.contains(**label)) {
+                    visible.insert(*label);
+                    let left = text.pos.x;
+                    let right = left + text.galley.size().x;
+                    assert!(
+                        left >= clip_rect.left() && right <= clip_rect.right().min(width),
+                        "{width} pt: {content:?} at {left}..{right} is clipped by {clip_rect:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                visible.len(),
+                if chat_visible { expected.len() } else { 0 },
+                "{width} pt at {density}x: rendered {visible:?}",
+            );
+            assert_eq!(bubbles, if chat_visible { 6 } else { 0 });
+            assert!(header_labels.iter().any(|label| label == "Active chat"));
+            assert_eq!(
+                header_labels.iter().any(|label| label == "Other tab"),
+                tabs_visible,
+                "unexpected tab visibility at {width} pt on {os:?}: {header_labels:?}",
+            );
+        }
+    }
+
+    #[test]
     fn skeleton_fits_mobile_and_desktop() {
         for width in [320.0, 390.0, 768.0, 1440.0] {
             for height in [160.0, 780.0] {
@@ -4782,6 +5505,7 @@ mod composer_tests {
     #[test]
     fn server_reset_discards_previous_server_content() {
         let mut app = D4c::default();
+        app.preferences = preferences::Settings::default();
         app.preferences.connections.push(preferences::Connection {
             name: "Other".into(),
             url: "wss://other.example".into(),
@@ -4805,6 +5529,30 @@ mod composer_tests {
         assert_ne!(app.session, old);
         assert_eq!(app.url, "wss://other.example");
         assert_eq!(app.token, "explicit-token-for-new-server");
+    }
+    #[test]
+    fn busy_chat_queues_followups_in_order() {
+        let mut app = D4c::default();
+        app.connected = true;
+        app.history_loading = false;
+        app.running = true;
+        app.sessions.push((app.session.clone(), "Test".into()));
+        let (_, rx) = std::sync::mpsc::channel();
+        let (out, requests) = std::sync::mpsc::channel();
+        app.gateway = Some(gateway::test_gateway(out, rx));
+        for message in ["first", "second"] {
+            app.input = message.into();
+            app.send(&egui::Context::default());
+        }
+        assert!(requests.try_recv().is_err());
+        for message in ["first", "second"] {
+            app.running = false;
+            app.active_sessions.clear();
+            app.flush_queued_message();
+            assert_eq!(requests.try_recv().unwrap()["params"]["message"], message);
+            app.flush_queued_message();
+            assert!(requests.try_recv().is_err());
+        }
     }
     #[test]
     fn hidden_compact_chat_is_not_visible() {
@@ -4942,5 +5690,62 @@ mod recovery_tests {
                 .any(|m| m.item_id.as_deref() == Some("tool:call-1"))
         );
         assert!(app.live.contains_key(&app.session));
+    }
+}
+
+#[cfg(test)]
+mod session_tab_tests {
+    use super::*;
+    use session_tabs::TabId;
+
+    #[test]
+    fn selection_opens_tabs_once_and_closing_preserves_the_chat_and_draft() {
+        let mut app = D4c {
+            url: "wss://work.example".into(),
+            sessions: vec![
+                ("first".into(), "First".into()),
+                ("second".into(), "Second".into()),
+            ],
+            ..Default::default()
+        };
+        let first = TabId::new(&app.url, "first");
+        let second = TabId::new(&app.url, "second");
+        app.select_session(first.session.clone(), true);
+        app.input = "unfinished".into();
+        app.select_session(second.session.clone(), true);
+        app.select_session(first.session.clone(), true);
+        assert_eq!(app.tabs.ids().collect::<Vec<_>>(), [&first, &second]);
+
+        let ctx = egui::Context::default();
+        app.close_tab(&first, &ctx);
+        assert_eq!(app.session, second.session);
+        assert_eq!(app.tabs.ids().collect::<Vec<_>>(), [&second]);
+        assert!(app.sessions.iter().any(|(key, _)| key == &first.session));
+
+        app.close_tab(&second, &ctx);
+        assert!(app.session.starts_with("draft:"));
+        assert_eq!(app.tabs.ids().count(), 0);
+        app.select_session(first.session, true);
+        assert_eq!(app.input, "unfinished");
+    }
+
+    #[test]
+    fn draft_promotion_keeps_its_tab_without_merging_same_keys_on_other_servers() {
+        let mut app = D4c {
+            url: "wss://work.example".into(),
+            ..Default::default()
+        };
+        let remote = TabId::new("wss://doom.example", "draft:one");
+        app.tabs.open(remote.clone());
+        app.select_session("draft:one".into(), false);
+        app.history_initialized = true;
+        let ctx = egui::Context::default();
+        app.select_tab(&TabId::new(&app.url, "draft:one"), &ctx);
+        assert!(app.history_initialized);
+        let canonical = uuid::Uuid::new_v4().to_string();
+        app.adopt_session("draft:one", &canonical);
+        let promoted = TabId::new(&app.url, &canonical);
+        assert_eq!(app.tabs.ids().collect::<Vec<_>>(), [&remote, &promoted]);
+        assert_eq!(app.session, canonical);
     }
 }

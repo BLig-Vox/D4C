@@ -4,8 +4,62 @@ pub type UploadResult = Result<Vec<Attachment>, String>;
 pub const FILE_LIMIT: usize = 6_000_000;
 pub const TOTAL_LIMIT: usize = 12_000_000;
 
+#[cfg(all(test, not(target_os = "android")))]
+mod clipboard_tests {
+    #[test]
+    fn clipboard_rgba_becomes_a_png_attachment() {
+        let file = super::clipboard_image_attachment(1, 1, vec![255, 0, 0, 255]).unwrap();
+        assert_eq!(file.1, "image/png");
+        let decoded = image::load_from_memory(&file.2).unwrap().to_rgba8();
+        assert_eq!(decoded.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn malformed_clipboard_pixels_are_rejected() {
+        assert!(super::clipboard_image_attachment(2, 2, vec![0; 4]).is_err());
+    }
+}
+
 pub fn load(paths: Vec<PathBuf>, ctx: eframe::egui::Context) -> mpsc::Receiver<UploadResult> {
     spawn(ctx, move || read_files(paths))
+}
+#[cfg(not(target_os = "android"))]
+pub fn paste_image(
+    image: std::sync::Arc<eframe::egui::ColorImage>,
+    ctx: eframe::egui::Context,
+) -> mpsc::Receiver<UploadResult> {
+    spawn(ctx, move || {
+        let [width, height] = image.size;
+        if width.checked_mul(height).filter(|n| *n <= 32_000_000) != Some(image.pixels.len()) {
+            return Err("Clipboard image is too large or invalid".into());
+        }
+        let pixels = image
+            .pixels
+            .iter()
+            .flat_map(|p| p.to_srgba_unmultiplied())
+            .collect();
+        Ok(vec![clipboard_image_attachment(width, height, pixels)?])
+    })
+}
+#[cfg(not(target_os = "android"))]
+fn clipboard_image_attachment(
+    width: usize,
+    height: usize,
+    pixels: Vec<u8>,
+) -> Result<Attachment, String> {
+    let width = u32::try_from(width).map_err(|_| "Invalid image dimensions")?;
+    let height = u32::try_from(height).map_err(|_| "Invalid image dimensions")?;
+    let image =
+        image::RgbaImage::from_raw(width, height, pixels).ok_or("Invalid clipboard image")?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|e| format!("Could not attach clipboard image: {e}"))?;
+    let bytes = png.into_inner();
+    if bytes.len() > FILE_LIMIT {
+        return Err("Attachment limit: 6 MB per file".into());
+    }
+    Ok(("Pasted image.png".into(), "image/png".into(), bytes))
 }
 #[cfg(target_os = "android")]
 pub fn pick(ctx: eframe::egui::Context) -> mpsc::Receiver<UploadResult> {

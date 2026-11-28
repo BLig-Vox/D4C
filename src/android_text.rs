@@ -40,6 +40,7 @@ pub fn detach() {
     *DESIRED.lock().unwrap() = None;
     *LAST.lock().unwrap() = None;
     *EDIT.lock().unwrap() = None;
+    SERVER_FORM.lock().unwrap().take();
     VISIBLE_BOTTOM.store(0, Ordering::Release);
     set_modal_visible(false);
     take_modal_back();
@@ -259,10 +260,10 @@ pub fn flush_platform_commands(ctx: &egui::Context) {
         let mut texts = Vec::new();
         output.commands.retain(|command| {
             if let egui::OutputCommand::CopyText(text) = command {
-                texts.push((false, text.clone()));
+                texts.push((TextAction::Copy, text.clone()));
                 false
             } else if let egui::OutputCommand::OpenUrl(link) = command {
-                texts.push((true, link.url.clone()));
+                texts.push((TextAction::Link, link.url.clone()));
                 false
             } else {
                 true
@@ -270,34 +271,48 @@ pub fn flush_platform_commands(ctx: &egui::Context) {
         });
         texts
     });
+    for (action, text) in texts {
+        run_text_action(action, text);
+    }
+}
+
+enum TextAction {
+    Copy,
+    Link,
+    Select,
+}
+
+pub fn select_message(text: String) {
+    run_text_action(TextAction::Select, text);
+}
+
+fn run_text_action(action: TextAction, text: String) {
     let Some(app) = crate::platform::android_app() else {
         return;
     };
-    for (is_link, text) in texts {
-        let activity_app = app.clone();
-        app.run_on_java_main_thread(Box::new(move || {
-            let vm = unsafe { jni::JavaVM::from_raw(activity_app.vm_as_ptr().cast()) };
-            let result = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
-                let raw = activity_app.activity_as_ptr() as jni::sys::jobject;
-                let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw)? };
-                let text = env.new_string(&text)?;
-                env.call_method(
-                    activity.as_ref(),
-                    if is_link {
-                        jni_str!("openChatLink")
-                    } else {
-                        jni_str!("copyText")
-                    },
-                    jni_sig!("(Ljava/lang/String;)V"),
-                    &[JValue::Object(&text)],
-                )?;
-                Ok(())
-            });
-            if let Err(error) = result {
-                eprintln!("D4C Android platform action: {error}");
-            }
-        }));
-    }
+    let activity_app = app.clone();
+    app.run_on_java_main_thread(Box::new(move || {
+        let vm = unsafe { jni::JavaVM::from_raw(activity_app.vm_as_ptr().cast()) };
+        let result = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+            let raw = activity_app.activity_as_ptr() as jni::sys::jobject;
+            let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw)? };
+            let text = env.new_string(&text)?;
+            env.call_method(
+                activity.as_ref(),
+                match action {
+                    TextAction::Link => jni_str!("openChatLink"),
+                    TextAction::Copy => jni_str!("copyText"),
+                    TextAction::Select => jni_str!("selectMessage"),
+                },
+                jni_sig!("(Ljava/lang/String;)V"),
+                &[JValue::Object(&text)],
+            )?;
+            Ok(())
+        });
+        if let Err(error) = result {
+            eprintln!("D4C Android platform action: {error}");
+        }
+    }));
 }
 
 #[unsafe(no_mangle)]
@@ -327,4 +342,56 @@ pub extern "system" fn Java_site_blig_d4c_D4cActivity_dismissChatOverlay(
         wake();
     }
     consume.into()
+}
+
+static SERVER_FORM: Mutex<Option<(String, String)>> = Mutex::new(None);
+pub fn take_server_form() -> Option<(String, String)> {
+    SERVER_FORM.lock().ok()?.take()
+}
+pub fn open_settings_action(form: Option<(String, String)>) {
+    let Some(app) = crate::platform::android_app() else {
+        return;
+    };
+    let activity_app = app.clone();
+    app.run_on_java_main_thread(Box::new(move || {
+        let vm = unsafe { jni::JavaVM::from_raw(activity_app.vm_as_ptr().cast()) };
+        if let Err(e) = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+            let raw = activity_app.activity_as_ptr() as jni::sys::jobject;
+            let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw)? };
+            let Some((name, url)) = form else {
+                env.call_method(
+                    activity.as_ref(),
+                    jni_str!("openSystemUpdate"),
+                    jni_sig!("()V"),
+                    &[],
+                )?;
+                return Ok(());
+            };
+            let name = env.new_string(name)?;
+            let url = env.new_string(url)?;
+            env.call_method(
+                activity.as_ref(),
+                jni_str!("openServerForm"),
+                jni_sig!("(Ljava/lang/String;Ljava/lang/String;)V"),
+                &[JValue::Object(&name), JValue::Object(&url)],
+            )?;
+            Ok(())
+        }) {
+            eprintln!("Android server form: {e}");
+        }
+    }));
+}
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_site_blig_d4c_D4cActivity_saveServerForm<'a>(
+    mut env: jni::EnvUnowned<'a>,
+    _this: JObject<'a>,
+    name: JString<'a>,
+    url: JString<'a>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        *SERVER_FORM.lock().unwrap() = Some((name.try_to_string(env)?, url.try_to_string(env)?));
+        wake();
+        Ok(())
+    })
+    .resolve::<jni::errors::ThrowRuntimeExAndDefault>();
 }

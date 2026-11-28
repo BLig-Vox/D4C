@@ -2,11 +2,11 @@
 
 # D4C
 
-**Give Codex a desktop on your own server.** Chat from Linux or Android, watch it work live, and take over from your phone.
+**Give Codex a desktop on your own server.** Chat from Linux, Windows, or Android, watch it work live, and take over from your phone.
 
 D4C is a native Rust client for Codex App Server. Follow tool calls as they happen, schedule recurring tasks, and switch between servers from one sidebar. Your sessions stay on the server, so you can start a task on your laptop, close the app, and pick it up on Android.
 
-**Alpha software.** Downloads are available for Linux x86_64 and Android arm64.
+Downloads are available for Android arm64, Linux x86_64, and Windows x86_64.
 
 ## Watch Codex use its desktop
 
@@ -18,16 +18,24 @@ Each D4C desktop has its own Linux home directory and graphical session. Codex c
 
 ## Get started
 
-1. Install the D4C manager and Codex CLI on your host, then sign in to Codex under the service account. Follow the [host setup below](#host-setup-from-codex-to-tailscale).
-2. Download the Android arm64 APK or Linux x86_64 archive from [Releases](https://github.com/BLig-Vox/D4C/releases).
+1. Install the D4C manager and Codex CLI on your host, then sign in to Codex under the service account. Follow the [server installation guide](INSTALL.md).
+2. Download the Android arm64 APK, Linux x86_64 archive, or Windows x86_64 ZIP from [Releases](https://github.com/BLig-Vox/D4C/releases).
 3. In **Settings → Add server**, enter the server name and private WSS URL. Existing installations keep their saved server addresses.
 4. On a new device, compare its displayed fingerprint and approve the matching ID on the server using `d4c-server --approve DEVICE_ID`.
 
 Select a chat under its server in the sidebar. Returning to a visited server reuses a healthy chat connection and fetches recent history. **Settings → Workspace server** sets an optional endpoint for desks and drafts. The default uses the same hostname on port 8443.
 
+On Linux x86_64, with GStreamer installed, you can install the prebuilt client without compiling using [cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
+
+```sh
+cargo binstall --git https://github.com/BLig-Vox/D4C.git --version 0.1.2 vox-d4c
+```
+
+On Windows, extract the entire ZIP and run `bin\vox-d4c.exe`. On desktop, open **Settings → System update** to check Stable or Alpha releases for your platform. **Download** opens the matching archive in your browser. Close D4C and extract the new package to upgrade.
+
 ## Host setup from Codex to Tailscale
 
-One Linux host runs one D4C manager and one persistent Codex app server. A phone or Linux client opens a private WebSocket to the manager over Tailscale. The manager authenticates the device and forwards chat to Codex over a local Unix socket. The host keeps the threads, scheduled jobs and desktop environments when a client closes. Repeat the setup on each host you want in the sidebar.
+One Linux host runs one D4C manager and one persistent Codex app server. A phone or desktop client opens a private WebSocket to the manager over Tailscale. The manager authenticates the device and forwards chat to Codex over a local Unix socket. The host keeps the threads, scheduled jobs and desktop environments when a client closes. Repeat the setup on each host you want in the sidebar.
 
 **Choose the right starting point.** The steps below assume a fresh host. For an existing native Codex installation with missing chat images, skip to [upgrading the manager](#upgrade-the-manager-and-verify-chat-images). To import conversations from an older installation, follow the snapshot and import steps in the [migration guide](docs/setup.md) **before** creating the Codex workspace.
 
@@ -134,7 +142,7 @@ sudo -u d4c /usr/local/bin/d4c-server --config /etc/d4c/manager.json --list-devi
 sudo -u d4c /usr/local/bin/d4c-server --config /etc/d4c/manager.json --approve DEVICE_ID
 ```
 
-**Tailnet membership provides connectivity. D4C pairing grants access to a specific host.** Pair the phone and Linux app individually on every server they use. Switching between already-paired servers reuses the saved identities. Clearing client storage can create a new device fingerprint.
+**Tailnet membership provides connectivity. D4C pairing grants access to a specific host.** Pair the phone and desktop app individually on every server they use. Switching between already-paired servers reuses the saved identities. Clearing client storage can create a new device fingerprint.
 
 | Endpoint on the manager | Purpose |
 | --- | --- |
@@ -179,6 +187,8 @@ The last command checks the **running process**. For this release it should prin
 After the alpha.14 server rollout, the Linux client on Tusk recovered an earlier desktop screenshot after reconnecting and opened a newly generated apple image. Doom’s manager version and service health were also checked. The visual test covered Tusk on Linux. For attachments above the manager’s 6 MB per-file limit, retry with a smaller image.
 
 **Existing chats missing `share_media`.** Codex saves a tool list with each conversation. If a new chat can send a PNG but an older one only displays its server path, check whether the installed Codex unit has the tool refresh hook with `systemctl cat d4c-codex`. In builds with `--refresh-codex-tools`, the hook updates older conversations before Codex opens their transcripts. Install the matching unit and manager together, then restart Codex between turns. The original alpha.14 release archive predates this hook. [Service setup](docs/setup.md#set-up-the-working-directory-ponytail-and-authentication)
+
+**Media links in Codex replies.** When `share_media` is unavailable, save the image or video in the current server thread’s export folder, `$CODEX_HOME/workspace/d4c-media/<thread-id>/`. Add `MEDIA: Demo video.mp4` in its own paragraph or use a Markdown link to the absolute file with the `sandbox:` prefix. The updated server and client display the attachment in live replies and when you reopen the chat. The fallback reads files up to 6 MB from that thread’s export folder.
 
 ### Connection troubleshooting
 

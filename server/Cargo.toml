@@ -1,6 +1,6 @@
 [package]
 name = "vox-d4c-server"
-version = "0.1.0-alpha.14"
+version = "0.1.2-alpha.2"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Blig-Vox/D4C"
@@ -16,7 +16,9 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 base64 = "0.22"
 sha2 = "0.10"
+pulldown-cmark = { version = "0.13", default-features = false }
+percent-encoding = "2"
 flate2 = "1"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 libc="0.2"

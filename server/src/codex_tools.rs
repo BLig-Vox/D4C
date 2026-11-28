@@ -1,5 +1,6 @@
 //! Native Codex dynamic tools for this conversation's desktop and scheduled tasks.
 use crate::{manager::Manager, mcp};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::{
@@ -23,7 +24,7 @@ fn namespace_spec() -> Value {
             "limit":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0}
         },"required":["action"],"additionalProperties":false}
     }));
-    tools.push(json!({"name":"share_media","description":"Send an image or video in this chat. First call without arguments to get this chat’s export directory. Save or copy a PNG, JPEG, GIF, WebP, MP4, MKV, MOV or WebM there (up to 6 MB), then call with its filename.","inputSchema":{"type":"object","properties":{"filename":{"type":"string"}},"additionalProperties":false}}));
+    tools.push(json!({"name":"share_media","description":"Send an image or video in this chat. First call without arguments to get this chat’s export directory. Save or copy a PNG, JPEG, GIF, WebP, MP4, MKV, MOV or WebM there (up to 6 MB), then call with its filename. If sending fails after the file is saved, put MEDIA: followed by the filename in a separate paragraph of your reply.","inputSchema":{"type":"object","properties":{"filename":{"type":"string"}},"additionalProperties":false}}));
     for tool in &mut tools {
         tool["type"] = json!("function");
     }
@@ -95,10 +96,36 @@ fn execute(manager: &Manager, thread: &str, tool: &str, args: &Value) -> Result<
                 let data = part["data"]
                     .as_str()
                     .ok_or("Screenshot is missing image data")?;
-                let mime = part["mimeType"].as_str().unwrap_or("image/png");
-                items.push(
-                    json!({"type":"inputImage","imageUrl":format!("data:{mime};base64,{data}")}),
-                );
+                let bytes = STANDARD.decode(data).map_err(|e| e.to_string())?;
+                let stored = crate::transport::store_attachment(
+                    &manager.runtime.root.join("uploads"),
+                    &json!({"name":"Screenshot.png","data":data}),
+                )?;
+                let path = Path::new(stored["path"].as_str().ok_or("Missing screenshot path")?);
+                let key = path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|v| v.to_str())
+                    .ok_or("Invalid screenshot path")?;
+                let original = json!({"type":"image","artifactId":format!("upload/{key}/Screenshot.png"),"fileName":"Screenshot.png","mimeType":"image/png"});
+                let frame = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+                    .map_err(|e| e.to_string())?;
+                let mut preview = Vec::new();
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut preview, 70)
+                    .encode_image(&frame.to_rgb8())
+                    .map_err(|e| e.to_string())?;
+                let view_path = if preview.len() < bytes.len() {
+                    let preview_path = path.with_file_name("Preview.jpg");
+                    fs::write(&preview_path, preview).map_err(|e| e.to_string())?;
+                    preview_path
+                } else {
+                    path.to_owned()
+                };
+                items.push(json!({"type":"inputText","text":json!({
+                    "d4cScreenshot":original,
+                    "path":view_path,
+                    "instruction":"Inspect this capture with native view_image using path. In Code Mode, forward its image_url with image()."
+                }).to_string()}));
             }
             Some("text") => items.push(json!({"type":"inputText","text":part["text"]})),
             _ => return Err("Unsupported desktop result".into()),

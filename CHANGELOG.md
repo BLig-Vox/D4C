@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.2
+
+- Connect to Lovetrain servers over SSH and sign in to Codex per server.
+- Keep chat tabs on desktop; use the sidebar on mobile and in narrow windows.
+- Restore each chat’s BotScreen layout when it reopens.
+- Ship Android arm64, Linux x86_64, and Windows x86_64 client packages. Linux x86_64 also supports installing the prebuilt client with cargo-binstall.
+
+## 0.1.2-alpha.12
+
+- Restore the left sidebar and per-chat BotScreen layout when D4C reopens.
+- Start the right dock at 75% width on wide screens and drag its divider to resize it.
+- Use the compact BotScreen toolbar and press Ctrl+B to toggle the left sidebar.
+## 0.1.2-alpha.3
+
+- Organize Settings into Connections, System update, and Notifications with a layout that adapts to the window width.
+- Check stable or alpha GitHub releases from the Linux and Windows desktop clients and download the matching package.
+- Add a portable Windows x86_64 client with GStreamer for chat video playback.
+
+## 0.1.2-alpha.2
+
+- Play videos and view images exported by Codex from the live conversation and chat history. Update both the app and its server to use this feature.
+- Add an installation guide for Linux servers and for connecting from Windows.
+
+## 0.1.2-alpha.1
+
+- Open composer image previews and keep fullscreen images visible on narrow and wide screens. Paste images directly on Linux.
+- Queue follow-up messages and attachments during a reply. Queues send in order when their chat is open and are cleared when the app exits.
+- Retry interrupted gateway connections sooner.
+- Count running virtual desktops separately from the host screen and report missing container images.
+
 ## 0.1.0-alpha.14
 
 - Align Markdown bullets with the first line of wrapped list items.

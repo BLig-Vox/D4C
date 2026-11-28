@@ -39,7 +39,19 @@ pub fn parse(payload: &Value) -> Vec<Command> {
             })
         })
         .collect();
-    commands.retain(|c| !matches!(c.token.as_str(), "/permission" | "/permissions"));
+    commands.retain(|c| {
+        !matches!(
+            c.token.as_str(),
+            "/compact" | "/permission" | "/permissions"
+        )
+    });
+    commands.push(Command {
+        token: "/compact".into(),
+        description: "Compact the Codex context for this chat".into(),
+        source: "native".into(),
+        aliases: vec![],
+        args: vec![],
+    });
     commands.push(Command {
         token: "/permissions".into(),
         description: "Change this chat’s permissions".into(),
@@ -156,6 +168,14 @@ mod tests {
             {"name":"think","args":[{"name":"level","choices":[{"value":"medium","label":"Balanced"},"high"]}]}
         ]}))
     }
+    #[test]
+    fn compact_is_available_without_skill_discovery() {
+        let matches = suggestions(&parse(&Value::Null), "/comp");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].replacement, "/compact ");
+        assert!(!matches[0].skill);
+    }
+
     #[test]
     fn discovers_skills_and_aliases() {
         assert_eq!(suggestions(&catalog(), "/m")[0].replacement, "/model ");

@@ -3,7 +3,7 @@ use crate::{gateway, preferences};
 use eframe::egui;
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     time::{Duration, Instant},
 };
 #[derive(Clone)]
@@ -12,12 +12,21 @@ pub struct Session {
     pub title: String,
     pub running: bool,
 }
+#[derive(Default)]
+pub struct BackgroundSends {
+    pub pending: HashMap<String, Value>,
+    pub sent: HashMap<String, Value>,
+    pub failed: Vec<Value>,
+    pub rekeys: HashMap<String, String>,
+}
+
 pub struct Server {
     pub sessions: Vec<Session>,
     pub expanded: bool,
     pub online: bool,
     pub status: String,
     pub selected: Option<String>,
+    pub sends: BackgroundSends,
     link: Option<gateway::Gateway>,
     pub workspace: Option<crate::workspace::Workspace>,
     media_token: Option<String>,
@@ -31,6 +40,7 @@ impl Default for Server {
             online: false,
             status: "Connecting…".into(),
             selected: None,
+            sends: BackgroundSends::default(),
             link: None,
             workspace: None,
             media_token: None,
@@ -38,6 +48,60 @@ impl Default for Server {
         }
     }
 }
+impl Server {
+    fn handle_send_event(&mut self, value: &Value) {
+        if value["event"] == "session.created" {
+            let payload = &value["payload"];
+            if let (Some(old), Some(new)) = (
+                payload["previousKey"].as_str(),
+                payload["sessionKey"].as_str(),
+            ) && old.starts_with("draft:")
+                && uuid::Uuid::parse_str(new).is_ok()
+            {
+                self.sends.rekeys.insert(old.into(), new.into());
+                for params in self
+                    .sends
+                    .pending
+                    .values_mut()
+                    .chain(self.sends.sent.values_mut())
+                    .chain(self.sends.failed.iter_mut())
+                {
+                    if params["sessionKey"] == old {
+                        params["sessionKey"] = json!(new);
+                    }
+                }
+            }
+            return;
+        }
+        if value["type"] != "res" {
+            return;
+        }
+        let Some(id) = value["id"].as_str() else {
+            return;
+        };
+        if let Some(params) = self.sends.sent.remove(id)
+            && value["ok"] == false
+        {
+            self.sends.failed.push(params);
+        }
+        let Some(params) = self.sends.pending.remove(id) else {
+            return;
+        };
+        if value["ok"] == true
+            && let Some(link) = &self.link
+        {
+            let request = gateway::rpc("chat.send", params.clone());
+            if let Some(id) = request["id"].as_str().map(str::to_owned)
+                && link.tx.send(request).is_ok()
+            {
+                self.sends.sent.insert(id, params);
+                return;
+            }
+        }
+        self.sends.failed.push(params);
+    }
+}
+
 pub struct Catalogs {
     pub rows: BTreeMap<String, Server>,
     dirty: bool,
@@ -126,24 +190,32 @@ impl Catalogs {
     pub fn poll(
         &mut self,
         connections: &[preferences::Connection],
+        ssh: &crate::ssh::Servers,
         active: &str,
         ctx: &egui::Context,
     ) {
-        self.rows
-            .retain(|url, _| connections.iter().any(|connection| &connection.url == url));
-        for connection in connections {
-            let row = self.rows.entry(connection.url.clone()).or_default();
-            if connection.url == active {
+        self.rows.retain(|url, _| {
+            connections.iter().any(|connection| &connection.url == url) || ssh.is_connected(url)
+        });
+        let urls: Vec<_> = connections
+            .iter()
+            .map(|c| c.url.clone())
+            .chain(
+                self.rows
+                    .keys()
+                    .filter(|url| crate::ssh::is_chat_id(url))
+                    .cloned(),
+            )
+            .collect();
+        for url in urls {
+            let row = self.rows.entry(url.clone()).or_default();
+            if url == active {
                 row.link = None;
                 row.media_token = None;
                 continue;
             }
-            if row.link.is_none() {
-                row.link = Some(gateway::connect(
-                    connection.url.clone(),
-                    String::new(),
-                    ctx.clone(),
-                ));
+            if row.link.is_none() && !crate::ssh::is_chat_id(&url) {
+                row.link = Some(gateway::connect(url, String::new(), ctx.clone()));
             }
             if let Some(workspace) = &mut row.workspace {
                 workspace.poll();
@@ -162,6 +234,9 @@ impl Catalogs {
                 .as_ref()
                 .map(|link| link.rx.try_iter().take(32).collect())
                 .unwrap_or_default();
+            if events.len() == 32 {
+                ctx.request_repaint();
+            }
             for event in events {
                 match event {
                     gateway::Event::Status(status) => {
@@ -175,10 +250,15 @@ impl Catalogs {
                         row.status = status;
                     }
                     gateway::Event::Error(error) => {
+                        row.sends
+                            .failed
+                            .extend(row.sends.pending.drain().map(|(_, params)| params));
+                        row.sends.sent.clear();
                         row.online = false;
                         row.status = error;
                     }
                     gateway::Event::Data(value) => {
+                        row.handle_send_event(&value);
                         if value["id"] == "connect" && value["ok"] == true {
                             row.media_token = value["payload"]["auth"]["deviceToken"]
                                 .as_str()
@@ -250,7 +330,7 @@ impl Catalogs {
         self.dirty = true;
     }
     pub fn save(&mut self) {
-        let value: Vec<_> = self.rows.iter().map(|(url,row)| json!({"url":url,"expanded":row.expanded,"selected":row.selected,
+        let value: Vec<_> = self.rows.iter().filter(|(url, _)| preferences::valid_url(url)).map(|(url,row)| json!({"url":url,"expanded":row.expanded,"selected":row.selected,
             "sessions":row.sessions.iter().map(|s|json!({"key":s.key,"title":s.title,"hasActiveRun":s.running})).collect::<Vec<_>>()})).collect();
         if preferences::write("server-catalogs.json", &json!(value)).is_ok() {
             self.dirty = false;
@@ -263,6 +343,34 @@ impl Catalogs {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn parked_server_finishes_a_send_after_its_model_update() {
+        let (tx, commands) = mpsc::channel();
+        let (_events, incoming) = mpsc::channel();
+        let mut row = Server {
+            link: Some(gateway::test_gateway(tx, incoming)),
+            ..Server::default()
+        };
+        let params = json!({"sessionKey":"draft:example","message":"hello","idempotencyKey":"one"});
+        row.sends.pending.insert("patch".into(), params.clone());
+        row.handle_send_event(&json!({"type":"res","id":"patch","ok":true}));
+        let request = commands.try_recv().unwrap();
+        assert_eq!(request["method"], "chat.send");
+        assert_eq!(request["params"], params);
+
+        let native = "180ba31c-7508-43c8-86a7-c97193470b33";
+        row.handle_send_event(&json!({"event":"session.created","payload":{
+            "previousKey":"draft:example","sessionKey":native
+        }}));
+        row.handle_send_event(&json!({"type":"res","id":request["id"],"ok":false}));
+        assert_eq!(row.sends.failed.len(), 1);
+        assert_eq!(row.sends.failed[0]["sessionKey"], native);
+        assert_eq!(row.sends.failed[0]["idempotencyKey"], "one");
+        assert!(row.sends.pending.is_empty());
+        assert!(row.sends.sent.is_empty());
+        assert!(commands.try_recv().is_err());
+    }
 
     #[test]
     fn first_visit_promotes_the_background_socket_even_during_handshake() {

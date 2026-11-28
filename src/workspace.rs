@@ -13,10 +13,13 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
 pub(crate) type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
+const IDLE_READ_TIMEOUT: Duration = Duration::from_millis(100);
+const CONTROL_READ_TIMEOUT: Duration = Duration::from_millis(8);
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 pub enum Event {
     Data(Value),
     Status(String),
@@ -166,7 +169,7 @@ pub(crate) fn open(url: &str) -> Result<Socket, String> {
         return Err("Workspace authentication rejected".into());
     }
     if let Some(s) = tcp(&mut socket) {
-        let _ = s.set_read_timeout(Some(Duration::from_millis(100)));
+        let _ = s.set_read_timeout(Some(IDLE_READ_TIMEOUT));
     }
     Ok(socket)
 }
@@ -210,11 +213,17 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
             );
             let result = (|| -> Result<(), String> {
                 let mut socket = open(&url)?;
+                let idle_timeout = if desktop.is_some() {
+                    IDLE_READ_TIMEOUT
+                } else {
+                    CONTROL_READ_TIMEOUT
+                };
+                let mut read_timeout = IDLE_READ_TIMEOUT;
                 connected.store(true, Ordering::Relaxed);
                 emit(Event::Status("Online".into()));
                 let mut decoder = None;
                 let mut compressed = false;
-                let mut last_frame = std::time::Instant::now();
+                let mut last_frame = None;
                 let mut pending = false;
                 let mut last_received = std::time::Instant::now();
                 let mut last_ping = std::time::Instant::now();
@@ -248,6 +257,19 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
                         crate::wire::send(&mut socket, Message::Text(req.to_string().into()))
                             .map_err(|e| e.to_string())?;
                     }
+                    // If a frame arrived before the repaint interval elapsed, wake
+                    // at its deadline even if the upstream desktop becomes idle.
+                    let next_timeout = pending_frame_delay(pending, last_frame, Instant::now())
+                        .map(|delay| delay.max(Duration::from_millis(1)))
+                        .unwrap_or(idle_timeout);
+                    if next_timeout != read_timeout {
+                        if let Some(stream) = tcp(&mut socket) {
+                            stream
+                                .set_read_timeout(Some(next_timeout))
+                                .map_err(|e| e.to_string())?;
+                        }
+                        read_timeout = next_timeout;
+                    }
                     let incoming = socket.read();
                     if incoming.is_ok() {
                         last_received = std::time::Instant::now();
@@ -256,6 +278,8 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
                         Ok(Message::Text(t)) => {
                             let v: Value = serde_json::from_str(&t).map_err(|e| e.to_string())?;
                             if v["type"] == "framebuffer" {
+                                pending = false;
+                                last_frame = None;
                                 compressed =
                                     v["transport"].as_str() == Some(crate::desktop_wire::NAME);
                                 decoder = Some(
@@ -307,11 +331,13 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
                         Err(e) if transient(&e) => {}
                         Err(e) => return Err(e.to_string()),
                     }
-                    if pending && last_frame.elapsed() >= Duration::from_millis(33) {
+                    if pending_frame_delay(pending, last_frame, Instant::now())
+                        == Some(Duration::ZERO)
+                    {
                         if let Some(d) = decoder.as_ref() {
                             if emit(Event::Frame(d.width, d.height, d.rgba.clone())) {
                                 pending = false;
-                                last_frame = std::time::Instant::now();
+                                last_frame = Some(Instant::now());
                             }
                         }
                     }
@@ -358,6 +384,18 @@ pub fn connect(base: String, desktop: Option<String>, ctx: egui::Context) -> Lin
         online,
         reconnect,
     }
+}
+
+fn pending_frame_delay(
+    pending: bool,
+    last_frame: Option<Instant>,
+    now: Instant,
+) -> Option<Duration> {
+    pending.then(|| {
+        last_frame.map_or(Duration::ZERO, |last| {
+            (last + FRAME_INTERVAL).saturating_duration_since(now)
+        })
+    })
 }
 #[derive(Default)]
 pub struct Workspace {
@@ -545,6 +583,21 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn trailing_desktop_frame_has_a_repaint_deadline() {
+        let now = Instant::now();
+        assert_eq!(pending_frame_delay(false, None, now), None);
+        assert_eq!(pending_frame_delay(true, None, now), Some(Duration::ZERO));
+        assert_eq!(
+            pending_frame_delay(true, Some(now), now + Duration::from_millis(10)),
+            Some(Duration::from_millis(6))
+        );
+        assert_eq!(
+            pending_frame_delay(true, Some(now), now + Duration::from_millis(16)),
+            Some(Duration::ZERO)
+        );
+    }
+
     #[test]
     fn snapshot_restores_server_workspace() {
         let mut w = Workspace::default();

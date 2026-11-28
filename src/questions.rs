@@ -6,6 +6,14 @@ use shadcn_egui::components::{
     card::{Card, CardSize, card_title},
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+fn is_active(record: &Value) -> bool {
+    record["status"] == "pending"
+        && record["expiresAtMs"]
+            .as_u64()
+            .is_none_or(|t| t > crate::activity::now())
+}
+
 #[derive(Default)]
 pub struct Questions {
     records: Vec<Value>,
@@ -18,19 +26,10 @@ pub struct Questions {
     markdown: egui_commonmark::CommonMarkCache,
 }
 impl Questions {
-    pub fn has_session(&self, session: &str) -> bool {
-        self.records.iter().any(|r| r["sessionKey"] == session)
-    }
     pub fn pending_count(&self, session: &str) -> usize {
         self.records
             .iter()
-            .filter(|r| {
-                r["sessionKey"] == session
-                    && r["status"] == "pending"
-                    && r["expiresAtMs"]
-                        .as_u64()
-                        .is_none_or(|t| t > crate::activity::now())
-            })
+            .filter(|r| r["sessionKey"] == session && is_active(r))
             .count()
     }
     #[cfg(test)]
@@ -176,6 +175,9 @@ impl Questions {
                     message_ids.get(saved.as_str())
                 })
                 .copied();
+            if anchor.is_none() && record["approval"] == true && !is_active(record) {
+                continue;
+            }
             by_anchor.entry(anchor).or_default().push(record.clone());
         }
         by_anchor
@@ -190,6 +192,21 @@ impl Questions {
         let mut requests = Vec::new();
         for record in cards {
             let id = record["id"].as_str().unwrap_or_default();
+            if record["approval"] == true && !is_active(&record) {
+                let label = match record["status"].as_str() {
+                    Some("answered") => "Approval answered",
+                    Some("cancelled") => "Approval cancelled",
+                    Some("pending") => "Approval expired",
+                    _ => "Approval closed",
+                };
+                egui::CollapsingHeader::new(label)
+                    .id_salt(("approval_history", id))
+                    .show(ui, |ui| {
+                        self.card(ui, &record, connected);
+                    });
+                ui.add_space(8.0);
+                continue;
+            }
             let reply = ui
                 .push_id(("decision", id), |ui| self.card(ui, &record, connected))
                 .inner;
@@ -246,10 +263,7 @@ impl Questions {
     fn card(&mut self, ui: &mut egui::Ui, r: &Value, connected: bool) -> Option<bool> {
         let id = r["id"].as_str().unwrap_or_default();
         let status = r["status"].as_str().unwrap_or_default();
-        let expired = r["expiresAtMs"]
-            .as_u64()
-            .is_some_and(|t| t <= crate::activity::now());
-        let active = status == "pending" && !expired;
+        let active = is_active(r);
         let waiting = self.pending.values().any(|key| key == id);
         let enabled = connected && self.hydrated && !waiting;
         let questions = r["questions"].as_array()?;
@@ -258,7 +272,7 @@ impl Questions {
             let title = match status {
                 "answered" => "You answered",
                 "cancelled" => "Cancelled",
-                "pending" if expired => "Request expired",
+                "pending" if !active => "Request expired",
                 "pending" if r["approval"] == true => "Approval requested",
                 "pending" => "Your choice",
                 _ => "Request closed",
@@ -461,7 +475,7 @@ mod tests {
         q.observe(&request());
         assert_eq!(q.pending_count("chat-a"), 1);
         assert_eq!(q.pending_count("chat-b"), 0);
-        assert!(!q.has_session("chat-b"));
+        assert!(q.cards_by_anchor("chat-b", &HashSet::new()).is_empty());
         q.observe(&json!({"event":"question.resolved","payload":{"id":"q1","status":"answered","answers":{"answers":{"q":["Yes"]}}}}));
         assert_eq!(q.pending_count("chat-a"), 0);
         assert_eq!(q.records[0]["answers"]["answers"]["q"][0], "Yes");
@@ -487,7 +501,21 @@ mod tests {
         q.observe(
             &json!({"type":"res","id":"question.list:1","ok":true,"payload":{"questions":[]}}),
         );
-        assert!(!q.has_session("chat-a"));
+        assert!(q.cards_by_anchor("chat-a", &HashSet::new()).is_empty());
+    }
+    #[test]
+    fn settled_approvals_only_appear_with_a_transcript_anchor() {
+        let mut q = Questions::default();
+        let mut event = request();
+        event["payload"]["approval"] = true.into();
+        event["payload"]["itemId"] = "command-1".into();
+        q.observe(&event);
+        assert_eq!(q.cards_by_anchor("chat-a", &HashSet::new())[&None].len(), 1);
+
+        q.observe(&json!({"event":"question.resolved","payload":{"id":"q1","status":"answered"}}));
+        assert!(q.cards_by_anchor("chat-a", &HashSet::new()).is_empty());
+        let ids = HashSet::from(["tool:command-1"]);
+        assert_eq!(q.cards_by_anchor("chat-a", &ids)[&Some("tool:command-1")].len(), 1);
     }
     #[test]
     fn acknowledged_choice_survives_replay_and_reconnect() {

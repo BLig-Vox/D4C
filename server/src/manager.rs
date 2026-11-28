@@ -162,18 +162,6 @@ impl Manager {
                 if d["rev"].as_u64() != Some(revision(p)?) {
                     return Err("conflict".into());
                 }
-                if method == "desktop.start"
-                    && db
-                        .list("desktop")?
-                        .iter()
-                        .filter(|d| {
-                            d["deleted"] != true && d["id"] != id && d["desired"] == "running"
-                        })
-                        .count()
-                        >= 2
-                {
-                    return Err("Two desktops are already running. Stop one first.".into());
-                }
                 if method == "desktop.delete" && p["confirm"] != true {
                     return Err(
                         "Deletion confirmation required; persistent files will be retained".into(),
@@ -371,7 +359,7 @@ impl Manager {
         d["lastError"] = Value::Null;
         let saved = (|| {
             let mut db = self.db.lock().map_err(|_| "Database unavailable")?;
-            if action == "start"
+            if action == "start" && !crate::runtime::host_desktop(&id)
                 && db
                     .list("desktop")?
                     .iter()
@@ -379,6 +367,8 @@ impl Manager {
                         other["deleted"] != true
                             && other["id"] != id
                             && other["desired"] == "running"
+                            && other["status"] != "error"
+                            && !other["id"].as_str().is_some_and(crate::runtime::host_desktop)
                     })
                     .count()
                     >= 2

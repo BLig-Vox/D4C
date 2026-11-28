@@ -1,11 +1,13 @@
 use crate::{
     auth,
     manager::{Actor, Manager},
+    rfb,
     store::Result,
 };
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     fs,
     io::{self, BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
@@ -304,6 +306,7 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
         cfg.max_message_size = Some(16 << 20);
     });
     let mut heartbeat = Heartbeat::new();
+    let mut history_requests = HashMap::new();
     loop {
         heartbeat.poll(&mut client)?;
         match receive_codex(&mut client)? {
@@ -334,6 +337,13 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
                             // A single desktop-heavy turn can contain megabytes of screenshots.
                             // Codex returns a cursor for the remaining turns.
                             request["params"]["limit"] = json!(1);
+                            if history_requests.len() < 256
+                                && !request["id"].is_null()
+                                && let Some(thread) = request["params"]["threadId"].as_str()
+                            {
+                                history_requests
+                                    .insert(request["id"].to_string(), thread.to_owned());
+                            }
                             send_native(&mut upstream, request)?;
                             continue;
                         }
@@ -343,9 +353,10 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
                             continue;
                         }
                         if request["method"] == "d4c/attachment/download" {
-                            let result = crate::chat_media::download(
+                            let result = crate::chat_media::download_range(
                                 &manager.runtime.root,
                                 request["params"]["artifactId"].as_str().unwrap_or(""),
+                                request["params"]["offset"].as_u64(),
                             );
                             let response = match result {
                                 Ok(value) => json!({"id":request["id"],"result":value}),
@@ -380,7 +391,12 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
             Some(message) if message.is_text() => {
                 if let Ok(mut req) = serde_json::from_str::<Value>(message.to_text().unwrap_or(""))
                 {
-                    if compact_history_images(&manager.runtime.root, &mut req) {
+                    let thread = if req["method"].is_null() && !req["id"].is_null() {
+                        history_requests.remove(&req["id"].to_string())
+                    } else {
+                        None
+                    };
+                    if project_chat_media(&manager.runtime.root, &mut req, thread.as_deref()) {
                         send(&mut client, req)?;
                         continue;
                     }
@@ -396,13 +412,18 @@ fn codex(mut client: Socket, path: &Path, manager: &Manager) -> Result<()> {
     }
 }
 
-// The transcript displays tool results as text. Avoid transferring base64 screenshots
-// as JSON text while retaining the original result in Codex and all user attachments.
-fn compact_history_images(root: &Path, response: &mut Value) -> bool {
+// Put attachment metadata on the wire while retaining the original Codex transcript.
+fn project_chat_media(root: &Path, response: &mut Value, thread: Option<&str>) -> bool {
     if response["method"] == "item/completed"
-        && let Some(item) = response.pointer_mut("/params/item")
+        && let Some(params) = response.get_mut("params").and_then(Value::as_object_mut)
     {
-        return crate::chat_media::project_item(root, item);
+        let thread = params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        return params
+            .get_mut("item")
+            .is_some_and(|item| crate::chat_media::project_item(root, item, thread.as_deref()));
     }
     let mut changed = false;
     for turn in response
@@ -417,7 +438,7 @@ fn compact_history_images(root: &Path, response: &mut Value) -> bool {
             .into_iter()
             .flatten()
         {
-            changed |= crate::chat_media::project_item(root, item);
+            changed |= crate::chat_media::project_item(root, item, thread);
         }
     }
     changed
@@ -557,17 +578,17 @@ fn viewer(mut socket: Socket, manager: Manager, id: &str, compressed: bool) -> R
         .set_read_timeout(Some(Duration::from_millis(20)))
         .map_err(|e| e.to_string())?;
     session.request(false).map_err(|e| e.to_string())?;
-    let mut refresh = Instant::now();
+    let mut updates = ViewerUpdates::default();
     let mut bytes = [0; 65536];
     let mut heartbeat = Heartbeat::new();
+    let mut next_client_check = Instant::now();
     loop {
-        if refresh.elapsed() > Duration::from_millis(100) {
-            session.request(true).map_err(|e| e.to_string())?;
-            refresh = Instant::now();
-        }
         match session.socket.read(&mut bytes) {
             Ok(0) => return Err("VNC disconnected".into()),
             Ok(n) => {
+                updates
+                    .advance(&bytes[..n], &mut session)
+                    .map_err(|e| e.to_string())?;
                 let packet = if compressed {
                     crate::desktop_wire::encode(&bytes[..n]).map_err(|e| e.to_string())?
                 } else {
@@ -579,10 +600,18 @@ fn viewer(mut socket: Socket, manager: Manager, id: &str, compressed: bool) -> R
             Err(e)
                 if matches!(
                     e.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
                 ) => {}
             Err(e) => return Err(e.to_string()),
         }
+        // A large framebuffer spans multiple chunks. Check for client traffic
+        // periodically so an idle WebSocket cannot delay every chunk.
+        if Instant::now() < next_client_check {
+            continue;
+        }
+        next_client_check = Instant::now() + Duration::from_millis(20);
         // The framebuffer channel never forwards client bytes into VNC. All input goes
         // through typed, server-authorized control RPCs, so takeover cannot be bypassed.
         heartbeat.poll(&mut socket)?;
@@ -600,6 +629,113 @@ fn viewer(mut socket: Socket, manager: Manager, id: &str, compressed: bool) -> R
                 ) => {}
             Err(e) => return Err(e.to_string()),
         }
+    }
+}
+
+// Track RFB message boundaries while relaying the original bytes. Only headers
+// are buffered here. The viewer decodes pixels and owns the framebuffer.
+#[derive(Default)]
+struct ViewerUpdates {
+    header: [u8; 16],
+    header_len: usize,
+    rectangles_left: Option<u16>,
+    payload_left: usize,
+    resize: Option<(u16, u16)>,
+}
+
+impl ViewerUpdates {
+    fn read_header(&mut self, input: &mut &[u8], len: usize) -> bool {
+        let count = (len - self.header_len).min(input.len());
+        let end = self.header_len + count;
+        self.header[self.header_len..end].copy_from_slice(&input[..count]);
+        self.header_len = end;
+        *input = &input[count..];
+        end == len
+    }
+
+    fn advance(&mut self, mut input: &[u8], session: &mut rfb::Session) -> io::Result<()> {
+        let mut complete = false;
+        let mut resize = None;
+        loop {
+            let skip = self.payload_left.min(input.len());
+            self.payload_left -= skip;
+            input = &input[skip..];
+            if self.payload_left != 0 {
+                break;
+            }
+            if self.rectangles_left == Some(0) {
+                self.rectangles_left = None;
+                complete = true;
+                resize = self.resize.take().or(resize);
+            }
+            if input.is_empty() {
+                break;
+            }
+            if let Some(count) = self.rectangles_left {
+                if !self.read_header(&mut input, 12.max(self.header_len)) {
+                    break;
+                }
+                let rect = match rfb::rectangle(&self.header[..self.header_len])? {
+                    Some(rect) => rect,
+                    None if self.read_header(&mut input, 16) => {
+                        rfb::rectangle(&self.header)?.unwrap()
+                    }
+                    None => break,
+                };
+                if rect.encoding == -223 {
+                    self.resize = Some((rect.width, rect.height));
+                }
+                self.rectangles_left = Some(count - 1);
+                self.payload_left = rect.payload_len;
+            } else {
+                let kind = if self.header_len == 0 {
+                    input[0]
+                } else {
+                    self.header[0]
+                };
+                let len = match kind {
+                    0 => 4, // FramebufferUpdate
+                    1 => 6, // SetColorMapEntries
+                    2 => 1, // Bell
+                    3 => 8, // ServerCutText
+                    _ => return Err(io::Error::other("Unsupported VNC server message")),
+                };
+                if !self.read_header(&mut input, len) {
+                    break;
+                }
+                match kind {
+                    0 => {
+                        self.rectangles_left =
+                            Some(u16::from_be_bytes([self.header[2], self.header[3]]))
+                    }
+                    1 => {
+                        self.payload_left =
+                            6 * u16::from_be_bytes([self.header[4], self.header[5]]) as usize
+                    }
+                    3 => {
+                        self.payload_left =
+                            u32::from_be_bytes(self.header[4..8].try_into().unwrap()) as usize;
+                        if self.payload_left > 1024 * 1024 {
+                            return Err(io::Error::other("VNC clipboard too large"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            self.header_len = 0;
+        }
+        // Incremental requests can stay pending indefinitely on a static
+        // desktop. Ask again only after the server answers the previous one.
+        if complete {
+            if let Some((width, height)) = resize {
+                session.width = width;
+                session.height = height;
+                session.request(false)?;
+            } else {
+                session.request(true)?;
+            }
+        }
+        Ok(())
     }
 }
 #[cfg(unix)]
@@ -737,6 +873,105 @@ fn peer_is_owner(stream: &std::os::unix::net::UnixStream, owner_uid: u32) -> Res
 #[cfg(test)]
 mod ipc_tests {
     use super::*;
+
+    #[test]
+    fn viewer_rearms_after_complete_framebuffer_updates() {
+        use std::os::unix::net::UnixStream;
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut session = rfb::Session {
+            socket: Box::new(stream),
+            width: 16,
+            height: 16,
+            name: "Test desktop".into(),
+        };
+        let mut updates = ViewerUpdates::default();
+        let mut request = [0; 10];
+        session.request(false).unwrap();
+        peer.read_exact(&mut request).unwrap();
+        assert_eq!(request, [3, 0, 0, 0, 0, 0, 0, 16, 0, 16]);
+
+        // A Bell, a clipboard message, then an update with raw and zlib rectangles.
+        let input = [
+            2, 3, 0, 0, 0, 0, 0, 0, 1, b'x', 0, 0, 0, 2, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1,
+            2, 3, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 6, 0, 0, 0, 3, 0, 1, 2,
+        ];
+        for byte in &input[..input.len() - 1] {
+            updates.advance(&[*byte], &mut session).unwrap();
+            assert_eq!(
+                peer.read(&mut request).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        updates
+            .advance(&input[input.len() - 1..], &mut session)
+            .unwrap();
+        peer.read_exact(&mut request).unwrap();
+        assert_eq!(request, [3, 1, 0, 0, 0, 0, 0, 16, 0, 16]);
+        assert_eq!(
+            peer.read(&mut request).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        // DesktopSize ends this update and requires a full request at the new size.
+        let resize = [0, 0, 0, 1, 0, 0, 0, 0, 0, 32, 0, 24, 255, 255, 255, 33];
+        updates.advance(&resize, &mut session).unwrap();
+        peer.read_exact(&mut request).unwrap();
+        assert_eq!(request, [3, 0, 0, 0, 0, 0, 0, 32, 0, 24]);
+    }
+
+    #[test]
+    fn live_codex_reply_delivers_a_video_without_a_tool_call() {
+        let root = std::env::temp_dir().join(format!("d4c-history-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let thread = uuid::Uuid::new_v4().to_string();
+        let export = crate::chat_media::share(&root, &thread, None).unwrap();
+        let file = Path::new(export["directory"].as_str().unwrap()).join("Demo video.mp4");
+        fs::write(&file, b"demo video").unwrap();
+        let mut event = json!({"method":"item/completed","params":{"threadId":thread,
+            "item":{"id":"item","type":"agentMessage","text":"Here is the demo.\n\nMEDIA: Demo video.mp4"}}});
+        assert!(project_chat_media(&root, &mut event, None));
+        let item = &event["params"]["item"];
+        assert_eq!(item["text"], "Here is the demo.\n\nMEDIA: Demo video.mp4");
+        assert_eq!(item["d4cText"], "Here is the demo.");
+        let attachment = &item["d4cAttachments"][0];
+        assert_eq!(attachment["mimeType"], "video/mp4");
+        let download =
+            crate::chat_media::download(&root, attachment["artifactId"].as_str().unwrap()).unwrap();
+        assert_eq!(download["data"], "ZGVtbyB2aWRlbw==");
+        let other_thread = uuid::Uuid::new_v4().to_string();
+        crate::chat_media::share(&root, &other_thread, None).unwrap();
+        let link = format!(
+            "[Demo](sandbox:{})",
+            file.display().to_string().replace(' ', "%20")
+        );
+        let mut history = json!({"result":{"data":[{"items":[
+            {"id":"item","type":"agentMessage","text":link}
+        ]}],"nextCursor":"older"}});
+        let untouched = history.clone();
+        assert!(!project_chat_media(&root, &mut history, None));
+        assert!(!project_chat_media(
+            &root,
+            &mut history,
+            Some(&other_thread)
+        ));
+        assert_eq!(history, untouched);
+        assert!(project_chat_media(&root, &mut history, Some(&thread)));
+        assert_eq!(history["result"]["nextCursor"], "older");
+        let item = &history["result"]["data"][0]["items"][0];
+        assert_eq!(item["id"], "item");
+        assert_eq!(item["d4cText"], "");
+        assert_eq!(item["d4cAttachments"][0], *attachment);
+
+        std::os::unix::fs::symlink(&file, file.with_file_name("symlink.mp4")).unwrap();
+        for text in ["MEDIA: symlink.mp4", "```text\nMEDIA: Demo video.mp4\n```"] {
+            let mut event = json!({"method":"item/completed","params":{"threadId":thread,
+                "item":{"type":"agentMessage","text":text}}});
+            assert!(!project_chat_media(&root, &mut event, None));
+            assert_eq!(event["params"]["item"]["text"], text);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn history_compacts_only_embedded_tool_images() {
         let root = std::env::temp_dir().join(format!("d4c-history-{}", uuid::Uuid::new_v4()));
@@ -745,13 +980,13 @@ mod ipc_tests {
         let mut response = json!({"result":{"data":[{"items":[user.clone(),
             {"type":"dynamicToolCall","contentItems":[image,{"type":"inputText","text":"ok"}]}
         ]}],"nextCursor":"older"}});
-        assert!(compact_history_images(&root, &mut response));
+        assert!(project_chat_media(&root, &mut response, None));
         assert_eq!(response["result"]["nextCursor"], "older");
         let items = &response["result"]["data"][0]["items"];
         assert_eq!(items[0], user);
         assert_eq!(items[1]["contentItems"][0]["type"], "inputText");
         assert_eq!(items[1]["contentItems"][1]["text"], "ok");
-        assert!(!compact_history_images(&root, &mut response));
+        assert!(!project_chat_media(&root, &mut response, None));
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
