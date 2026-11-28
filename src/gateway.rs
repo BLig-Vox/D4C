@@ -1,4 +1,4 @@
-mod codex;
+pub(crate) mod codex;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use serde_json::{Value, json};
@@ -32,13 +32,26 @@ impl Drop for Gateway {
     }
 }
 
+impl Gateway {
+    pub(crate) fn from_channels(tx: Sender<Value>, rx: Receiver<Event>) -> Self {
+        Self {
+            tx,
+            rx,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 #[cfg(test)]
 pub fn test_gateway(tx: Sender<Value>, rx: Receiver<Event>) -> Gateway {
-    Gateway {
-        tx,
-        rx,
-        cancelled: Arc::new(AtomicBool::new(false)),
-    }
+    Gateway::from_channels(tx, rx)
+}
+
+pub(crate) fn initialize() -> Value {
+    json!({"id":"initialize","method":"initialize","params":{
+        "clientInfo":{"name":"d4c","title":"D4C","version":env!("CARGO_PKG_VERSION")},
+        "capabilities":{"experimentalApi":true}
+    }})
 }
 
 pub(crate) fn key() -> io::Result<SigningKey> {
@@ -95,13 +108,7 @@ pub fn connect(url: String, _token: String, ctx: eframe::egui::Context) -> Gatew
             let send = |socket: &mut crate::workspace::Socket, value: Value| {
                 crate::wire::send(socket, Message::Text(value.to_string().into()))
             };
-            send(
-                &mut socket,
-                json!({"id":"initialize","method":"initialize","params":{
-                    "clientInfo":{"name":"d4c","title":"D4C","version":env!("CARGO_PKG_VERSION")},
-                    "capabilities":{"experimentalApi":true}
-                }}),
-            )?;
+            send(&mut socket, initialize())?;
             let mut ready = false;
             let started = Instant::now();
             let mut received = started;

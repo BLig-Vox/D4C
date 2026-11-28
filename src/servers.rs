@@ -190,24 +190,32 @@ impl Catalogs {
     pub fn poll(
         &mut self,
         connections: &[preferences::Connection],
+        ssh: &crate::ssh::Servers,
         active: &str,
         ctx: &egui::Context,
     ) {
-        self.rows
-            .retain(|url, _| connections.iter().any(|connection| &connection.url == url));
-        for connection in connections {
-            let row = self.rows.entry(connection.url.clone()).or_default();
-            if connection.url == active {
+        self.rows.retain(|url, _| {
+            connections.iter().any(|connection| &connection.url == url) || ssh.is_connected(url)
+        });
+        let urls: Vec<_> = connections
+            .iter()
+            .map(|c| c.url.clone())
+            .chain(
+                self.rows
+                    .keys()
+                    .filter(|url| crate::ssh::is_chat_id(url))
+                    .cloned(),
+            )
+            .collect();
+        for url in urls {
+            let row = self.rows.entry(url.clone()).or_default();
+            if url == active {
                 row.link = None;
                 row.media_token = None;
                 continue;
             }
-            if row.link.is_none() {
-                row.link = Some(gateway::connect(
-                    connection.url.clone(),
-                    String::new(),
-                    ctx.clone(),
-                ));
+            if row.link.is_none() && !crate::ssh::is_chat_id(&url) {
+                row.link = Some(gateway::connect(url, String::new(), ctx.clone()));
             }
             if let Some(workspace) = &mut row.workspace {
                 workspace.poll();
@@ -322,7 +330,7 @@ impl Catalogs {
         self.dirty = true;
     }
     pub fn save(&mut self) {
-        let value: Vec<_> = self.rows.iter().map(|(url,row)| json!({"url":url,"expanded":row.expanded,"selected":row.selected,
+        let value: Vec<_> = self.rows.iter().filter(|(url, _)| preferences::valid_url(url)).map(|(url,row)| json!({"url":url,"expanded":row.expanded,"selected":row.selected,
             "sessions":row.sessions.iter().map(|s|json!({"key":s.key,"title":s.title,"hasActiveRun":s.running})).collect::<Vec<_>>()})).collect();
         if preferences::write("server-catalogs.json", &json!(value)).is_ok() {
             self.dirty = false;

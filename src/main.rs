@@ -128,6 +128,7 @@ struct D4c {
     workspace_sync: std::time::Instant,
     sidebar_open: bool,
     settings_open: bool,
+    settings_tab: dialogs::SettingsTab,
     notifications_open: bool,
     preferences: preferences::Settings,
     center: activity::Center,
@@ -261,6 +262,7 @@ impl D4c {
             remote_notifications: Default::default(),
             workspace_sync: std::time::Instant::now(),
             settings_open: url.is_empty(),
+            settings_tab: Default::default(),
             notifications_open: false,
             preferences,
             center,
@@ -347,6 +349,10 @@ impl D4c {
 }
 impl D4c {
     fn reconnect(&mut self, ctx: &egui::Context) {
+        if ssh::is_chat_id(&self.url) {
+            self.settings_open = true;
+            return;
+        }
         self.composer_picker = None;
         self.workspace_hydrated = false;
         self.permission_request = None;
@@ -395,19 +401,20 @@ impl D4c {
         }
     }
     fn reset_connection(&mut self, index: usize, token: String) {
+        let url = self.preferences.connections[index].url.clone();
+        self.reset_connection_for(index, token, url);
+    }
+    fn reset_connection_for(&mut self, index: usize, token: String, url: String) {
         self.save_layout(true);
         self.deleted_sessions.clear();
         self.pending_sends.clear();
         let mut preferences = self.preferences.clone();
         preferences.selected = index;
         let servers = std::mem::take(&mut self.servers);
-        let remembered = servers
-            .rows
-            .get(&preferences.current().url)
-            .and_then(|row| row.selected.clone());
+        let remembered = servers.rows.get(&url).and_then(|row| row.selected.clone());
         let mut views = std::mem::take(&mut self.server_views);
         views.retain(|(url, _)| url != &self.url);
-        if preferences::valid_url(&self.url) {
+        if preferences::valid_url(&self.url) || ssh::is_chat_id(&self.url) {
             let mut messages = std::mem::take(&mut self.messages);
             messages.drain(..messages.len().saturating_sub(100));
             while messages
@@ -432,7 +439,7 @@ impl D4c {
         }
         let restored = views
             .iter()
-            .position(|(url, _)| url == &preferences.current().url)
+            .position(|(cached_url, _)| cached_url == &url)
             .and_then(|n| views.remove(n))
             .map(|(_, v)| v);
         while views.len() > 2 {
@@ -446,7 +453,7 @@ impl D4c {
         next.ssh = std::mem::take(&mut self.ssh);
         next.session = remembered.unwrap_or_else(|| format!("draft:{}", uuid::Uuid::new_v4()));
         next.explicit_selection = true;
-        next.url = preferences.current().url.clone();
+        next.url = url;
         next.center = activity::Center::load(&next.url);
         next.preferences = preferences;
         next.token = token;
@@ -563,14 +570,29 @@ impl D4c {
         }
     }
     fn switch_to(&mut self, index: usize, ctx: &egui::Context, target: Option<String>) {
-        if index >= self.preferences.connections.len() {
-            return;
+        if let Some(connection) = self.preferences.connections.get(index) {
+            self.switch_to_url(&connection.url.clone(), ctx, target);
         }
-        if self.preferences.connections[index].url == self.url {
+    }
+    fn switch_to_url(&mut self, url: &str, ctx: &egui::Context, target: Option<String>) {
+        if url == self.url {
             if let Some(key) = target {
                 let load = !key.starts_with("draft:");
                 self.select_session(key, load);
             }
+            return;
+        }
+        let index = self
+            .preferences
+            .connections
+            .iter()
+            .position(|connection| connection.url == url);
+        if index.is_none()
+            && !self
+                .ssh
+                .chat_connections()
+                .any(|connection| connection.url == url)
+        {
             return;
         }
         if let Err(error) = self.save_server_drafts() {
@@ -581,14 +603,16 @@ impl D4c {
         self.servers.select(&self.url, &self.session);
         self.servers.save();
         self.center.save();
-        let previous = self.preferences.selected;
-        self.preferences.selected = index;
-        if let Err(e) = self.preferences.save() {
-            self.preferences.selected = previous;
-            self.settings_error = e.to_string();
-            return;
+        if let Some(index) = index {
+            let previous = self.preferences.selected;
+            self.preferences.selected = index;
+            if let Err(e) = self.preferences.save() {
+                self.preferences.selected = previous;
+                self.settings_error = e.to_string();
+                return;
+            }
         }
-        if self.preferences.current().url != self.url {
+        {
             media::reset();
             self.rpc("sessions.messages.unsubscribe", json!({"key":self.session}));
             if let Some(link) = self.gateway.take() {
@@ -611,7 +635,11 @@ impl D4c {
                 .or_default()
                 .workspace = Some(std::mem::take(&mut self.desktops.workspace));
         }
-        self.reset_connection(index, String::new());
+        if let Some(index) = index {
+            self.reset_connection(index, String::new());
+        } else {
+            self.reset_connection_for(self.preferences.selected, String::new(), url.to_owned());
+        }
         let sends = self
             .servers
             .rows
@@ -656,12 +684,14 @@ impl D4c {
                 .and_then(|r| r.workspace.take())
             {
                 self.desktops.workspace = workspace;
-            } else {
+            } else if !ssh::is_chat_id(&self.url) {
                 self.desktops.connect(&self.url, ctx);
             }
             if online {
                 self.activate_chat();
             }
+        } else if ssh::is_chat_id(&self.url) {
+            self.status = "Codex connection unavailable. Check SSH servers in Settings.".into();
         } else {
             self.reconnect(ctx);
         }
@@ -1026,16 +1056,7 @@ impl D4c {
         session_tabs::TabId::new(&self.url, &self.session)
     }
     fn select_tab(&mut self, id: &session_tabs::TabId, ctx: &egui::Context) {
-        if id.url == self.url {
-            self.select_session(id.session.clone(), !id.session.starts_with("draft:"));
-        } else if let Some(index) = self
-            .preferences
-            .connections
-            .iter()
-            .position(|c| c.url == id.url)
-        {
-            self.switch_to(index, ctx, Some(id.session.clone()));
-        }
+        self.switch_to_url(&id.url, ctx, Some(id.session.clone()));
     }
     fn close_tab(&mut self, id: &session_tabs::TabId, ctx: &egui::Context) {
         if &self.active_tab() == id {
@@ -1211,12 +1232,19 @@ impl D4c {
         self.cron.refresh();
     }
     fn events(&mut self, ctx: &egui::Context) {
-        let events: Vec<_> = self
+        let mut events: Vec<_> = self
             .gateway
             .as_ref()
             .map(|g| g.rx.try_iter().take(64).collect())
             .unwrap_or_default();
-        if events.len() == 64 {
+        if self.gateway.is_some() && ssh::is_chat_id(&self.url) && !self.ssh.is_connected(&self.url)
+        {
+            self.gateway = None;
+            events.push(gateway::Event::Error(
+                "SSH disconnected. Reconnect in Settings.".into(),
+            ));
+        }
+        if events.len() >= 64 {
             ctx.request_repaint();
         }
         for event in events {
@@ -3471,6 +3499,20 @@ impl D4c {
                 self.slash_selected = 0;
             }
         }
+        self.ssh.poll(ui.ctx());
+        let ssh_connections: Vec<_> = self.ssh.chat_connections().collect();
+        for connection in &ssh_connections {
+            if let Some(link) = self.ssh.take_chat(&connection.url) {
+                if self.url == connection.url {
+                    self.gateway = Some(link);
+                    self.connected = false;
+                    self.status = "Connecting…".into();
+                } else {
+                    self.servers
+                        .park(&connection.url, link, None, false, "Connecting…");
+                }
+            }
+        }
         self.events(ui.ctx());
         self.servers.update_active(
             &self.url,
@@ -3479,9 +3521,12 @@ impl D4c {
             self.connected,
             &self.status,
         );
-        self.servers
-            .poll(&self.preferences.connections, &self.url, ui.ctx());
-        self.ssh.poll(ui.ctx());
+        self.servers.poll(
+            &self.preferences.connections,
+            &self.ssh,
+            &self.url,
+            ui.ctx(),
+        );
         self.reconcile_history();
         self.desktops.poll_ui(ui.ctx());
         self.sync_workspace();
@@ -3751,11 +3796,14 @@ impl D4c {
                 .id_salt("chats")
                 .show(ui, |ui| {
                     matches += self.ssh.rows_ui(ui, &query);
-                    let mut selected: Option<(usize, Option<String>)> = None;
+                    let mut selected: Option<(String, Option<String>)> = None;
                     let mut rename = None;
                     let mut delete = None;
                     let connections = self.preferences.connections.clone();
-                    for (server_index, connection) in connections.iter().enumerate() {
+                    for connection in connections.iter().chain(&ssh_connections) {
+                        if connection.url.is_empty() {
+                            continue;
+                        }
                         let current = connection.url == self.url;
                         let Some(row) = self.servers.rows.get(&connection.url) else {
                             continue;
@@ -3779,18 +3827,11 @@ impl D4c {
                         }
                         let (toggle, new_chat) = ui
                             .push_id(&connection.url, |ui| {
-                                server_row(
-                                    ui,
-                                    &connection.name,
-                                    online,
-                                    current,
-                                    expanded,
-                                    &status,
-                                )
+                                server_row(ui, &connection.name, online, current, expanded, &status)
                             })
                             .inner;
                         if new_chat {
-                            selected = Some((server_index, None));
+                            selected = Some((connection.url.clone(), None));
                         }
                         if toggle {
                             self.servers.toggle(&connection.url);
@@ -3820,7 +3861,7 @@ impl D4c {
                                             );
                                             if click {
                                                 selected = Some((
-                                                    server_index,
+                                                    connection.url.clone(),
                                                     Some(session.key.clone()),
                                                 ));
                                             }
@@ -3848,7 +3889,7 @@ impl D4c {
                                             );
                                             if click {
                                                 selected = Some((
-                                                    server_index,
+                                                    connection.url.clone(),
                                                     Some(session.key.clone()),
                                                 ));
                                             }
@@ -3871,15 +3912,10 @@ impl D4c {
                         }
                         ui.add_space(8.0);
                     }
-                    if let Some((index, key)) = selected {
-                        let load = key.is_some();
+                    if let Some((url, key)) = selected {
                         let target =
                             key.unwrap_or_else(|| format!("draft:{}", uuid::Uuid::new_v4()));
-                        if index == self.preferences.selected {
-                            self.select_session(target, load);
-                        } else {
-                            self.switch_to(index, ui.ctx(), Some(target));
-                        }
+                        self.switch_to_url(&url, ui.ctx(), Some(target));
                         if compact {
                             self.sidebar_open = false;
                         }

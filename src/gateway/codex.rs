@@ -2,13 +2,13 @@
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
-pub(super) enum Output {
+pub(crate) enum Output {
     Wire(Value),
     Ui(Value),
 }
 
 #[derive(Default)]
-pub(super) struct Adapter {
+pub(crate) struct Adapter {
     pub output: Vec<Output>,
     pending: HashMap<String, (String, Value)>,
     // Serialize thread/start and thread/resume with commands that need a live thread.

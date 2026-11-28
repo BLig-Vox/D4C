@@ -1,3 +1,6 @@
+mod codex;
+
+use crate::{gateway, preferences};
 use eframe::egui;
 use russh::{
     client,
@@ -34,6 +37,16 @@ impl std::fmt::Display for Endpoint {
             write!(f, "{}@{host}:{}", self.user, self.port)
         }
     }
+}
+
+impl Endpoint {
+    fn chat_id(&self) -> String {
+        format!("ssh://{self}")
+    }
+}
+
+pub(crate) fn is_chat_id(id: &str) -> bool {
+    id.starts_with("ssh://")
 }
 
 enum Credential {
@@ -93,6 +106,9 @@ enum Event {
     },
     Connected,
     Disconnected(String),
+    Codex(codex::Status),
+    CodexLink(gateway::Gateway),
+    OpenCodexUrl(String),
 }
 
 struct Reporter {
@@ -209,6 +225,10 @@ struct Connection {
     // Dropping this cancels the worker, including in-progress handshakes.
     _stop: oneshot::Sender<()>,
     status: String,
+    codex: codex::Status,
+    redirect_input: String,
+    chat: Option<gateway::Gateway>,
+    commands: tokio::sync::mpsc::UnboundedSender<codex::Command>,
 }
 
 struct Pending {
@@ -233,18 +253,90 @@ pub struct Servers {
 
 fn ssh_field(ui: &mut egui::Ui, label: &str, input: Input<'_>) {
     let label = ui.label(label);
-    ui.add(input).labelled_by(label.id);
+    let field = ui.add(input).labelled_by(label.id);
+    if cfg!(target_os = "android") && field.has_focus() {
+        // The keyboard can shrink the viewport a frame after the field receives focus.
+        let bottom = ui.clip_rect().bottom();
+        let id = field.id.with("keyboard-scroll");
+        let ime = ui.ctx().output(|output| output.ime);
+        let gained_focus = field.gained_focus();
+        let (scrolling, keep_ime) = ui.data_mut(|data| {
+            let (previous_bottom, previous_ime, scrolling) = data
+                .get_temp::<(f32, Option<egui::output::IMEOutput>, bool)>(id)
+                .unwrap_or((bottom, None, false));
+            let scrolling = field.rect.bottom() > bottom
+                && (scrolling || gained_focus || bottom < previous_bottom);
+            data.insert_temp(id, (bottom, ime.or(previous_ime), scrolling));
+            (scrolling, previous_ime.filter(|_| scrolling))
+        });
+        if let Some(ime) = keep_ime {
+            // egui omits IME output while the field is clipped. Keep the keyboard
+            // open until the scroll brings the field into view.
+            ui.output_mut(|output| {
+                output.ime.get_or_insert(ime);
+            });
+        }
+        if scrolling {
+            ui.scroll_with_delta_animation(
+                egui::vec2(
+                    0.0,
+                    bottom - field.rect.bottom() - ui.spacing().item_spacing.y,
+                ),
+                egui::style::ScrollAnimation::none(),
+            );
+        }
+    }
 }
 
 impl Servers {
+    pub fn chat_connections(&self) -> impl Iterator<Item = preferences::Connection> + '_ {
+        self.servers.iter().filter_map(|server| {
+            (server.status == "Connected" && server.codex.account.is_some()).then(|| {
+                preferences::Connection {
+                    name: server.endpoint.to_string(),
+                    url: server.endpoint.chat_id(),
+                }
+            })
+        })
+    }
+
+    pub fn is_connected(&self, url: &str) -> bool {
+        self.servers
+            .iter()
+            .any(|server| server.status == "Connected" && server.endpoint.chat_id() == url)
+    }
+
+    pub fn take_chat(&mut self, url: &str) -> Option<gateway::Gateway> {
+        self.servers
+            .iter_mut()
+            .find(|server| server.endpoint.chat_id() == url && server.codex.account.is_some())?
+            .chat
+            .take()
+    }
+
     pub fn poll(&mut self, ctx: &egui::Context) {
         for server in &mut self.servers {
-            match server.events.try_recv() {
-                Ok(Event::Disconnected(message)) => server.status = message,
-                Err(mpsc::TryRecvError::Disconnected) if server.status == "Connected" => {
-                    server.status = "Disconnected".into();
+            loop {
+                match server.events.try_recv() {
+                    Ok(Event::Codex(status)) => {
+                        if !status.browser_callback {
+                            server.redirect_input.clear();
+                        }
+                        server.codex = status;
+                    }
+                    Ok(Event::CodexLink(link)) => server.chat = Some(link),
+                    Ok(Event::OpenCodexUrl(url)) => ctx.open_url(egui::OpenUrl::new_tab(url)),
+                    Ok(Event::Disconnected(message)) => server.status = message,
+                    Err(mpsc::TryRecvError::Disconnected) if server.status == "Connected" => {
+                        server.status = "Disconnected".into();
+                        break;
+                    }
+                    Err(_) => break,
+                    _ => {}
                 }
-                _ => {}
+            }
+            if server.status != "Connected" {
+                server.redirect_input.clear();
             }
         }
         let Some(pending) = &mut self.pending else {
@@ -265,6 +357,7 @@ impl Servers {
                 self.error = message;
                 self.pending = None;
             }
+            Ok(_) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.error = "SSH connection ended.".into();
                 self.pending = None;
@@ -273,7 +366,7 @@ impl Servers {
         }
     }
 
-    pub fn settings_ui(&mut self, ui: &mut egui::Ui) {
+    pub fn settings_ui(&mut self, ui: &mut egui::Ui) -> Option<String> {
         if let Some(pending) = &mut self.pending {
             ui.label(pending.connection.endpoint.to_string());
             if let Some((fingerprint, _)) = &pending.verify {
@@ -298,11 +391,14 @@ impl Servers {
             if cancel {
                 self.pending = None;
             }
-            return;
+            return None;
         }
-        if self.rows_ui(ui, "") > 0 {
-            ui.separator();
+        let (_, open) = self.render_rows(ui, "", true);
+        if self.servers.is_empty() {
+            ui.label("No SSH connections yet.");
+            ui.weak("Connect a server to sign in to Codex.");
         }
+        ui.separator();
         if ui.available_width() >= 480.0 {
             ui.columns(2, |columns| {
                 self.endpoint_fields(&mut columns[0]);
@@ -313,60 +409,59 @@ impl Servers {
             self.authentication_fields(ui);
         }
 
-        if (self.authentication != Authentication::D4cKey || self.public_key.is_empty())
-            && ui
+        let managed_key = self.authentication == Authentication::D4cKey;
+        let key_ready = managed_key && !self.public_key.is_empty();
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!managed_key || key_ready, Button::new("Connect over SSH"))
+                .clicked()
+                && let Err(error) = self.start(ui.ctx())
+            {
+                self.error = error;
+            }
+            if key_ready {
+                let label = if self.key_copied {
+                    "Copied public key"
+                } else {
+                    "Copy public key"
+                };
+                if ui
+                    .add(Button::new(label).variant(ButtonVariant::Outline))
+                    .clicked()
+                {
+                    ui.copy_text(self.public_key.clone());
+                    self.key_copied = true;
+                }
+            } else if ui
                 .add(Button::new("Set up D4C SSH key").variant(ButtonVariant::Outline))
                 .clicked()
-        {
-            self.error.clear();
-            match managed_key_path()
-                .map_err(Into::into)
-                .and_then(|path| managed_public_key(&path))
             {
-                Ok(public_key) => {
-                    self.authentication = Authentication::D4cKey;
-                    self.secret.clear();
-                    self.public_key = public_key;
-                    self.key_copied = false;
+                self.error.clear();
+                match managed_key_path()
+                    .map_err(Into::into)
+                    .and_then(|path| managed_public_key(&path))
+                {
+                    Ok(public_key) => {
+                        self.authentication = Authentication::D4cKey;
+                        self.secret.clear();
+                        self.public_key = public_key;
+                        self.key_copied = false;
+                    }
+                    Err(error) => self.error = format!("Couldn't set up the D4C SSH key: {error}"),
                 }
-                Err(error) => self.error = format!("Couldn't set up the D4C SSH key: {error}"),
             }
-        }
-        if self.authentication == Authentication::D4cKey && !self.public_key.is_empty() {
-            ui.separator();
-            if ui
-                .add(
-                    Button::new(if self.key_copied {
-                        "Copied public key"
-                    } else {
-                        "Copy public key"
-                    })
-                    .variant(ButtonVariant::Outline),
-                )
-                .clicked()
-            {
-                ui.copy_text(self.public_key.clone());
-                self.key_copied = true;
-            }
+        });
+        if key_ready {
             ui.weak("Add the key to your server account’s authorized_keys before connecting.");
             egui::CollapsingHeader::new("Public key and setup details").show(ui, |ui| {
                 ui.add(egui::Label::new(egui::RichText::new(&self.public_key).monospace()).wrap());
                 ui.weak("Linux: ~/.ssh/authorized_keys. Windows OpenSSH: see AuthorizedKeysFile in the server configuration.");
             });
         }
-        let can_connect =
-            self.authentication != Authentication::D4cKey || !self.public_key.is_empty();
-        if ui
-            .add_enabled(can_connect, Button::new("Connect over SSH"))
-            .clicked()
-        {
-            if let Err(error) = self.start(ui.ctx()) {
-                self.error = error;
-            }
-        }
         if !self.error.is_empty() {
             ui.colored_label(ui.visuals().error_fg_color, &self.error);
         }
+        open
     }
 
     fn endpoint_fields(&mut self, ui: &mut egui::Ui) {
@@ -455,33 +550,73 @@ impl Servers {
     }
 
     pub fn rows_ui(&mut self, ui: &mut egui::Ui, query: &str) -> usize {
+        self.render_rows(ui, query, false).0
+    }
+
+    fn render_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        query: &str,
+        settings: bool,
+    ) -> (usize, Option<String>) {
         let mut count = 0;
         let mut remove = None;
-        for (index, server) in self.servers.iter().enumerate() {
+        let mut open = None;
+        for (index, server) in self.servers.iter_mut().enumerate() {
             let label = server.endpoint.to_string();
-            if !label.to_lowercase().contains(query) {
+            let connected = server.status == "Connected";
+            if !label.to_lowercase().contains(query)
+                || (!settings && connected && server.codex.account.is_some())
+            {
                 continue;
             }
             count += 1;
-            ui.horizontal_wrapped(|ui| {
-                ui.strong(label);
-                ui.weak(format!("SSH · {}", server.status));
-                if ui
-                    .small_button(if server.status == "Connected" {
-                        "Disconnect"
-                    } else {
-                        "Remove"
-                    })
-                    .clicked()
-                {
-                    remove = Some(index);
+            ui.push_id(server.endpoint.chat_id(), |ui| {
+                if !settings {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 28.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if connected {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(120, 200, 155),
+                                    "Connected",
+                                );
+                            } else {
+                                ui.weak("Offline").on_hover_text(&server.status);
+                            }
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.add(
+                                        egui::Label::new(egui::RichText::new(label).strong())
+                                            .truncate(),
+                                    );
+                                },
+                            );
+                        },
+                    );
+                    return;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(label);
+                    ui.weak(format!("SSH · {}", server.status));
+                    if ui
+                        .small_button(if connected { "Disconnect" } else { "Remove" })
+                        .clicked()
+                    {
+                        remove = Some(index);
+                    }
+                });
+                if connected && server.codex_ui(ui) {
+                    open = Some(server.endpoint.chat_id());
                 }
             });
         }
         if let Some(index) = remove {
             self.servers.remove(index);
         }
-        count
+        (count, open)
     }
 
     fn start(&mut self, ctx: &egui::Context) -> Result<(), String> {
@@ -538,6 +673,7 @@ impl Servers {
         };
         let (tx, events) = mpsc::channel();
         let (stop, mut cancelled) = oneshot::channel();
+        let (commands, mut inbox) = tokio::sync::mpsc::unbounded_channel();
         let report = Reporter {
             tx,
             ctx: ctx.clone(),
@@ -549,7 +685,7 @@ impl Servers {
                 .map_err(|error| format!("Couldn't start SSH: {error}"))
                 .and_then(|runtime| runtime.block_on(async {
                     let connection_report = Reporter { tx: report.tx.clone(), ctx: report.ctx.clone() };
-                    let mut session = tokio::select! {
+                    let session = tokio::select! {
                         _ = &mut cancelled => return Ok(()),
                         session = connect(worker_endpoint, credential, connection_report) => session?,
                     };
@@ -559,7 +695,7 @@ impl Servers {
                             let _ = session.disconnect(russh::Disconnect::ByApplication, "", "en").await;
                             Ok(())
                         }
-                        result = &mut session => result.map_err(|error| format!("SSH connection lost: {error}")),
+                        result = codex::serve(&session, &mut inbox, &report) => result,
                     }
                 }));
             report.send(Event::Disconnected(result.err().unwrap_or_else(|| "Disconnected".into())));
@@ -571,10 +707,96 @@ impl Servers {
                 events,
                 _stop: stop,
                 status: "Connecting…".into(),
+                codex: codex::Status::default(),
+                redirect_input: String::new(),
+                chat: None,
+                commands,
             },
             verify: None,
         });
         Ok(())
+    }
+}
+
+impl Connection {
+    fn codex_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut open = false;
+        let mut command = None;
+        ui.weak(format!("Codex · {}", self.codex.label()));
+        ui.horizontal_wrapped(|ui| {
+            if self.codex.account.is_some() {
+                open = ui.button("Open Codex").clicked();
+            } else if self.codex.unavailable {
+                if ui.button("Retry Codex").clicked() {
+                    command = Some(codex::Command::Retry);
+                }
+            } else if !self.codex.busy {
+                if ui.button("Sign in with browser").clicked() {
+                    command = Some(codex::Command::Login(false));
+                }
+                if ui.button("Use device code").clicked() {
+                    command = Some(codex::Command::Login(true));
+                }
+            } else {
+                ui.spinner();
+                if self.codex.can_cancel && ui.button("Cancel sign-in").clicked() {
+                    command = Some(codex::Command::Cancel);
+                }
+            }
+        });
+        if let Some((url, code)) = &self.codex.device {
+            ui.horizontal_wrapped(|ui| {
+                ui.monospace(code);
+                if ui.small_button("Copy code").clicked() {
+                    ui.ctx().copy_text(code.clone());
+                }
+                if ui.button("Open device sign-in").clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                }
+            });
+        }
+        if self.codex.browser_callback && command.is_none() {
+            ssh_field(
+                ui,
+                "Paste redirect URL",
+                Input::new(&mut self.redirect_input)
+                    .hint("http://localhost:…/auth/callback?…")
+                    .password(true)
+                    .max_width(f32::INFINITY),
+            );
+            ui.weak("If the browser can’t return to D4C, paste the full URL from its address bar.");
+            if ui
+                .add_enabled(
+                    !self.redirect_input.trim().is_empty(),
+                    egui::Button::new("Complete sign-in"),
+                )
+                .clicked()
+            {
+                let url = std::mem::take(&mut self.redirect_input);
+                if self
+                    .commands
+                    .send(codex::Command::SubmitRedirect(url))
+                    .is_ok()
+                {
+                    self.codex.error = None;
+                }
+            }
+        }
+        if let Some(error) = &self.codex.error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        if let Some(command) = command {
+            if self.commands.send(command).is_ok() {
+                self.codex.busy = true;
+                self.codex.unavailable = false;
+                self.codex.can_cancel = false;
+                self.codex.browser_callback = false;
+                self.redirect_input.clear();
+                self.codex.device = None;
+                self.codex.error = None;
+            }
+        }
+        open
     }
 }
 

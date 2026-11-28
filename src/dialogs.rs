@@ -17,6 +17,13 @@ pub(super) enum ComposerPicker {
     Effort,
 }
 
+#[derive(Clone, Copy, Default, PartialEq)]
+pub(super) enum SettingsTab {
+    General,
+    #[default]
+    Ssh,
+}
+
 fn neutral(label: impl Into<String>) -> Button {
     Button::new(label).variant(ButtonVariant::Outline)
 }
@@ -119,15 +126,27 @@ impl D4c {
     pub(super) fn settings_ui(&mut self, ui: &mut egui::Ui) {
         let mut switch = None;
         let mut forget = None;
+        let mut open_ssh = None;
+        ui.add_space(4.0);
+        ui.heading("Settings");
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.settings_tab, SettingsTab::General, "General");
+            ui.selectable_value(&mut self.settings_tab, SettingsTab::Ssh, "SSH & Codex");
+        });
+        ui.add_space(4.0);
+        let (scroll_id, ssh_tab) = match self.settings_tab {
+            SettingsTab::General => ("settings-general", false),
+            SettingsTab::Ssh => ("settings-ssh", true),
+        };
         egui::ScrollArea::vertical()
-            .id_salt("settings")
+            .id_salt(scroll_id)
             .show(ui, |ui| {
                 ui.set_max_width(ui.available_width().min(1120.0));
                 ui.spacing_mut().item_spacing.y = 10.0;
-                ui.add_space(4.0);
-                ui.heading("Settings");
-                ui.add_space(4.0);
-                settings_card(ui, "SSH servers", |ui| self.ssh.settings_ui(ui));
+                if ssh_tab {
+                    settings_card(ui, "SSH connections", |ui| open_ssh = self.ssh.settings_ui(ui));
+                    return;
+                }
                 if ui.available_width() >= 780.0 {
                     ui.columns(2, |columns| {
                         self.connection_settings(&mut columns[0], &mut switch, &mut forget);
@@ -143,6 +162,12 @@ impl D4c {
                     }
                 }
             });
+        if let Some(url) = open_ssh {
+            self.switch_to_url(&url, ui.ctx(), None);
+            if self.url == url {
+                self.settings_open = false;
+            }
+        }
         if let Some(index) = forget {
             let previous = self.preferences.clone();
             self.preferences.connections.remove(index);
@@ -170,10 +195,13 @@ impl D4c {
     ) {
         settings_card(ui, "Connections", |ui| {
             for (index, connection) in self.preferences.connections.iter().enumerate() {
+                if connection.url.is_empty() {
+                    continue;
+                }
                 ui.scope(|ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.strong(&connection.name);
-                        if index == self.preferences.selected {
+                        if connection.url == self.url {
                             ui.weak(if self.connected {
                                 "Active · Online"
                             } else {
@@ -183,20 +211,19 @@ impl D4c {
                             if ui.add(neutral("Switch")).clicked() {
                                 *switch = Some(index);
                             }
-                            ui.menu_button("More", |ui| {
-                                if ui.add(neutral("Remove connection")).clicked() {
-                                    *forget = Some(index);
-                                    ui.close();
-                                }
-                            });
+                            if index != self.preferences.selected {
+                                ui.menu_button("More", |ui| {
+                                    if ui.add(neutral("Remove connection")).clicked() {
+                                        *forget = Some(index);
+                                        ui.close();
+                                    }
+                                });
+                            }
                         }
                     });
-                    if !connection.url.is_empty() {
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(&connection.url).small().weak())
-                                .wrap(),
-                        );
-                    }
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&connection.url).small().weak()).wrap(),
+                    );
                 });
                 ui.separator();
             }

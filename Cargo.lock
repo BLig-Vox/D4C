@@ -4859,6 +4859,7 @@ dependencies = [
  "tokio",
  "tungstenite",
  "ureq",
+ "url",
  "uuid",
  "winit",
 ]
