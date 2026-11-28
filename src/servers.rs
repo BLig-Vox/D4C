@@ -1,5 +1,5 @@
 //! Each visited host retains its own authenticated chat transport across switches.
-use crate::{gateway, preferences};
+use crate::{gateway, organizer::Organizer, preferences, session_tabs::TabId};
 use eframe::egui;
 use serde_json::{Value, json};
 use std::{
@@ -49,7 +49,7 @@ impl Default for Server {
     }
 }
 impl Server {
-    fn handle_send_event(&mut self, value: &Value) {
+    fn handle_send_event<'a>(&mut self, value: &'a Value) -> Option<(&'a str, &'a str)> {
         if value["event"] == "session.created" {
             let payload = &value["payload"];
             if let (Some(old), Some(new)) = (
@@ -70,23 +70,20 @@ impl Server {
                         params["sessionKey"] = json!(new);
                     }
                 }
+                return Some((old, new));
             }
-            return;
+            return None;
         }
         if value["type"] != "res" {
-            return;
+            return None;
         }
-        let Some(id) = value["id"].as_str() else {
-            return;
-        };
+        let id = value["id"].as_str()?;
         if let Some(params) = self.sends.sent.remove(id)
             && value["ok"] == false
         {
             self.sends.failed.push(params);
         }
-        let Some(params) = self.sends.pending.remove(id) else {
-            return;
-        };
+        let params = self.sends.pending.remove(id)?;
         if value["ok"] == true
             && let Some(link) = &self.link
         {
@@ -95,10 +92,11 @@ impl Server {
                 && link.tx.send(request).is_ok()
             {
                 self.sends.sent.insert(id, params);
-                return;
+                return None;
             }
         }
         self.sends.failed.push(params);
+        None
     }
 }
 
@@ -192,6 +190,7 @@ impl Catalogs {
         connections: &[preferences::Connection],
         ssh: &crate::ssh::Servers,
         active: &str,
+        organizer: &mut Organizer,
         ctx: &egui::Context,
     ) {
         self.rows.retain(|url, _| {
@@ -215,7 +214,7 @@ impl Catalogs {
                 continue;
             }
             if row.link.is_none() && !crate::ssh::is_chat_id(&url) {
-                row.link = Some(gateway::connect(url, String::new(), ctx.clone()));
+                row.link = Some(gateway::connect(url.clone(), String::new(), ctx.clone()));
             }
             if let Some(workspace) = &mut row.workspace {
                 workspace.poll();
@@ -257,8 +256,16 @@ impl Catalogs {
                         row.online = false;
                         row.status = error;
                     }
+                    gateway::Event::Organizer(call) => {
+                        if let Some(link) = &row.link {
+                            let result = organizer.answer(&url, call);
+                            let _ = link.tx.send(gateway::rpc("organizer.result", result));
+                        }
+                    }
                     gateway::Event::Data(value) => {
-                        row.handle_send_event(&value);
+                        if let Some((old, new)) = row.handle_send_event(&value) {
+                            organizer.rekey(&TabId::new(&url, old), &TabId::new(&url, new));
+                        }
                         if value["id"] == "connect" && value["ok"] == true {
                             row.media_token = value["payload"]["auth"]["deviceToken"]
                                 .as_str()

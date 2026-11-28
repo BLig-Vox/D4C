@@ -18,6 +18,7 @@ use tungstenite::Message;
 #[derive(Debug)]
 pub enum Event {
     Status(String),
+    Organizer(codex::OrganizerCall),
     Data(Value),
     Error(String),
 }
@@ -137,6 +138,7 @@ pub fn connect(url: String, _token: String, ctx: eframe::egui::Context) -> Gatew
                     match output {
                         codex::Output::Wire(v) => send(&mut socket, v)?,
                         codex::Output::Ui(v) => emit(Event::Data(v)),
+                        codex::Output::Organizer(call) => emit(Event::Organizer(call)),
                     }
                 }
                 match socket.read() {

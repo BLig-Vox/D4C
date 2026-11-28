@@ -1,5 +1,5 @@
 //! Native Codex dynamic tools for this conversation's desktop and scheduled tasks.
-use crate::{manager::Manager, mcp};
+use crate::{manager::Manager, mcp, organizer_tools};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -41,8 +41,11 @@ fn owns_namespace(spec: &Value) -> bool {
 
 fn combine_specs(existing: &Value) -> Value {
     let mut specs = existing.as_array().cloned().unwrap_or_default();
-    specs.retain(|s| !owns_namespace(s));
+    specs.retain(|s| {
+        !owns_namespace(s) && !(s["type"] == "namespace" && s["name"] == organizer_tools::NAMESPACE)
+    });
     specs.push(namespace_spec());
+    specs.push(organizer_tools::namespace_spec());
     Value::Array(specs)
 }
 
@@ -296,7 +299,7 @@ pub fn migrate_tools(home: &Path) -> Result<usize, String> {
 /// ExecStartPre runs before Codex opens any rollout file descriptors.
 pub fn refresh_tools(home: &Path) -> Result<usize, String> {
     let marker = home.join(".d4c-verified-tool-catalog");
-    let catalog = namespace_spec().to_string();
+    let catalog = combine_specs(&Value::Null).to_string();
     let verify_checkpoints = fs::read_to_string(&marker).ok().as_ref() != Some(&catalog);
     let count = visit_rollouts(home, |path, id| {
         migrate_rollout(path, id, Some((home, verify_checkpoints)))
@@ -484,6 +487,7 @@ mod tests {
         let specs = combine_specs(&original);
         assert_eq!(specs[0], other);
         assert_eq!(specs[1]["name"], "d4c");
+        assert_eq!(specs[2]["name"], organizer_tools::NAMESPACE);
         assert_eq!(combine_specs(&specs), specs);
     }
     #[test]
@@ -505,6 +509,12 @@ mod tests {
         assert_eq!(fs::read_to_string(other).unwrap(), unmanaged);
         let data = fs::read_to_string(&path).unwrap();
         assert!(data.lines().nth(1).unwrap().contains("share_media"));
+        assert!(
+            data.lines()
+                .nth(1)
+                .unwrap()
+                .contains(organizer_tools::NAMESPACE)
+        );
         assert_eq!(refresh_tools(&home).unwrap(), 0);
         fs::remove_dir_all(home).unwrap();
     }

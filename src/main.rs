@@ -17,6 +17,8 @@ mod links;
 mod media;
 mod notifications;
 mod platform;
+mod organizer;
+mod organizer_tools;
 mod preferences;
 mod questions;
 mod rfb;
@@ -112,6 +114,27 @@ fn message_cache_bytes(m: &ChatMessage) -> usize {
         .iter()
         .fold(m.text.len(), |n, a| n.saturating_add(a.cache_bytes()))
 }
+#[derive(Default)]
+struct ChatContext {
+    tokens: Option<(u64, Option<u64>)>,
+    compaction: Option<Compaction>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Compaction {
+    Running,
+    Complete,
+    Interrupted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum WorkspaceTab {
+    Desktop,
+    ToDos,
+    Notes,
+    Tasks,
+}
+
 struct D4c {
     desktops: desktops::Desktops,
     servers: servers::Catalogs,
@@ -122,6 +145,7 @@ struct D4c {
     jump_latest: bool,
     workspace_hydrated: bool,
     queued_messages: std::collections::HashMap<(String, String), std::collections::VecDeque<Draft>>,
+    chat_context: std::collections::HashMap<String, ChatContext>,
     draft_queue: draft_sync::Queue,
     imported_notifications: std::collections::HashSet<String>,
     remote_notifications: std::collections::HashSet<String>,
@@ -142,7 +166,8 @@ struct D4c {
     switch_pending: Option<usize>,
     composer_picker: Option<(ComposerPicker, egui::Response)>,
     compact_previous: bool,
-    show_cron: bool,
+    workspace_tab: WorkspaceTab,
+    organizer: organizer::Organizer,
     workspace_open: bool,
     task_chat: bool,
     cron: cron::Tasks,
@@ -218,19 +243,26 @@ impl Default for D4c {
 impl D4c {
     fn load(restore_tabs: bool) -> Self {
         let mut preferences = preferences::Settings::load();
+        let ssh = if restore_tabs { ssh::Servers::load() } else { ssh::Servers::default() };
         let saved_tabs = restore_tabs
             .then(|| {
                 session_tabs::Tabs::load(|url| {
-                    preferences.connections.iter().any(|c| c.url == url)
+                    ssh.remembers(url) || preferences.connections.iter().any(|c| c.url == url)
                 })
             })
             .flatten();
         if let Some((_, Some(active))) = &saved_tabs
-            && let Some(index) = preferences.connections.iter().position(|c| c.url == active.url)
+            && let Some(index) = preferences
+                .connections
+                .iter()
+                .position(|c| c.url == active.url)
         {
             preferences.selected = index;
         }
-        let url = preferences.current().url.clone();
+        let url = saved_tabs.as_ref()
+            .and_then(|(_, active)| active.as_ref())
+            .map(|active| active.url.clone())
+            .unwrap_or_else(|| preferences.current().url.clone());
         let center = activity::Center::load(&url);
         let servers = servers::Catalogs::default();
         let (tabs, remembered, explicit_selection) = match saved_tabs {
@@ -238,7 +270,10 @@ impl D4c {
             None => {
                 let remembered = servers.rows.get(&url).and_then(|row| row.selected.clone());
                 let mut tabs = session_tabs::Tabs::default();
-                if let Some(key) = remembered.as_deref().filter(|key| !key.starts_with("draft:")) {
+                if let Some(key) = remembered
+                    .as_deref()
+                    .filter(|key| !key.starts_with("draft:"))
+                {
                     tabs.open(session_tabs::TabId::new(&url, key));
                 }
                 let explicit = remembered.is_some();
@@ -250,13 +285,14 @@ impl D4c {
         Self {
             desktops: Default::default(),
             servers,
-            ssh: ssh::Servers::default(),
+            ssh,
             server_views: Default::default(),
             tabs,
             explicit_selection,
             jump_latest: false,
             workspace_hydrated: false,
             queued_messages: Default::default(),
+            chat_context: Default::default(),
             draft_queue: Default::default(),
             imported_notifications: Default::default(),
             remote_notifications: Default::default(),
@@ -277,7 +313,8 @@ impl D4c {
             composer_picker: None,
             compact_previous: false,
             sidebar_open,
-            show_cron: false,
+            workspace_tab: WorkspaceTab::Desktop,
+            organizer: organizer::Organizer::default(),
             workspace_open: false,
             task_chat: false,
             cron: cron::Tasks::default(),
@@ -350,7 +387,10 @@ impl D4c {
 impl D4c {
     fn reconnect(&mut self, ctx: &egui::Context) {
         if ssh::is_chat_id(&self.url) {
-            self.settings_open = true;
+            if !self.ssh.retry_saved(&self.url, ctx) {
+                self.settings_open = true;
+                self.settings_tab = dialogs::SettingsTab::Ssh;
+            }
             return;
         }
         self.composer_picker = None;
@@ -479,6 +519,7 @@ impl D4c {
             next.restore_scroll = Some(view.scroll.1);
         }
         next.restore_server_drafts();
+        next.organizer = std::mem::take(&mut self.organizer);
         *self = next;
     }
     fn restore_pending_sends(&mut self) {
@@ -944,6 +985,10 @@ impl D4c {
             return;
         }
         self.tabs.rekey(&self.url, old, new);
+        self.organizer.rekey(
+            &session_tabs::TabId::new(&self.url, old),
+            &session_tabs::TabId::new(&self.url, new),
+        );
         if self.active_sessions.remove(old) {
             self.active_sessions.insert(new.into());
         }
@@ -1086,8 +1131,10 @@ impl D4c {
         self.composer_picker = None;
         self.servers.select(&self.url, &key);
         self.desktops.open = false;
-        self.show_cron = false;
-        self.workspace_open = false;
+        if !matches!(self.workspace_tab, WorkspaceTab::ToDos | WorkspaceTab::Notes) {
+            self.workspace_tab = WorkspaceTab::Desktop;
+            self.workspace_open = false;
+        }
         self.settings_open = false;
         self.notifications_open = false;
         self.task_chat = false;
@@ -1249,6 +1296,10 @@ impl D4c {
         }
         for event in events {
             match event {
+                gateway::Event::Organizer(call) => {
+                    let result = self.organizer.answer(&self.url, call);
+                    self.rpc("organizer.result", result);
+                }
                 gateway::Event::Status(s) => {
                     self.connected = s == "Connected";
                     self.status = s;
@@ -1266,6 +1317,7 @@ impl D4c {
                     self.questions.disconnected();
                     self.active_sessions.clear();
                     self.live.clear();
+                    self.chat_context.clear();
                     self.delete_pending = None;
                     self.running = false;
                     self.status = s;
@@ -1637,6 +1689,29 @@ impl D4c {
                     }
                     let id = v["id"].as_str().unwrap_or("");
                     let payload = &v["payload"];
+                    if let Some(key) = payload["sessionKey"]
+                        .as_str()
+                        .filter(|key| !key.is_empty() && !self.deleted_sessions.contains(*key))
+                    {
+                        if v["event"] == "session.context" {
+                            let context = self.chat_context.entry(key.to_owned()).or_default();
+                            if let Some(used) = payload["usedTokens"].as_u64() {
+                                let window = payload["contextWindow"].as_u64().filter(|n| *n > 0);
+                                context.tokens = Some((used, window));
+                            }
+                            match payload["compaction"].as_str() {
+                                Some("running") => context.compaction = Some(Compaction::Running),
+                                Some("complete") => context.compaction = Some(Compaction::Complete),
+                                _ => {}
+                            }
+                        } else if v["event"] == "chat"
+                            && matches!(payload["state"].as_str(), Some("final" | "aborted" | "error"))
+                            && let Some(context) = self.chat_context.get_mut(key)
+                            && context.compaction == Some(Compaction::Running)
+                        {
+                            context.compaction = Some(Compaction::Interrupted);
+                        }
+                    }
                     if let Some(key) = self.title_requests.remove(id) {
                         if let Some(items) = payload["messages"].as_array() {
                             if let Some(title) = items
@@ -2903,6 +2978,54 @@ impl D4c {
                     ui.colored_label(egui::Color32::LIGHT_RED, &self.composer_error);
                 }
             });
+        let context = self.chat_context.get(&self.session);
+        let ssh_chat = ssh::is_chat_id(&self.url);
+        if ssh_chat || context.is_some() {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                match context.and_then(|context| context.tokens) {
+                    Some((used, Some(window))) => {
+                        let fraction = (used as f64 / window as f64).min(1.0);
+                        ui.small(format!("Context {:.0}% used", fraction * 100.0))
+                            .on_hover_text(format!("Last reported: {used} / {window} tokens"));
+                        ui.add(
+                            egui::ProgressBar::new(fraction as f32)
+                                .desired_width(48.0)
+                                .desired_height(5.0),
+                        );
+                    }
+                    Some((used, None)) => {
+                        ui.small(format!("Context: {used} tokens"))
+                            .on_hover_text("Codex hasn't reported the context window size.");
+                    }
+                    None => {
+                        ui.small("Context: —")
+                            .on_hover_text("Waiting for Codex to report context usage.");
+                    }
+                }
+                ui.small("·");
+                match context.and_then(|context| context.compaction) {
+                    Some(Compaction::Running) => {
+                        ui.spinner();
+                        ui.small("Compacting…");
+                    }
+                    Some(Compaction::Complete) => {
+                        ui.small("Compaction complete");
+                    }
+                    Some(Compaction::Interrupted) => {
+                        ui.small("Compaction interrupted");
+                    }
+                    None => {
+                        ui.small("Compaction: —")
+                            .on_hover_text("No compaction reported for this chat.");
+                    }
+                }
+                if ssh_chat {
+                    ui.small("·");
+                    self.ssh.codex_usage_ui(ui, &self.url);
+                }
+            });
+        }
         if send && accept.is_none() {
             self.send(ui.ctx());
             self.focus_composer = true;
@@ -2968,6 +3091,7 @@ impl D4c {
         self.queued_messages
             .remove(&(self.url.clone(), key.to_owned()));
         self.draft_queue.forget(key);
+        self.chat_context.remove(key);
         let rev = self
             .desktops
             .workspace
@@ -3324,12 +3448,14 @@ impl eframe::App for D4c {
                 })
             });
         }
+        self.organizer.tick(ui.ctx());
         self.save_layout(false);
         self.save_tab_layout();
     }
 }
 impl D4c {
     fn save_on_exit(&mut self) {
+        self.organizer.flush();
         media::reset();
         self.save_layout(true);
         self.save_tab_layout();
@@ -3350,7 +3476,8 @@ impl D4c {
         let compact = self.compact_previous;
         let previous = self.preferences.sidebar_open(compact);
         if previous != self.sidebar_open {
-            self.preferences.set_sidebar_open(compact, self.sidebar_open);
+            self.preferences
+                .set_sidebar_open(compact, self.sidebar_open);
             if let Err(error) = self.preferences.save() {
                 self.preferences.set_sidebar_open(compact, previous);
                 eprintln!("Could not save sidebar layout: {error}");
@@ -3412,61 +3539,97 @@ impl D4c {
             }
         }
     }
-    fn workspace_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::Button::selectable(
-                        !self.show_cron,
-                        button_label(lucide_icons::Icon::Monitor, "Desktop"),
-                    )
-                    .min_size(egui::vec2(0.0, 36.0)),
-                )
-                .clicked()
-            {
-                self.show_cron = false;
+    fn append_to_composer(&mut self, ctx: &egui::Context, text: &str) {
+        if !text.is_empty() {
+            if !self.input.is_empty() {
+                self.input.push_str("\n\n");
             }
-            if ui
-                .add(
-                    egui::Button::selectable(
-                        self.show_cron,
-                        button_label(lucide_icons::Icon::CalendarClock, "Tasks"),
-                    )
-                    .min_size(egui::vec2(0.0, 36.0)),
-                )
-                .clicked()
-            {
-                self.show_cron = true;
-                self.cron.refresh();
+            self.input.push_str(text);
+        }
+        let id = egui::Id::unique("message_input");
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(self.input.chars().count()),
+        )));
+        state.store(ctx, id);
+        self.focus_composer = true;
+    }
+
+    fn workspace_ui(&mut self, ui: &mut egui::Ui) {
+        use lucide_icons::Icon;
+
+        let chat = self.active_tab();
+        let show_active_label = ui.available_width() >= 300.0;
+        ui.horizontal(|ui| {
+            let spacing = ui.spacing_mut();
+            spacing.item_spacing = egui::vec2(4.0, 3.0);
+            spacing.button_padding = egui::vec2(5.0, 3.0);
+            spacing.interact_size.y = 28.0;
+            for (tab, icon, label) in [
+                (WorkspaceTab::Desktop, Icon::Monitor, "Desktop"),
+                (WorkspaceTab::ToDos, Icon::ListTodo, "To-Dos"),
+                (WorkspaceTab::Notes, Icon::NotebookPen, "Notes"),
+                (WorkspaceTab::Tasks, Icon::CalendarClock, "Tasks"),
+            ] {
+                let selected = self.workspace_tab == tab;
+                let button = if selected && show_active_label {
+                    egui::Button::selectable(true, button_label(icon, label))
+                        .min_size(egui::vec2(28.0, 28.0))
+                } else {
+                    workspace_icon(icon).selected(selected)
+                };
+                if ui.add(button).on_hover_text(label).clicked() {
+                    self.workspace_tab = tab;
+                    if tab == WorkspaceTab::Tasks {
+                        self.cron.refresh();
+                    }
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add(egui::Button::new(icon_text(lucide_icons::Icon::X, 18.0)).frame(false))
+                    .add(workspace_icon(Icon::X))
                     .on_hover_text("Close workspace")
                     .clicked()
                 {
                     self.workspace_open = false;
                 }
+                match self.workspace_tab {
+                    WorkspaceTab::ToDos => self.organizer.toolbar(ui, organizer::Kind::ToDos, &chat),
+                    WorkspaceTab::Notes => self.organizer.toolbar(ui, organizer::Kind::Notes, &chat),
+                    _ => {}
+                }
             });
         });
-        ui.add_space(8.0);
+        ui.add_space(3.0);
         ui.separator();
-        ui.add_space(10.0);
+        ui.add_space(4.0);
         egui::ScrollArea::vertical()
-            .id_salt(("workspace_content", &self.session, self.show_cron))
+            .id_salt(("workspace_content", &chat, self.workspace_tab))
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if self.show_cron {
-                    self.cron.session_ui(
-                        ui,
-                        &self.session,
-                        self.connected,
-                        &self.models,
-                        &self.model_efforts,
-                        &self.model,
-                        &self.thinking,
-                    );
-                } else {
+            .show(ui, |ui| match self.workspace_tab {
+                WorkspaceTab::ToDos | WorkspaceTab::Notes => {
+                    let kind = if self.workspace_tab == WorkspaceTab::ToDos {
+                        organizer::Kind::ToDos
+                    } else {
+                        organizer::Kind::Notes
+                    };
+                    if let Some(message) = self.organizer.ui(ui, kind, &chat) {
+                        self.append_to_composer(ui.ctx(), &message);
+                        if self.compact_previous {
+                            self.workspace_open = false;
+                        }
+                    }
+                }
+                WorkspaceTab::Tasks => self.cron.session_ui(
+                    ui,
+                    &self.session,
+                    self.connected,
+                    &self.models,
+                    &self.model_efforts,
+                    &self.model,
+                    &self.thinking,
+                ),
+                WorkspaceTab::Desktop => {
                     if ui
                         .add_enabled(
                             self.can_reload(),
@@ -3500,6 +3663,11 @@ impl D4c {
             }
         }
         self.ssh.poll(ui.ctx());
+        if self.gateway.is_none()
+            && let Some(status) = self.ssh.status(&self.url)
+        {
+            self.status = status.to_owned();
+        }
         let ssh_connections: Vec<_> = self.ssh.chat_connections().collect();
         for connection in &ssh_connections {
             if let Some(link) = self.ssh.take_chat(&connection.url) {
@@ -3525,6 +3693,7 @@ impl D4c {
             &self.preferences.connections,
             &self.ssh,
             &self.url,
+            &mut self.organizer,
             ui.ctx(),
         );
         self.reconcile_history();
@@ -3533,13 +3702,15 @@ impl D4c {
         self.desktops
             .follow_session(&self.session, &self.url, ui.ctx());
         if self.desktops.open {
+            self.workspace_tab = WorkspaceTab::Desktop;
             self.workspace_open = true;
             self.desktops.open = false;
         }
         self.poll_upload();
         self.load_media();
         if !self.media_requests.is_empty() {
-            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(1));
         }
         #[cfg(target_os = "android")]
         if let Some(session) = android_notifications::take_session() {
@@ -3588,8 +3759,18 @@ impl D4c {
                 ),
             ));
         }
-        let toggle_sidebar = !self.dialog_open()
-            && !media::is_fullscreen()
+        let shortcuts_enabled = !self.dialog_open() && !media::is_fullscreen();
+        if shortcuts_enabled
+            && let Some(id) = ui.input_mut(|input| self.tabs.consume_number_shortcut(input))
+        {
+            if id != self.active_tab() {
+                self.select_tab(&id, ui.ctx());
+            }
+            if compact {
+                self.sidebar_open = false;
+            }
+        }
+        let toggle_sidebar = shortcuts_enabled
             && ui.input_mut(|input| {
                 let mut toggle = false;
                 input.events.retain(|event| match event {
@@ -4006,7 +4187,7 @@ impl D4c {
                     self.settings_ui(ui);
                 } else if !self.connected && self.messages.is_empty() && !self.session.starts_with("draft:") {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(if self.gateway.is_some() { "Connecting" } else { "Offline" }).weak());
+                        ui.label(egui::RichText::new(if self.gateway.is_some() || self.status == "Connecting…" { "Connecting" } else { "Offline" }).weak());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("Settings").clicked() { self.settings_open = true; }
                             if ui.small_button("Retry").clicked() { self.reconnect(ui.ctx()); }
@@ -4155,27 +4336,13 @@ impl D4c {
                 .session
                 .unwrap_or_else(|| format!("draft:{}", uuid::Uuid::new_v4()));
             self.select_session(key, load);
-            if !request.draft.is_empty() {
-                if !self.input.is_empty() {
-                    self.input.push_str("\n\n");
-                }
-                self.input.push_str(&request.draft);
-            }
-            let id = egui::Id::unique("message_input");
-            let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
-            state
-                .cursor
-                .set_char_range(Some(egui::text::CCursorRange::one(
-                    egui::text::CCursor::new(self.input.chars().count()),
-                )));
-            state.store(ui.ctx(), id);
+            self.append_to_composer(ui.ctx(), &request.draft);
             self.task_chat = true;
             self.workspace_open = false;
-            self.focus_composer = true;
         }
         if self.cron.open_history {
             self.cron.open_history = false;
-            self.show_cron = true;
+            self.workspace_tab = WorkspaceTab::Tasks;
             self.workspace_open = true;
             self.settings_open = false;
             if compact {
@@ -4788,6 +4955,10 @@ fn loading_conversation(ui: &mut egui::Ui) {
         ui.add_space(24.0);
     }
 }
+fn workspace_icon(icon: lucide_icons::Icon) -> egui::Button<'static> {
+    egui::Button::new(icon_text(icon, 16.0)).min_size(egui::vec2(28.0, 28.0))
+}
+
 fn icon_text(icon: lucide_icons::Icon, size: f32) -> egui::RichText {
     egui::RichText::new(char::from(icon).to_string()).font(egui::FontId::new(
         size,
@@ -4921,6 +5092,42 @@ mod composer_tests {
         app.gateway = Some(gateway::test_gateway(out, rx));
         tx.send(event).unwrap();
         app.events(&egui::Context::default());
+    }
+    #[test]
+    fn composer_shows_context_and_compaction_only_for_the_selected_chat() {
+        let mut app = D4c::default();
+        app.session = "chat".into();
+        app.input = "Composer text".into();
+        for payload in [
+            json!({"sessionKey":"chat","usedTokens":24_000,"contextWindow":100_000}),
+            json!({"sessionKey":"chat","compaction":"running"}),
+            json!({"sessionKey":"other","usedTokens":90_000,"contextWindow":100_000}),
+        ] {
+            inject(&mut app, gateway::Event::Data(json!({
+                "event": "session.context", "payload": payload
+            })));
+        }
+        let legacy_url = std::mem::replace(&mut app.url, "ssh://tester@localhost:2201".into());
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.composer(ui));
+        output.textures_delta.clear();
+        let labels: Vec<_> = output.shapes.into_iter().filter_map(|shape| match shape.shape {
+            egui::Shape::Text(text) => Some((text.galley.job.text.clone(), text.pos.y)),
+            _ => None,
+        }).collect();
+        let y = |name: &str| labels.iter().find(|(text, _)| text == name).map(|(_, y)| *y);
+        let context_y = y("Context 24% used").unwrap();
+        assert!(context_y > y("Composer text").unwrap());
+        assert!((context_y - y("Compacting…").unwrap()).abs() < 2.0);
+        assert!((context_y - y("Codex usage").unwrap()).abs() < 2.0);
+        assert!(y("Context 90% used").is_none());
+
+        app.url = legacy_url;
+        inject(&mut app, gateway::Event::Data(json!({
+            "event": "session.context",
+            "payload": {"sessionKey":"chat","compaction":"complete"}
+        })));
+        assert!(app.chat_context["chat"].compaction == Some(Compaction::Complete));
     }
     #[test]
     fn compact_dispatches_without_a_user_message_and_recovers_from_start_failure() {

@@ -10,13 +10,21 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h") {
         println!(
-            "D4C server\nUsage: d4c-server [--config PATH] [--list-devices | --approve DEVICE_ID | --import-aliases MANIFEST | --migrate-codex-tools HOME | --refresh-codex-tools HOME]\n       d4c-server --mcp\n       d4c-server --help | --version"
+            "D4C server\nUsage: d4c-server [--config PATH] [--list-devices | --approve DEVICE_ID | --import-aliases MANIFEST | --migrate-codex-tools HOME | --refresh-codex-tools HOME]\n       d4c-server --mcp\n       d4c-server --native-screen SOCKET (Linux X11)\n       d4c-server --help | --version"
         );
         return Ok(());
     }
     if args.len() == 2 && matches!(args[1].as_str(), "--version" | "-V") {
         println!("d4c-server {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    if args.get(1).is_some_and(|arg| arg == "--native-screen") {
+        if args.len() != 3 || args[2].starts_with("--") {
+            return Err("--native-screen requires a Unix socket path".into());
+        }
+        return vox_d4c_server::native_screen::serve(std::path::Path::new(&args[2]))
+            .map_err(|e| e.to_string());
     }
     let mut options = args.iter().skip(1);
     while let Some(arg) = options.next() {
